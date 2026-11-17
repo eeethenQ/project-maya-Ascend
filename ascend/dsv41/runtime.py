@@ -82,9 +82,10 @@ def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_sha
         # size the tier from what is *actually* left once the resident weights are on the card, less the
         # staging ring and a reserve for activations, KV and the allocator's own fragmentation
         per_expert = 3 * cfg.moe_intermediate_size * cfg.hidden_size
-        # a 5 GiB reserve: the head's matmul, the prompt's activations and the allocator's own padding all
-        # come out of what is left, and an expert tier sized to the last byte OOMs at the first token
-        budget = max(0.0, (free_hbm_gib(dev) if dev != "cpu" else 8 * GIB) - src.staging_bytes() - 5.0 * GIB)
+        # a 6 GiB reserve: the head's matmul, the prompt's activations, the dequantization temporaries and
+        # the allocator's own padding all come out of what is left.  Sized to the last byte, the tier OOMs
+        # on the second token.
+        budget = max(0.0, (free_hbm_gib(dev) if dev != "cpu" else 8 * GIB) - src.staging_bytes() - 6.0 * GIB)
         expert_slots = int(budget // per_expert)
     if not no_experts:
         # never more slots than the model has experts: on the host the budget formula would allow millions

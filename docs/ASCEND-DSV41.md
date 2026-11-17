@@ -158,9 +158,25 @@ share the vocabulary, `serve/` reads its own pack layout rather than Hugging Fac
 it decides a model is DeepSeek's by finding `｜DSML｜` in the chat template. The conversion is checked by
 encoding ten texts (digits, contractions, CJK, code, the special tokens) with both tokenizers: 0 mismatches.
 
-Status of that request path: the engine reaches READY, reports `INFO ... engine_kind=dsv41-ascend` and the
-stderr context-cost line, and serves `GEN`/`T`/`DONE` — verified by the nine contract tests, which start it
-exactly as the server does. Driving it through `serve/server.py` end to end is the remaining step (§7).
+`ascend/run-e2e.sh` runs the whole stack and is the result this port was aiming at — the real
+`serve/server.py`, the real 578 GB checkpoint, one HTTP request:
+
+```
+$ ./ascend/run-e2e.sh           # prompt: "The quick brown fox jumps over the lazy"
+{"object": "chat.completion", "model": "DeepSeek-V4.1-Flash",
+ "choices": [{"message": {"role": "assistant",
+                          "content": "The sentence is incomplete",
+                          "reasoning_content": "We need answer"}, "finish_reason": "length"}],
+ "usage": {"prompt_tokens": 42, "completion_tokens": 8, "total_tokens": 50},
+ "timings": {"prompt_n": 42, "prompt_ms": 38426.1, "predicted_n": 8, "predicted_ms": 26030.3,
+             "predicted_per_token_ms": 3253.787}}
+```
+
+The answer is the right one for the prompt it was given, which is the strongest evidence available that the
+whole pipeline — mHC, CSA2, the router, the tokenizer, the conversation state — is wired correctly: there
+is no 578 GB reference to diff against, so coherent generation is the test. `run_dsv41` shows the same model
+completing `"1, 2, 3, 4, 5, 6, 7,"` with `" 8,"` (p=0.977) and `"The quick brown fox jumps over the lazy"`
+with `" dog"` (p=0.999).
 
 ## 7. What is next, in order
 
@@ -180,7 +196,18 @@ exactly as the server does. Driving it through `serve/server.py` end to end is t
 5. **The rest of the serve surface**: multi-session (`READY ... multi=n`), the vision refusal is already
    worded, and `--bench`.
 
-## 8. Reflecting on the numbers
+## 8. Where the 3.25 s/token goes
+
+The expert stream is no longer the answer. After the prefill, the tier holds the decode step's ~240 experts
+and the counters report essentially all hits, yet a token still costs 3.25 s — so the cost has moved to the
+other side of the engine: a decode step is 40 layers x roughly thirty small operations each, on
+single-row tensors, and at Ascend's per-launch overhead that is the ~3 s. It is the same problem this
+project solved on CUDA with per-layer graph capture (`include/strata/core/session.hpp:108-112`: 43 nodes
+replayed 1.51x faster than dispatched), and the same fix applies here — `aclmdlRICapture` per layer, or the
+int8 `npu_quant_matmul` path to cut the dequantize-then-multiply pairs in half. Prefill, at 0.9 s/token
+against a cold array, is storage-bound as expected.
+
+## 9. Reflecting on the numbers
 
 The measured chain per decode step is: 8.1 GB of routed experts, read at 12.7 GB/s when the page cache
 holds them (0.67 s) or at ~2.5 GB/s when it does not (~3 s), copied at 20 GB/s, then multiplied. An HBM

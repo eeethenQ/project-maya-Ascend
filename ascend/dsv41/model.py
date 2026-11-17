@@ -733,7 +733,15 @@ class Dsv41:
         return F.silu(g) * u
 
     def dequant(self, q: torch.Tensor, scale: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
-        return ((q.to(torch.float32) - offset) * scale).to(self.dtype)
+        """(q - offset) * scale, in the compute dtype.
+
+        int8 is exactly representable in bf16 (8 significand bits, values in -128..127), and the product is
+        the value the matmul will round to anyway, so widening to fp32 first would only double the temporary
+        - on a card with a 30 GiB cap and a full expert tier, a 46 MiB temporary per expert is what runs it
+        out of memory.
+        """
+        dt = self.dtype
+        return (q.to(dt) - offset.to(dt)) * scale.to(dt)
 
     def moe(self, li: int, x: torch.Tensor) -> torch.Tensor:
         cfg, lw = self.cfg, self.weights.layers[li]

@@ -2,10 +2,10 @@
   "exe": "/home/q00999609/project-maya-Ascend/ascend/strata-ascend",
   "args": [
     "--model", "/mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8",
-    "--max-context", "4096",
-    "--expert-slots", "256"
+    "--max-context", "4096"
   ],
   "tokenizer": "/home/q00999609/project-maya-Ascend/.ascend-tokenizer",
   "model_name": "DeepSeek-V4.1-Flash",
+  "_comment": "expert slots are sized at start-up from the HBM left after the resident weights; pass --expert-slots in args to override, leaving at least ~6 GiB free",
   "log": "/tmp/ascend-engine.log"
 }
