@@ -279,7 +279,7 @@ class ExpertStreamer(ExpertSource):
     """
 
     def __init__(self, ckpt: Checkpoint, cfg: TextConfig, device, dtype=torch.bfloat16,
-                 cache_slots: int = 0, io_threads: int = 6, pin: bool = True):
+                 cache_slots: int = 0, io_threads: int = 6, pin: bool = True, max_batch: int = 8):
         self.ckpt, self.cfg, self.device, self.dtype = ckpt, cfg, device, dtype
         self.cache_slots = max(0, int(cache_slots))
         self._cache: dict[tuple[int, int], dict] = {}
@@ -290,6 +290,8 @@ class ExpertStreamer(ExpertSource):
                         "w2": (cfg.hidden_size, cfg.moe_intermediate_size),
                         "w3": (cfg.moe_intermediate_size, cfg.hidden_size)}
         self._pin_enabled = pin
+        # the staging ring is sized once, for at most `max_batch` experts; the caller batches larger sets
+        self._max_batch = max(1, int(max_batch))
         # A ring of staging buffers, not one: the device runs behind the host, so the copy of layer L may
         # still be in flight when layer L+1 wants the same pinned buffer.  Each slot carries an event
         # recorded after its copy, and a slot is only reused once that copy has landed.
@@ -306,7 +308,9 @@ class ExpertStreamer(ExpertSource):
     def _ensure_staging(self, n: int) -> None:
         if n <= self._cap:
             return
-        cap = max(n, 2 * self._cap, 8)
+        if n > self._max_batch:
+            raise ValueError(f"{n} experts in one read exceeds max_batch={self._max_batch}")
+        cap = self._max_batch
         for p, (out, inn) in self._shapes.items():
             slots = []
             for _ in range(self._ring):
@@ -406,6 +410,11 @@ class ExpertStreamer(ExpertSource):
         return {p: (torch.cat([g[p][0] for g in got], 0),
                     torch.cat([g[p][1] for g in got], 0),
                     torch.cat([g[p][2] for g in got], 0)) for p in ("w1", "w2", "w3")}
+
+    def staging_bytes(self) -> int:
+        """What the pinned staging ring costs, for the budget that decides the expert tier."""
+        per = sum(o * i for o, i in self._shapes.values())
+        return self._ring * self._max_batch * per
 
     def stats(self) -> dict[str, int]:
         return {"expert_hits": self.hits, "expert_misses": self.misses, "expert_bytes": self.bytes_in,
@@ -510,10 +519,18 @@ class Dsv41:
         self.eps = cfg.rms_norm_eps
         self.hc = cfg.hc_mult
         self.lim = cfg.swiglu_limit
+        # experts per MoE batch: the staging ring is sized for this many, so the two must agree
+        self.expert_batch = int(getattr(weights.experts, "_max_batch", 8))
 
     # -- matmul in the weights' dtype, results in fp32 -------------------------------------------
     def mm(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        return (x.to(w.dtype) @ w.T).float()
+        """x [., in] times w [out, in]'s transpose, in the weight's dtype.
+
+        ``F.linear`` rather than ``x @ w.T``: ``.T`` on a bf16 weight makes torch materialise a second,
+        transposed copy of it before multiplying (2.5 GiB for the 129280 x 5120 head, which is what ran the
+        card out of memory), while linear consumes the weight's strides as they are.
+        """
+        return F.linear(x.to(w.dtype), w).float()
 
     # -- mHC ------------------------------------------------------------------------------------
     def hc_mixes(self, x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor):
@@ -729,15 +746,19 @@ class Dsv41:
         y = torch.zeros(T, cfg.hidden_size, device=x.device, dtype=torch.float32)
 
         uniq = torch.unique(idx).tolist()
-        blocks = self.weights.experts.fetch_int8(li, uniq)
-        for i, e in enumerate(uniq):
-            rows, slot = torch.where(idx == e)
-            xs = x[rows]
-            w1 = self.dequant(*[blocks["w1"][k][i:i + 1] for k in range(3)])
-            w2 = self.dequant(*[blocks["w2"][k][i:i + 1] for k in range(3)])
-            w3 = self.dequant(*[blocks["w3"][k][i:i + 1] for k in range(3)])
-            h = self.swiglu(xs, w1[0], w3[0])
-            y.index_add_(0, rows, self.mm(h, w2[0]) * wts[rows, slot, None])
+        # A prompt routes far more distinct experts than a decode step - up to all 384 - and holding their
+        # dequantized weights at once is 13 GiB.  Batching bounds both the staging ring and the device.
+        for start in range(0, len(uniq), self.expert_batch):
+            batch = uniq[start:start + self.expert_batch]
+            blocks = self.weights.experts.fetch_int8(li, batch)
+            for i, e in enumerate(batch):
+                rows, slot = torch.where(idx == e)
+                xs = x[rows]
+                w1 = self.dequant(*[blocks["w1"][k][i:i + 1] for k in range(3)])
+                w2 = self.dequant(*[blocks["w2"][k][i:i + 1] for k in range(3)])
+                w3 = self.dequant(*[blocks["w3"][k][i:i + 1] for k in range(3)])
+                h = self.swiglu(xs, w1[0], w3[0])
+                y.index_add_(0, rows, self.mm(h, w2[0]) * wts[rows, slot, None])
         shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
         y = y + self.mm(shared, lw.ffn["shared_w2"])
         return y
@@ -782,4 +803,4 @@ class Dsv41:
         if not compute_logits:
             return None
         rows = x[-1:] if logits_last_only else x
-        return rows @ self.weights.head.T
+        return self.mm(rows, self.weights.head)

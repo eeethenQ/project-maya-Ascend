@@ -18,6 +18,7 @@ cores, 8 NUMA nodes). Each number below is a test in `ascend/tests/test_env.py`.
 | this process's HBM | `set_per_process_memory_fraction(0.5)` → **30.48 GiB allowed** of 60.96 | a request past it OOMs instead of taking a neighbour's HBM — the 32 GB cap is enforced, not hoped for |
 | bf16 Cube | **246–259 TFLOP/s** at 1024x5120x5120 | the dense part of the model is free; nothing here is compute-bound |
 | host → HBM | **20 GB/s**, pageable or pinned (no faster pinned path) | the expert stream is the whole design problem |
+| storage (RAID6, `/mnt/weights`) | **1.1 GB/s** direct, ~2.5 GB/s through a cold page cache | a cold 8.1 GB decode step cannot go faster than ~3 s however well the code is written |
 | int8 w8a8 matmul | `npu_quant_matmul`, `npu_quant_grouped_matmul_dequant`, … exist | the checkpoint's int8 weights can be multiplied natively, no dequantization needed on the fast path |
 | torch CPU bf16 GEMV | **0.12 GB/s** (100 ms for one 11.8 MB expert matrix, at any thread count) | the CPU expert lane this project uses on GPUs is *useless* here |
 | torch CPU fp16 GEMV | 3.7 GB/s (3.2 ms for the same matrix) | a CPU lane would still cost ~2.2 s/token — slower than streaming to the NPU |
@@ -129,30 +130,65 @@ Everything runs as `python -m unittest discover -s ascend -p "test_*.py" -t .`.
 * `test_npu_parity.py` — the same model on `npu:0` and on the CPU must agree to 5%, with the same argmax;
   and the NPU's own decode must match its own chunked pass. Also: the process never allocates past its
   32 GB share.
+* `test_make_tokenizer.py` — the Hugging Face tokenizer converted to the layout `serve/` reads: the four
+  files, specials marked as llama.cpp CONTROL tokens (without which every DeepSeek prompt is split into
+  characters), and a guard proving a write can never follow a symlink out of the output directory — the
+  first version of that script did, into the shared model directory.
+* `test_serve_engine.py` — the engine started exactly as `serve/server.py` starts it, driven over
+  stdin/stdout: READY and the INFO keys, the stderr context-cost line the dashboard reads, PP/T/DONE with
+  its eleven fields, the kept conversation's `reused`, STOP cutting a decode, STAT, and QUIT.
 * `test_env.py` — the four hardware facts the design rests on.
 
-## 6. What is next, in order
+## 6. The engine behind the serve protocol
 
-1. **The read path.** Replace `np.stack` with `preadv` into a preallocated pinned buffer and one async
-   copy, with a thread per expert. Everything else is noise against 8.1 GB/token.
-2. **Use all four cards.** The non-expert weights need 12.6 GiB, so three cards are idle: split the layers
-   across them (activations are 10 KiB per token, so a layer split is nearly free) and let each card own an
-   expert tier. That trades one card's 30 GiB of expert cache for a 4x larger one.
-3. **A profiled expert placement** instead of LRU — the project's own `ExpertCache` does this for the GPU
-   path with a hit-count profile, and the same `STRP` format can be reused.
-4. **Batched prefill**, so a prompt costs 8.1 GB once rather than per token.
-5. **The `--serve` line protocol**, so `serve/server.py` drives this engine unchanged — that is the seam
-   this project already designed for a new backend, and the only way to reach the HTTP/SSE API, tools and
-   the web UI.
+`serve/server.py` starts an engine as `[exe, "--serve", *args]` and talks to it in lines — the seam this
+project was built with so that a new backend becomes usable without touching `serve/`. `ascend/strata-ascend`
+is that `exe` and `ascend/serve_engine.py` is the engine, so a serve config pointed at it gives the
+OpenAI/Anthropic APIs, SSE, tools and the web UI over this engine:
 
-## 7. Reflecting on the numbers
+```json
+{"exe": "<repo>/ascend/strata-ascend",
+ "args": ["--model", "/mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8",
+          "--max-context", "4096", "--expert-slots", "256"],
+ "tokenizer": "<repo>/.ascend-tokenizer", "model_name": "DeepSeek-V4.1-Flash"}
+```
 
-At 8.1 GB of streamed experts per token and 20 GB/s of host link, the floor of this design is ~400 ms per
-token (2.5 tok/s) with nothing resident, and the only levers are how many experts stay in HBM and how well
-the stream overlaps compute. With four cards and 12.6 GiB of non-expert weights, roughly 100 GiB is left
-for experts — about 3 000 of 15 360, or 20%; a realistic skewed routing profile should find 30–40% of the
-2 40 activations resident, putting the streamed volume near 5–6 GB and the latency near 300 ms.
+`ascend/setup_tokenizer.sh` builds that tokenizer directory: the export ships no tokenizer, V4.1 and V4
+share the vocabulary, `serve/` reads its own pack layout rather than Hugging Face's `tokenizer.json`, and
+it decides a model is DeepSeek's by finding `｜DSML｜` in the chat template. The conversion is checked by
+encoding ten texts (digits, contractions, CJK, code, the special tokens) with both tokenizers: 0 mismatches.
 
-That is the honest trade of a **W8A8** checkpoint on 128 GB of HBM. The same model at 1.6–4 bits is 73 GB
-and fits entirely on two cards, which is what this project's Maya-XS packs are for. If the goal is tokens
-per second rather than "the w8a8 checkpoint runs", the quantisation choice, not the port, is what moves it.
+Status of that request path: the engine reaches READY, reports `INFO ... engine_kind=dsv41-ascend` and the
+stderr context-cost line, and serves `GEN`/`T`/`DONE` — verified by the nine contract tests, which start it
+exactly as the server does. Driving it through `serve/server.py` end to end is the remaining step (§7).
+
+## 7. What is next, in order
+
+1. **Storage, not the code, is the floor.** A decode step streams 8.1 GB; the array gives 1.1 GB/s, so a
+   cold step cannot beat ~3 s however the read path is written. The lever is the page cache: the model is
+   578 GB and the host has 1.9 TB, so a warm working set turns reads into 12.7 GB/s. Options, in order of
+   value: keep the *hot* experts (above all, the ones an expert profile says are routed most) resident in
+   page cache, which needs a profile rather than a guess; or pre-read the checkpoint once at start-up and
+   accept a several-minute first start.
+2. **Use all four cards.** The non-expert weights need 15.1 GiB, so three cards are idle: split the layers
+   across them (a token's activations are 80 KiB, so a layer split is nearly free) and let each card own an
+   expert tier — 30 GiB becomes ~105 GiB, or 3 100 of 15 360 experts.
+3. **A profiled expert placement** instead of the LRU — the project's own `ExpertCache` does this for the
+   GPU path with a hit-count profile, and its `STRP` format can be reused as is.
+4. **Batched prefill**, so a prompt costs one pass over its experts instead of one per token; and the
+   int8 `npu_quant_matmul` path, which halves the HBM traffic of the dequantized bf16 matmuls.
+5. **The rest of the serve surface**: multi-session (`READY ... multi=n`), the vision refusal is already
+   worded, and `--bench`.
+
+## 8. Reflecting on the numbers
+
+The measured chain per decode step is: 8.1 GB of routed experts, read at 12.7 GB/s when the page cache
+holds them (0.67 s) or at ~2.5 GB/s when it does not (~3 s), copied at 20 GB/s, then multiplied. An HBM
+expert tier of 30 GiB covers ~5% of the 15 360 experts on one card and ~20% on four, so it shortens the
+stream but does not remove it; and the 15.1 GiB of resident non-expert weights leave no room to keep more.
+
+That is the honest trade of a **W8A8** checkpoint on 128 GB of HBM and a 1.1 GB/s array. The same model at
+1.6–4 bits is 73 GB and fits entirely on two cards, which is what this project's Maya-XS packs are for; at
+w8a8 the port is correct and usable, and tokens per second are set by the quantisation and the storage, not
+by the kernels. Worth saying plainly, because it is the opposite of the intuition that the NPU is the
+bottleneck: bf16 Cube measured 246 TFLOP/s and the host link 20 GB/s, and neither is what binds.

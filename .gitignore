@@ -59,3 +59,5 @@ build-vision.bat
 /third_party/*.zip
 
 /data/glm-link-cpu-cal.txt
+# the Ascend engine's converted tokenizer directory (ascend/setup_tokenizer.sh)
+.ascend-tokenizer/

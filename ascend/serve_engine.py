@@ -63,7 +63,7 @@ class Engine:
         t0 = time.time()
         self.rt = rt.build(model=args.model, device=args.device, dtype=args.dtype,
                            hbm_share=args.hbm_share, expert_slots=args.expert_slots,
-                           io_threads=args.io_threads, verbose=args.verbose)
+                           io_threads=args.io_threads, expert_batch=args.expert_batch, verbose=args.verbose)
         self.cfg = self.rt.cfg
         self.load_s = time.time() - t0
         self.state = None
@@ -72,11 +72,17 @@ class Engine:
         self.input: queue.Queue[str | None] = queue.Queue()
         self.quit = False
         self.stats = {"tokens": 0, "steps": 0, "decode_ms": 0.0}
+        # The engine only needs the end-of-sequence id; serve/ does every tokenization.  `--tokenizer` is
+        # therefore optional, and a path to something other than a Hugging Face tokenizer.json (the pack
+        # layout, say) is a note in the log rather than a failed start.
+        self.tok = None
         if args.tokenizer:
-            from tokenizers import Tokenizer
-            self.tok = Tokenizer.from_file(args.tokenizer)
-        else:
-            self.tok = None
+            try:
+                from tokenizers import Tokenizer
+                self.tok = Tokenizer.from_file(args.tokenizer)
+            except Exception as e:                        # noqa: BLE001
+                _log(f"dsv41: --tokenizer {args.tokenizer} is not a Hugging Face tokenizer.json ({e}); "
+                     f"using the checkpoint's eos_token_id")
 
     # -- the start lines -----------------------------------------------------------------------
     def say_ready(self) -> None:
@@ -255,7 +261,7 @@ class Engine:
             got = self.tok.token_to_id("<｜end▁of▁sentence｜>")
             if got is not None:
                 return int(got)
-        return EOS
+        return int(self.cfg.raw.get("eos_token_id", EOS))
 
     @staticmethod
     def sample(logits: torch.Tensor, temperature: float, top_p: float, top_k: int,
@@ -322,6 +328,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--hbm-share", type=float, default=0.5)
     ap.add_argument("--expert-slots", type=int, default=None)
     ap.add_argument("--io-threads", type=int, default=6)
+    ap.add_argument("--expert-batch", type=int, default=8,
+                    help="experts fetched per MoE batch; sizes the pinned staging ring "
+                         "(2 x 3 x batch x 11.8 MiB)")
     ap.add_argument("--max-context", type=int, default=8192)
     ap.add_argument("--prefill-chunk", type=int, default=512)
     ap.add_argument("--verbose", action="store_true")

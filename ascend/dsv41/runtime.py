@@ -65,8 +65,8 @@ def free_hbm_gib(device: str) -> float:
 
 
 def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_share: float = 0.5,
-          expert_slots: int | None = None, io_threads: int = 6, no_experts: bool = False,
-          verbose: bool = False) -> Runtime:
+          expert_slots: int | None = None, io_threads: int = 6, expert_batch: int = 8,
+          no_experts: bool = False, verbose: bool = False) -> Runtime:
     """Load the checkpoint's resident weights and size the expert tier to what is left of the card."""
     model_dir = Path(model)
     cfg = TextConfig.from_json(model_dir / "config.json")
@@ -76,15 +76,19 @@ def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_sha
     if no_experts:
         src: ExpertSource = NullExpertSource(ckpt, cfg, dt)
     else:
-        if expert_slots is None:
-            # one expert is 3 matrices of moe_intermediate x hidden int8
-            per_expert = 3 * cfg.moe_intermediate_size * cfg.hidden_size
-            resident = 15.5 * GIB                                      # measured: 15.09 GiB for the text model
-            budget = max(0.0, (free_hbm_gib(dev) if dev != "cpu" else 8 * GIB) - resident - 1.5 * GIB)
-            expert_slots = int(budget // per_expert)
-        # never more slots than the model has experts: on the host the budget formula would allow millions
-        expert_slots = min(expert_slots, cfg.num_hidden_layers * cfg.n_routed_experts)
-        src = ExpertStreamer(ckpt, cfg, dev, dt, cache_slots=expert_slots, io_threads=io_threads)
+        src = ExpertStreamer(ckpt, cfg, dev, dt, cache_slots=0, io_threads=io_threads, max_batch=expert_batch)
     weights = Weights(ckpt, cfg, dev, dt, expert_source=src, verbose=verbose).load()
+    if not no_experts and expert_slots is None:
+        # size the tier from what is *actually* left once the resident weights are on the card, less the
+        # staging ring and a reserve for activations, KV and the allocator's own fragmentation
+        per_expert = 3 * cfg.moe_intermediate_size * cfg.hidden_size
+        # a 5 GiB reserve: the head's matmul, the prompt's activations and the allocator's own padding all
+        # come out of what is left, and an expert tier sized to the last byte OOMs at the first token
+        budget = max(0.0, (free_hbm_gib(dev) if dev != "cpu" else 8 * GIB) - src.staging_bytes() - 5.0 * GIB)
+        expert_slots = int(budget // per_expert)
+    if not no_experts:
+        # never more slots than the model has experts: on the host the budget formula would allow millions
+        expert_slots = min(int(expert_slots), cfg.num_hidden_layers * cfg.n_routed_experts)
+        src.cache_slots = expert_slots
     model_obj = Dsv41(cfg, weights, dev, dt)
     return Runtime(cfg=cfg, ckpt=ckpt, weights=weights, model=model_obj, device=dev, dtype=dt, experts=src)
