@@ -115,8 +115,12 @@ class Shard:
         return mv[self.data_start + begin: self.data_start + begin + _nbytes]
 
     def close(self) -> None:
+        """Release the mapping.  A tensor a caller still holds keeps it alive; that is the contract."""
         if self._mm is not None:
-            self._mm.close()
+            try:
+                self._mm.close()
+            except BufferError:          # numpy/torch still exports a view of it
+                pass
             self._mm = None
 
 
