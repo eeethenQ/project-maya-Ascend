@@ -117,7 +117,7 @@ class Int8Matmul(unittest.TestCase):
         def dequant_matmul(x_f32, wq_npu, scale_npu):
             """w = q * scale, in bf16, as the streaming path will do it."""
             w_bf16 = wq_npu.to(torch.bfloat16) * scale_npu.to(torch.bfloat16)[:, None]
-            return (x_f32.to(torch.bfloat16) @ w_bf16.T).float()
+            return (x_f32.to(torch.bfloat16).npu() @ w_bf16.T).float()
 
         got = dequant_matmul(x, wq.npu(), scale.npu()).cpu()
         rel = (got - want).abs().max() / want.abs().max()
