@@ -21,7 +21,9 @@ Nothing here imports torch_npu: run it on ``cpu`` for the reference, on ``npu:0`
 from __future__ import annotations
 
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -243,8 +245,12 @@ class ExpertSource:
     this machine), so dequantization happens on the device that is about to multiply.
     """
 
-    def fetch_int8(self, layer: int, experts: list[int]) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """``{"w1"|"w2"|"w3": (q [n,out,in] int8, scale [n,out,1], offset [n,out,1])}``, on the device."""
+    def fetch_int8(self, layer: int, experts: list[int]) -> list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+        """One ``{"w1"|"w2"|"w3": (q [1,out,in] int8, scale, offset)}`` per requested expert, on the device.
+
+        Per expert rather than stacked: a stacked return forces a second copy of every expert's 35 MB when
+        the batch mixes resident and streamed ones, and the batch is per-expert work anyway.
+        """
         raise NotImplementedError
 
     def stats(self) -> dict[str, int]:
@@ -261,7 +267,7 @@ class NullExpertSource(ExpertSource):
         self.ckpt, self.cfg, self.dtype = ckpt, cfg, dtype
 
     def fetch_int8(self, layer, experts):
-        return {}
+        return []
 
 
 class ExpertStreamer(ExpertSource):
@@ -376,10 +382,10 @@ class ExpertStreamer(ExpertSource):
         return out
 
     # -- the interface ------------------------------------------------------------------------
-    def fetch_int8(self, layer: int, experts: list[int]) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def fetch_int8(self, layer: int, experts: list[int]) -> list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         experts = [int(e) for e in experts]
         if not experts:
-            return {}
+            return []
         blocks: list[dict | None] = [None] * len(experts)
         missing: list[tuple[int, int]] = []
         for i, e in enumerate(experts):
@@ -401,15 +407,14 @@ class ExpertStreamer(ExpertSource):
                 block = {p: tuple(t[j:j + 1] for t in read[p]) for p in read}
                 blocks[i] = block
                 if self.cache_slots:
-                    self._cache[(layer, e)] = block
+                    # clone for the cache: a slice of the batch keeps the whole batch's storage alive, so
+                    # 284 cached "experts" would pin 284 batches (8x the tier's stated size)
+                    cached = {p: tuple(t.clone() for t in block[p]) for p in block}
+                    self._cache[(layer, e)] = cached
                     self._order.append((layer, e))
                     while len(self._order) > self.cache_slots:
                         self._cache.pop(self._order.pop(0), None)
-        got = blocks
-        # stack the experts of this layer: one batched matmul instead of six
-        return {p: (torch.cat([g[p][0] for g in got], 0),
-                    torch.cat([g[p][1] for g in got], 0),
-                    torch.cat([g[p][2] for g in got], 0)) for p in ("w1", "w2", "w3")}
+        return blocks
 
     def staging_bytes(self) -> int:
         """What the pinned staging ring costs, for the budget that decides the expert tier."""
@@ -519,8 +524,31 @@ class Dsv41:
         self.eps = cfg.rms_norm_eps
         self.hc = cfg.hc_mult
         self.lim = cfg.swiglu_limit
+        # set to a dict to attribute a step's time to its parts (ascend/bench_step.py); off costs nothing
+        self.timers: dict[str, float] | None = None
         # experts per MoE batch: the staging ring is sized for this many, so the two must agree
         self.expert_batch = int(getattr(weights.experts, "_max_batch", 8))
+
+    @contextmanager
+    def phase(self, name: str):
+        """Time a section of the forward.  Only active when `timers` is a dict; synchronises when it is.
+
+        Synchronising per section perturbs the schedule, so the numbers say where the *share* of the time
+        goes rather than what the unsynchronised step costs.
+        """
+        if self.timers is None:
+            yield
+            return
+        npu = str(self.device).startswith("npu")
+        if npu:
+            torch.npu.synchronize()
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if npu:
+                torch.npu.synchronize()
+            self.timers[name] = self.timers.get(name, 0.0) + (time.perf_counter() - t0)
 
     # -- matmul in the weights' dtype, results in fp32 -------------------------------------------
     def mm(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -753,18 +781,23 @@ class Dsv41:
         wts = wts / (wts.sum(-1, keepdim=True) + 1e-20) * cfg.routed_scaling_factor
         y = torch.zeros(T, cfg.hidden_size, device=x.device, dtype=torch.float32)
 
+        if isinstance(self.weights.experts, NullExpertSource):
+            # no expert source: the routed branch is skipped, which is what a shape or dense-only check wants
+            shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
+            return self.mm(shared, lw.ffn["shared_w2"])
         uniq = torch.unique(idx).tolist()
         # A prompt routes far more distinct experts than a decode step - up to all 384 - and holding their
         # dequantized weights at once is 13 GiB.  Batching bounds both the staging ring and the device.
         for start in range(0, len(uniq), self.expert_batch):
             batch = uniq[start:start + self.expert_batch]
-            blocks = self.weights.experts.fetch_int8(li, batch)
+            with self.phase("moe_fetch"):
+                blocks = self.weights.experts.fetch_int8(li, batch)
             for i, e in enumerate(batch):
                 rows, slot = torch.where(idx == e)
                 xs = x[rows]
-                w1 = self.dequant(*[blocks["w1"][k][i:i + 1] for k in range(3)])
-                w2 = self.dequant(*[blocks["w2"][k][i:i + 1] for k in range(3)])
-                w3 = self.dequant(*[blocks["w3"][k][i:i + 1] for k in range(3)])
+                w1 = self.dequant(*blocks[i]["w1"])
+                w2 = self.dequant(*blocks[i]["w2"])
+                w3 = self.dequant(*blocks[i]["w3"])
                 h = self.swiglu(xs, w1[0], w3[0])
                 y.index_add_(0, rows, self.mm(h, w2[0]) * wts[rows, slot, None])
         shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
@@ -795,13 +828,19 @@ class Dsv41:
         for li in range(cfg.num_hidden_layers):
             lw = self.weights.layers[li]
             res = h
-            a_pre, a_post, a_comb = self.hc_mixes(h, lw.hc["attn_fn"], lw.hc["attn_scale"], lw.hc["attn_base"])
-            x = rms(self.hc_pre(h, pre), lw.norms["attn_norm"], self.eps)
-            h = self.hc_post(self.attention(li, x, positions, host_positions, state), res, a_post, a_comb)
+            with self.phase("hc"):
+                a_pre, a_post, a_comb = self.hc_mixes(h, lw.hc["attn_fn"], lw.hc["attn_scale"],
+                                                     lw.hc["attn_base"])
+                x = rms(self.hc_pre(h, pre), lw.norms["attn_norm"], self.eps)
+            with self.phase("attn"):
+                h = self.hc_post(self.attention(li, x, positions, host_positions, state), res, a_post, a_comb)
             res = h
-            f_pre, f_post, f_comb = self.hc_mixes(h, lw.hc["ffn_fn"], lw.hc["ffn_scale"], lw.hc["ffn_base"])
-            x = rms(self.hc_pre(h, a_pre), lw.norms["ffn_norm"], self.eps)
-            h = self.hc_post(self.moe(li, x), res, f_post, f_comb)
+            with self.phase("hc"):
+                f_pre, f_post, f_comb = self.hc_mixes(h, lw.hc["ffn_fn"], lw.hc["ffn_scale"],
+                                                     lw.hc["ffn_base"])
+                x = rms(self.hc_pre(h, a_pre), lw.norms["ffn_norm"], self.eps)
+            with self.phase("moe"):
+                h = self.hc_post(self.moe(li, x), res, f_post, f_comb)
             pre = f_pre
 
         x = rms(self.hc_pre(h, pre), self.weights.final_norm, self.eps)

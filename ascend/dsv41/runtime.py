@@ -18,6 +18,8 @@ from .model import Dsv41, ExpertSource, ExpertStreamer, NullExpertSource, State,
 
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 GIB = 1 << 30
+# the HBM share this process claimed per device, so the budget can be computed from it
+_SHARES: dict[int, float] = {}
 
 
 @dataclass
@@ -29,6 +31,14 @@ class Runtime:
     device: str
     dtype: torch.dtype
     experts: ExpertSource
+
+    @property
+    def expert_slots(self) -> int:
+        return int(getattr(self.experts, "cache_slots", 0))
+
+    def decode_working_set(self) -> int:
+        """Experts one decode step routes: below this the tier thrashes and every step re-reads them."""
+        return self.cfg.num_hidden_layers * self.cfg.num_experts_per_tok
 
     def state(self, max_context: int, batch: int = 1) -> State:
         return State(self.cfg, build_layer_plan(self.cfg), self.device, self.dtype,
@@ -52,21 +62,34 @@ def resolve_device(requested: str, share: float) -> str:
     torch.npu.set_device(index)
     # the card is shared: 0.5 of 64 GB keeps this process inside 32 GB whatever else is running
     torch.npu.set_per_process_memory_fraction(share, index)
+    _SHARES[index] = share
     return f"npu:{index}"
 
 
-def free_hbm_gib(device: str) -> float:
-    """What is left of this process's share, in GiB."""
+def free_hbm_bytes(device: str) -> int:
+    """What is left of this process's *share*, in **bytes**.
+
+    ``mem_get_info`` answers for the allocator, not for the share: on a 64 GB card claiming 0.5 it can
+    report tens of GiB after this process has already taken half.  The share is what the cap enforces, so
+    the budget is computed from it and from what the allocator holds.
+    """
     if device == "cpu" or not hasattr(torch, "npu"):
-        return 0.0
+        return 0
     index = int(device.split(":")[-1])
-    free, _total = torch.npu.mem_get_info(index)
-    return free / GIB
+    # the card's own capacity, not the share-limited figure get_device_properties may report
+    _free_physical, total = torch.npu.mem_get_info(index)
+    allowed = float(total) * _SHARES.get(index, 0.5)
+    # what this process actually holds: reserved includes blocks the allocator grew during loading and no
+    # longer needs, which would wrongly shrink the tier to nothing
+    used = float(torch.npu.memory_allocated(index))
+    # bytes, not GiB: returning a "gib" figure once made the tier arithmetic divide a gigabyte count by a
+    # byte count and quietly size the tier to zero
+    return int(max(0.0, allowed - used))
 
 
 def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_share: float = 0.5,
           expert_slots: int | None = None, io_threads: int = 6, expert_batch: int = 8,
-          no_experts: bool = False, verbose: bool = False) -> Runtime:
+          expert_reserve_gib: float = 6.0, no_experts: bool = False, verbose: bool = False) -> Runtime:
     """Load the checkpoint's resident weights and size the expert tier to what is left of the card."""
     model_dir = Path(model)
     cfg = TextConfig.from_json(model_dir / "config.json")
@@ -82,10 +105,13 @@ def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_sha
         # size the tier from what is *actually* left once the resident weights are on the card, less the
         # staging ring and a reserve for activations, KV and the allocator's own fragmentation
         per_expert = 3 * cfg.moe_intermediate_size * cfg.hidden_size
-        # a 6 GiB reserve: the head's matmul, the prompt's activations, the dequantization temporaries and
-        # the allocator's own padding all come out of what is left.  Sized to the last byte, the tier OOMs
-        # on the second token.
-        budget = max(0.0, (free_hbm_gib(dev) if dev != "cpu" else 8 * GIB) - src.staging_bytes() - 6.0 * GIB)
+        # The reserve covers the head's matmul, the prompt's activations and the dequantized experts of one
+        # batch.  It is not free to set at zero: the tier fills during the run rather than at load, and the
+        # tier is also the difference between a decode step that re-reads its 240 experts and one that does
+        # not - below about 8.2 GiB of tier (240 experts) the LRU thrashes and every step re-reads.
+        # the staging ring is *host* pinned memory, so it does not come out of HBM at all
+        reserve = int(expert_reserve_gib * GIB)
+        budget = max(0, (free_hbm_bytes(dev) if dev != "cpu" else 8 * GIB) - reserve)
         expert_slots = int(budget // per_expert)
     if not no_experts:
         # never more slots than the model has experts: on the host the budget formula would allow millions

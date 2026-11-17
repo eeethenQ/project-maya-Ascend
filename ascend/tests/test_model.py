@@ -140,6 +140,32 @@ class TheExpertSource(unittest.TestCase):
         self.assertEqual(stats["expert_hits"] + stats["expert_misses"], 2 * hits["expert_misses"])
         self.assertGreater(hits["expert_bytes"], 0)
 
+    def test_a_cached_expert_owns_exactly_its_own_bytes(self):
+        """A cache entry must be a copy, not a slice of the batch it arrived in.
+
+        Slices of one device tensor share its storage, so caching 284 "experts" out of batches of 8 pinned
+        284 whole batches - 8x the tier's stated size - and the card ran out of memory during a prompt.
+        The storage a cached expert occupies is the check.
+        """
+        cfg = self.model.cfg
+        one = {p: (cfg.moe_intermediate_size, cfg.hidden_size) if p != "w2"
+                 else (cfg.hidden_size, cfg.moe_intermediate_size) for p in ("w1", "w2", "w3")}
+        ckpt, net = build(self.model, cache_slots=64)
+        try:
+            src = net.weights.experts
+            src.fetch_int8(0, [0])
+            for layer in range(1, cfg.num_hidden_layers):
+                src.fetch_int8(layer, list(range(cfg.n_routed_experts)))   # force batches larger than one
+            block = src._cache[(0, 0)]
+            for p, shape in one.items():
+                owned = block[p][0].untyped_storage().nbytes()
+                want = 1
+                for d in shape:
+                    want *= d
+                self.assertEqual(owned, want, f"{p} pins {owned} bytes for one {want}-byte expert")
+        finally:
+            ckpt.close()
+
     def test_the_streamed_bytes_are_what_the_experts_weigh(self):
         ckpt, net = build(self.model)
         try:

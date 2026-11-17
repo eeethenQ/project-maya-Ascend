@@ -91,6 +91,24 @@ class Parity(unittest.TestCase):
         rel = (got - whole).abs().max() / whole.abs().max().clamp_min(1e-6)
         self.assertLess(rel.item(), 5e-2, f"NPU decode vs chunk: max rel err {rel.item():.2e}")
 
+    def test_the_expert_tier_is_sized_from_what_is_left(self):
+        """With HBM free, the tier must not come out zero.
+
+        It did, once: the budget helper returned GiB and the slot arithmetic divided it by a byte count.
+        Every decode step then re-read all of its experts, which is the difference between 1.9 s and 3.2 s
+        a token - and the symptom was invisible except as slowness.
+        """
+        from ascend.dsv41 import runtime as rt
+
+        run = rt.build(model=str(self.model.root), device=self.dev, dtype="bfloat16",
+                       hbm_share=HBM_SHARE, expert_batch=8)
+        try:
+            self.assertGreater(run.expert_slots, 0, "the tier was sized from free HBM and came out empty")
+            self.assertGreaterEqual(run.expert_slots, min(run.decode_working_set(),
+                                                          self.cfg.num_hidden_layers * self.cfg.n_routed_experts))
+        finally:
+            run.close()
+
     def test_the_share_is_respected_while_the_model_runs(self):
         """mem_get_info reports the card; what matters is that this process never allocates past its share."""
         npu = self.build(self.dev, torch.bfloat16)

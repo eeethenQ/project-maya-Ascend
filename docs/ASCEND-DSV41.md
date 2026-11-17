@@ -196,18 +196,45 @@ with `" dog"` (p=0.999).
 5. **The rest of the serve surface**: multi-session (`READY ... multi=n`), the vision refusal is already
    worded, and `--bench`.
 
-## 8. Where the 3.25 s/token goes
+## 8. Where the 3.25 s/token went
 
-The expert stream is no longer the answer. After the prefill, the tier holds the decode step's ~240 experts
-and the counters report essentially all hits, yet a token still costs 3.25 s — so the cost has moved to the
-other side of the engine: a decode step is 40 layers x roughly thirty small operations each, on
-single-row tensors, and at Ascend's per-launch overhead that is the ~3 s. It is the same problem this
+Measured with `ascend/bench_step.py`, which times the same model with and without the routed branch and
+attributes the rest by phase.  The first run of it exposed more of the port's own bugs than the model's:
+
+| configuration | ms/token | notes |
+|---|---:|---|
+| decode, before this round | 3 250 | as the server measured it |
+| decode, whole model | **1 926** | 16 steps, 39% expert hits |
+| decode, routed branch disabled | **544** | mHC, attention, shared expert, head: the launch floor |
+| `dequant` one expert matrix | 190 µs | 4x the matmul it feeds |
+| `F.linear` `[1,5120]x[2304,5120]` | 48 µs | |
+| both together | 250 µs | |
+| `npu_quant_matmul`, int8, same shape | **82 µs** | 3x faster, and no 71 MB bf16 temporary |
+
+Three bugs the measurement found, each worth more than the tuning that followed:
+
+1. **A units bug sized the expert tier to zero.** `free_hbm_gib` returned GiB and the budget divided it by
+   a byte count, so the tier was always 0 - every decode step re-read all 240 of its experts.  The function
+   now returns bytes, which is what the name says.
+2. **Cached experts were views of an 8-expert batch**, so each cached "expert" pinned the whole batch: the
+   tier held 8x its stated size and the card ran out of memory.  A cache entry now clones.
+3. **The staging ring is pinned *host* memory** and was being subtracted from the HBM budget, and
+   `fetch_int8` concatenated every batch into a second copy of itself.  Both gone.
+
+And one measurement that reorders the remaining work: with the tier working, the routed branch costs 72%
+of a decode step, but the *fetch* is only ~100 ms of it - the rest is the per-expert compute, where
+dequantization alone outweighs the matrix multiply it exists to feed.  The int8 `npu_quant_matmul` path
+(82 µs above) is therefore the next step, ahead of anything to do with I/O.
+
+## 9. Where the remaining time goes
+
+After this round the split is: 544 ms the dense floor, ~1 380 ms the routed experts.  Of the experts, the
+fetch is ~100 ms and the rest is per-expert work on single-row tensors - the launch/op-count problem this
 project solved on CUDA with per-layer graph capture (`include/strata/core/session.hpp:108-112`: 43 nodes
-replayed 1.51x faster than dispatched), and the same fix applies here — `aclmdlRICapture` per layer, or the
-int8 `npu_quant_matmul` path to cut the dequantize-then-multiply pairs in half. Prefill, at 0.9 s/token
-against a cold array, is storage-bound as expected.
+replayed 1.51x faster than dispatched), plus the dequantization that int8 matmul removes outright.  Prefill
+at 0.9 s/token against a cold array stays storage-bound, as expected.
 
-## 9. Reflecting on the numbers
+## 10. Reflecting on the numbers
 
 The measured chain per decode step is: 8.1 GB of routed experts, read at 12.7 GB/s when the page cache
 holds them (0.67 s) or at ~2.5 GB/s when it does not (~3 s), copied at 20 GB/s, then multiplied. An HBM
