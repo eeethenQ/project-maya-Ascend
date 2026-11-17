@@ -21,6 +21,7 @@ Nothing here imports torch_npu: run it on ``cpu`` for the reference, on ``npu:0`
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -264,58 +265,143 @@ class NullExpertSource(ExpertSource):
 
 
 class ExpertStreamer(ExpertSource):
-    """Routed experts read from the checkpoint's page cache into a bounded device cache.
+    """Routed experts read from the checkpoint straight into a pinned staging buffer, then to the card.
 
-    Each expert is 3 x 2304 x 5120 int8 = 35.4 MB.  ``cache_slots`` of them stay resident on the device -
-    that is the VRAM expert tier the engine budgets from the HBM it has left - and the rest are read
-    through the mapping and copied over, which is what the 20 GB/s host link costs.
+    Each expert is 3 x 2304 x 5120 int8 = 33.8 MB, a decode step routes 40 x 6 of them, and the measured
+    limits on this machine are ~12 GB/s for threaded host reads and ~20 GB/s for host->HBM.  What that
+    rules out is what the obvious code does: ``np.stack`` of page-cache views copies at 1.8 GB/s, and one
+    ``pread`` per expert on one thread reaches only 3.5 GB/s (``ascend/bench_experts.py`` measures all
+    three).  So: one open descriptor per shard, one ``preadv`` per (expert, projection) into a
+    pre-allocated pinned buffer, a thread per expert, and a single asynchronous copy per projection.
+
+    ``cache_slots`` experts stay resident on the card - the VRAM expert tier the engine budgets from the
+    HBM it has left - and are served without touching the host at all.
     """
 
     def __init__(self, ckpt: Checkpoint, cfg: TextConfig, device, dtype=torch.bfloat16,
-                 cache_slots: int = 0, max_context: int = 8192):
+                 cache_slots: int = 0, io_threads: int = 6, pin: bool = True):
         self.ckpt, self.cfg, self.device, self.dtype = ckpt, cfg, device, dtype
         self.cache_slots = max(0, int(cache_slots))
-        self._cache: dict[tuple[int, int], dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
+        self._cache: dict[tuple[int, int], dict] = {}
         self._order: list[tuple[int, int]] = []
         self.hits = self.misses = 0
         self.bytes_in = 0
+        self._shapes = {"w1": (cfg.moe_intermediate_size, cfg.hidden_size),
+                        "w2": (cfg.hidden_size, cfg.moe_intermediate_size),
+                        "w3": (cfg.moe_intermediate_size, cfg.hidden_size)}
+        self._pin_enabled = pin
+        # A ring of staging buffers, not one: the device runs behind the host, so the copy of layer L may
+        # still be in flight when layer L+1 wants the same pinned buffer.  Each slot carries an event
+        # recorded after its copy, and a slot is only reused once that copy has landed.
+        self._ring = 3
+        self._staging: dict[str, list[torch.Tensor]] = {}
+        self._events: list = []
+        self._slot = 0
+        self._cap = 0
+        self._fds: dict[str, int] = {}
+        self._pool = ThreadPoolExecutor(max_workers=max(1, io_threads))
+        self._staging_mib = 0
 
-    def _read(self, layer: int, expert: int) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    # -- host staging -------------------------------------------------------------------------
+    def _ensure_staging(self, n: int) -> None:
+        if n <= self._cap:
+            return
+        cap = max(n, 2 * self._cap, 8)
+        for p, (out, inn) in self._shapes.items():
+            slots = []
+            for _ in range(self._ring):
+                t = torch.empty((cap, out, inn), dtype=torch.int8)
+                if self._pin_enabled:
+                    try:
+                        t = t.pin_memory()
+                    except Exception:                      # noqa: BLE001 - pinned memory is a nicety
+                        self._pin_enabled = False
+                slots.append(t)
+            self._staging[p] = slots
+        if not self._events and hasattr(torch, "npu") and str(self.device).startswith("npu"):
+            self._events = [torch.npu.Event() for _ in range(self._ring)]
+        self._cap = cap
+        self._staging_mib = sum(t.numel() for t in self._staging.values() for t in t) / (1 << 20)
+
+    def _fd(self, shard: str) -> int:
+        fd = self._fds.get(shard)
+        if fd is None:
+            import os
+            fd = os.open(str(self.ckpt.shards[shard].path), os.O_RDONLY)
+            self._fds[shard] = fd
+        return fd
+
+    def _read_one(self, layer: int, e: int, slot: int, views: dict) -> None:
+        import os
+        for p in ("w1", "w2", "w3"):
+            info = self.ckpt.info(f"layers.{layer}.ffn.experts.{e}.{p}.weight")
+            shard = self.ckpt.shards[info.shard]
+            os.preadv(self._fd(info.shard), [memoryview(views[p][slot]).cast("B")],
+                      shard.data_start + info.begin)
+
+    def _read_many(self, layer: int, experts: list[int]) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        n = len(experts)
+        self._ensure_staging(n)
+        slot = self._slot
+        self._slot = (slot + 1) % self._ring
+        if self._events:
+            # waits only for this slot's own copy, not for the compute queued behind it (a no-op when
+            # that copy has already landed), so the host read still overlaps the device's work
+            self._events[slot].synchronize()
+        views = {p: self._staging[p][slot].numpy() for p in self._shapes}
+        list(self._pool.map(lambda i_e: self._read_one(layer, i_e[1], i_e[0], views), list(enumerate(experts))))
         out = {}
         for p in ("w1", "w2", "w3"):
-            base = f"layers.{layer}.ffn.experts.{expert}.{p}.weight"
-            info = self.ckpt.info(base)
-            q = torch.from_numpy(np.frombuffer(self.ckpt.raw(base), dtype=np.int8).reshape(info.shape))
-            s = torch.from_numpy(np.array(self.ckpt.numpy(base + "_scale")))
-            o = (torch.from_numpy(np.array(self.ckpt.numpy(base + "_offset")))
-                 if (base + "_offset") in self.ckpt else torch.zeros_like(s))
-            self.bytes_in += info.nbytes
-            out[p] = (q.to(self.device, non_blocking=True).view(1, *info.shape),
-                      s.to(self.device, non_blocking=True).view(1, *s.shape),
-                      o.to(self.device, non_blocking=True).view(1, *o.shape))
+            # copy=True even when the device *is* the host: an expert that lands in the resident cache must
+            # own its bytes, or the next layer's read overwrites it (the slots are reused)
+            q = self._staging[p][slot][:n].to(self.device, non_blocking=True, copy=True)
+            ss, os_ = [], []
+            for e in experts:
+                base = f"layers.{layer}.ffn.experts.{e}.{p}.weight"
+                info = self.ckpt.info(base)
+                self.bytes_in += info.nbytes
+                ss.append(self.ckpt.numpy(base + "_scale"))
+                os_.append(self.ckpt.numpy(base + "_offset") if (base + "_offset") in self.ckpt
+                           else np.zeros_like(ss[-1]))
+            # the scales and offsets are a few tens of KB: copied synchronously, because an async copy
+            # would outlive the temporary numpy array it is reading from
+            out[p] = (q, torch.from_numpy(np.stack(ss)).to(self.device),
+                      torch.from_numpy(np.stack(os_)).to(self.device))
+        if self._events:
+            self._events[slot].record()
         return out
 
+    # -- the interface ------------------------------------------------------------------------
     def fetch_int8(self, layer: int, experts: list[int]) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        got: list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = []
-        for e in experts:
-            key = (layer, int(e))
-            block = self._cache.get(key)
+        experts = [int(e) for e in experts]
+        if not experts:
+            return {}
+        blocks: list[dict | None] = [None] * len(experts)
+        missing: list[tuple[int, int]] = []
+        for i, e in enumerate(experts):
+            block = self._cache.get((layer, e))
             if block is not None:
                 self.hits += 1
-                self._order.remove(key)
-                self._order.append(key)
-            else:
-                self.misses += 1
-                block = self._read(layer, int(e))
                 if self.cache_slots:
-                    while len(self._order) >= self.cache_slots:
-                        old = self._order.pop(0)
-                        self._cache.pop(old, None)
-                    self._cache[key] = block
+                    key = (layer, e)
+                    if key in self._order:
+                        self._order.remove(key)
                     self._order.append(key)
-            got.append(block)
-        if not got:
-            return {}
+                blocks[i] = block
+            else:
+                missing.append((i, e))
+        if missing:
+            self.misses += len(missing)
+            read = self._read_many(layer, [e for _, e in missing])
+            for j, (i, e) in enumerate(missing):
+                block = {p: tuple(t[j:j + 1] for t in read[p]) for p in read}
+                blocks[i] = block
+                if self.cache_slots:
+                    self._cache[(layer, e)] = block
+                    self._order.append((layer, e))
+                    while len(self._order) > self.cache_slots:
+                        self._cache.pop(self._order.pop(0), None)
+        got = blocks
         # stack the experts of this layer: one batched matmul instead of six
         return {p: (torch.cat([g[p][0] for g in got], 0),
                     torch.cat([g[p][1] for g in got], 0),
@@ -323,7 +409,20 @@ class ExpertStreamer(ExpertSource):
 
     def stats(self) -> dict[str, int]:
         return {"expert_hits": self.hits, "expert_misses": self.misses, "expert_bytes": self.bytes_in,
-                "expert_slots": len(self._order)}
+                "expert_slots": len(self._order), "staging_mib": int(self._staging_mib)}
+
+    def close(self) -> None:
+        import os
+        self._pool.shutdown(wait=False)
+        for fd in self._fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fds.clear()
+        self._staging.clear()
+        self._cache.clear()
+        self._order.clear()
 
 
 # --------------------------------------------------------------------------- state

@@ -129,6 +129,7 @@ class TheExpertSource(unittest.TestCase):
         # the second pass is served entirely from the cache, and reads exactly what the first did
         self.assertEqual(stats["expert_hits"], hits["expert_misses"])
         self.assertEqual(stats["expert_misses"], hits["expert_misses"])
+        self.assertEqual(stats["expert_hits"] + stats["expert_misses"], 2 * hits["expert_misses"])
         self.assertGreater(hits["expert_bytes"], 0)
 
     def test_the_streamed_bytes_are_what_the_experts_weigh(self):

@@ -103,7 +103,10 @@ class Shard:
         if self._mm is None:
             fd = os.open(self.path, os.O_RDONLY)
             try:
-                self._mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+                # ACCESS_COPY (a private mapping) rather than ACCESS_READ: torch.from_numpy wants a
+                # writable buffer and refuses a read-only one; nothing here ever writes, so the pages stay
+                # the file's page cache and the mapping costs no RAM of its own.
+                self._mm = mmap.mmap(fd, 0, access=mmap.ACCESS_COPY)
             finally:
                 os.close(fd)
         return self._mm
