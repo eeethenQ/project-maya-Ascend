@@ -1,0 +1,11 @@
+{
+  "exe": "/home/q00999609/project-maya-Ascend/ascend/strata-ascend",
+  "args": [
+    "--model", "/mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8",
+    "--tokenizer", "/home/q00999609/dsv41-tokenizer/tokenizer.json",
+    "--max-context", "4096",
+    "--expert-slots", "256"
+  ],
+  "tokenizer": "/home/q00999609/dsv41-tokenizer",
+  "model_name": "DeepSeek-V4.1-Flash"
+}

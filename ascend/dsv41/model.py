@@ -463,20 +463,32 @@ class State:
                                                        dtype=torch.float32)
             self.comp_closed[lid] = 0
         self.pos = torch.zeros(batch, dtype=torch.long, device=device)
+        # the same position as a host integer: the forward pass branches on it several times per layer,
+        # and a `.item()` there would flush the device pipeline each time
+        self.next_pos = 0
         self.topk = None
         self.candidates = None
         # statistics
         self.tokens = 0
 
     def context(self) -> int:
-        return int(self.pos.max().item()) if self.pos.numel() else 0
+        return self.next_pos
 
-    def entries(self, layer: int) -> int:
-        """How many compressed entries a query at the current position can see."""
+    def rewind(self, n: int = 1) -> None:
+        """Step back `n` tokens.  Every plane is addressed by absolute position and written before it is
+        read, so moving the pointer is enough: the rows past it are overwritten by the next pass."""
+        if n < 0 or n > self.next_pos:
+            raise ValueError(f"cannot rewind {n} of {self.next_pos} tokens")
+        self.next_pos -= n
+        self.pos -= n
+        self.tokens -= n
+
+    def entries(self, layer: int, position: int | None = None) -> int:
+        """How many compressed entries a query at `position` (default: the next one) can see."""
         r = self.plan.layer(layer).compress_ratio
         if not r:
             return 0
-        return (self.context() + 1) // r
+        return ((self.next_pos if position is None else position) + 1) // r
 
 
 
@@ -531,7 +543,8 @@ class Dsv41:
         return post.unsqueeze(-1) * y.float().unsqueeze(1) + (comb.unsqueeze(-1) * res.float().unsqueeze(2)).sum(1)
 
     # -- the compressor: tokens into compressed entries ------------------------------------------
-    def compress(self, li: int, x: torch.Tensor, positions: torch.Tensor, state: State):
+    def compress(self, li: int, x: torch.Tensor, positions: torch.Tensor, host_positions: list[int],
+                 state: State):
         """Run the layer's compressor over this chunk; returns the pre-RoPE latents of the closed groups.
 
         The oracle pools a whole sequence at once; here each group closes at its last token, which is what
@@ -555,11 +568,11 @@ class Dsv41:
         # every group this chunk completes: (group id g, its r rows, the group-start position)
         out_lat, out_pos = [], []
         for t in range(T):
-            p = int(positions[t].item())
+            p = host_positions[t]
             if (p + 1) % r:
                 continue
             g = (p + 1) // r - 1
-            js = torch.arange(g * r, g * r + r, device=x.device)
+            js = torch.arange(g * r, g * r + r, device=positions.device)
             kvc = state.comp_kv_raw[li][:, js]                       # [batch, r, D]
             sc = state.comp_score_raw[li][:, js]
             pooled = (kvc * sc.softmax(1)).sum(1)                    # per-dim softmax over the group
@@ -568,11 +581,12 @@ class Dsv41:
         if not out_lat:
             return None, None
         latent = rms(torch.cat(out_lat, 0), lw.compressor["norm"], self.eps)
-        return latent, torch.tensor(out_pos, device=x.device, dtype=positions.dtype)
+        return latent, out_pos
 
     # -- the indexer: which compressed entries a query reads -------------------------------------
     def indexer(self, li: int, x: torch.Tensor, qr: torch.Tensor, latent: torch.Tensor | None,
-                group_pos: torch.Tensor | None, positions: torch.Tensor, state: State) -> torch.Tensor:
+                group_pos: list[int] | None, positions: torch.Tensor, host_positions: list[int],
+                state: State) -> torch.Tensor:
         cfg, role = self.cfg, self.plan.layer(li)
         lw = self.weights.layers[li]
         r = role.compress_ratio
@@ -580,22 +594,23 @@ class Dsv41:
         freqs = self.rope.freqs_comp
         T = x.shape[0]
         if role.is_kv_source and latent is not None:
+            gp = torch.tensor(group_pos, device=positions.device, dtype=positions.dtype)
             k = rms(self.mm(latent, lw.indexer["wk"]), lw.indexer["k_norm"], self.eps)
-            k = torch.cat([k[:, :-rd], self.rope.apply(k[:, -rd:], freqs, group_pos)], -1)
-            g0 = int(group_pos[0].item()) // r
+            k = torch.cat([k[:, :-rd], self.rope.apply(k[:, -rd:], freqs, gp)], -1)
+            g0 = group_pos[0] // r
             state.index_k[li][:, g0:g0 + k.shape[0]] = k.to(state.dtype)
         q = (self.mm(qr, lw.indexer["wq_b"])).view(T, nh, hd)
         q = torch.cat([q[..., :-rd], self.rope.apply(q[..., -rd:], freqs, positions)], -1)
         w = self.mm(x, lw.indexer["weights_proj"]) * (hd ** -0.5 * nh ** -0.5)
         # a query at position p sees entries [0, (p+1)//r): the group it is itself closing counts
-        entries = int((int(positions[-1].item()) + 1) // r)
+        entries = (host_positions[-1] + 1) // r
         if entries <= 0:
             return torch.full((T, 1), -1, dtype=torch.long, device=x.device)
         ik = state.index_k[role.kv_source_layer][:, :entries].float()      # [1, E, hd]
         # score[t, j] = sum_h w[t, h] * relu(q[t, h] . ik[j])
         dots = torch.einsum("thd,ejd->thej", q.float(), ik).relu_()        # [T, nh, 1, E]
         score = (dots * w[:, :, None, None]).sum(1)[:, 0, :]               # [T, E]
-        lens = ((positions + 1) // r).unsqueeze(-1)
+        lens = ((torch.tensor(host_positions, device=positions.device) + 1) // r).unsqueeze(-1)
         score = score.masked_fill(torch.arange(entries, device=x.device)[None, :] >= lens, float("-inf"))
         if role.is_candidate_source:
             state.candidates = self.candidate_blocks(score, lens)
@@ -630,7 +645,8 @@ class Dsv41:
         den = p.sum(-1) + torch.exp(sink[None, :] - m)
         return torch.einsum("thk,tkd->thd", p, keys) / den.unsqueeze(-1)
 
-    def attention(self, li: int, x: torch.Tensor, positions: torch.Tensor, state: State) -> torch.Tensor:
+    def attention(self, li: int, x: torch.Tensor, positions: torch.Tensor, host_positions: list[int],
+                  state: State) -> torch.Tensor:
         cfg, role = self.cfg, self.plan.layer(li)
         lw = self.weights.layers[li]
         T = x.shape[0]
@@ -647,24 +663,25 @@ class Dsv41:
         latent, group_pos = (None, None)
         if r and role.is_kv_source:
             # only the four KV sources run a compressor; a consumer reads the cache it produced
-            latent, group_pos = self.compress(li, x, positions, state)
+            latent, group_pos = self.compress(li, x, positions, host_positions, state)
         if role.is_index_source:
-            state.topk = self.indexer(li, x, qr, latent, group_pos, positions, state)
+            state.topk = self.indexer(li, x, qr, latent, group_pos, positions, host_positions, state)
         if latent is not None:
             # the compressed entry is stored rotated at its group's start position
-            lat = torch.cat([latent[:, :-rd], self.rope.apply(latent[:, -rd:], freqs, group_pos)], -1)
-            g0 = int(group_pos[0].item()) // r
+            gp = torch.tensor(group_pos, device=positions.device, dtype=positions.dtype)
+            lat = torch.cat([latent[:, :-rd], self.rope.apply(latent[:, -rd:], freqs, gp)], -1)
+            g0 = group_pos[0] // r
             state.long_kv[li][:, g0:g0 + lat.shape[0]] = lat.to(state.dtype)
 
         # the window rows for this chunk, written before any of them is read
         for t in range(T):
-            state.swa[li][:, int(positions[t].item())] = kv[t].to(state.dtype)
+            state.swa[li][:, host_positions[t]] = kv[t].to(state.dtype)
 
         out = torch.empty(T, H, D, device=x.device, dtype=torch.float32)
         win = cfg.sliding_window
         topk = state.topk if (r and state.topk is not None) else None
         for t in range(T):
-            p = int(positions[t].item())
+            p = host_positions[t]
             w0 = max(0, p - win + 1)
             wkeys = state.swa[li][:, w0:p + 1].float()                     # [1, nw, D]
             if r:
@@ -727,14 +744,19 @@ class Dsv41:
 
     # -- the whole forward ----------------------------------------------------------------------
     @torch.inference_mode()
-    def forward(self, ids: list[int] | torch.Tensor, state: State, logits_last_only: bool = True):
-        """Run a chunk of tokens through the 40 layers; returns the logits (or just the last row's)."""
+    def forward(self, ids: list[int] | torch.Tensor, state: State, logits_last_only: bool = True,
+                compute_logits: bool = True):
+        """Run a chunk of tokens through the 40 layers; returns the logits (or just the last row's).
+
+        ``compute_logits=False`` skips the head for a prompt chunk whose logits nothing will read.
+        """
         cfg = self.cfg
         dev = self.device
         ids_t = torch.as_tensor(ids, dtype=torch.long, device=dev).reshape(-1)
         T = ids_t.numel()
-        start = int(state.pos[0].item())
-        positions = torch.arange(start, start + T, device=dev, dtype=torch.long)
+        start = state.next_pos
+        host_positions = list(range(start, start + T))
+        positions = torch.tensor(host_positions, device=dev, dtype=torch.long)
 
         h = self.weights.embed[ids_t].float()                     # [T, dim]
         h = h.unsqueeze(1).repeat(1, self.hc, 1)                  # four identical streams
@@ -746,7 +768,7 @@ class Dsv41:
             res = h
             a_pre, a_post, a_comb = self.hc_mixes(h, lw.hc["attn_fn"], lw.hc["attn_scale"], lw.hc["attn_base"])
             x = rms(self.hc_pre(h, pre), lw.norms["attn_norm"], self.eps)
-            h = self.hc_post(self.attention(li, x, positions, state), res, a_post, a_comb)
+            h = self.hc_post(self.attention(li, x, positions, host_positions, state), res, a_post, a_comb)
             res = h
             f_pre, f_post, f_comb = self.hc_mixes(h, lw.hc["ffn_fn"], lw.hc["ffn_scale"], lw.hc["ffn_base"])
             x = rms(self.hc_pre(h, a_pre), lw.norms["ffn_norm"], self.eps)
@@ -755,6 +777,9 @@ class Dsv41:
 
         x = rms(self.hc_pre(h, pre), self.weights.final_norm, self.eps)
         state.pos += T
+        state.next_pos += T
         state.tokens += T
+        if not compute_logits:
+            return None
         rows = x[-1:] if logits_last_only else x
         return rows @ self.weights.head.T

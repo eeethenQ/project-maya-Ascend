@@ -291,9 +291,9 @@ class ThePieces(unittest.TestCase):
                   if self.net.plan.layer(i).compress_ratio == r and self.net.plan.layer(i).is_kv_source)
         x = torch.randn(r, cfg.hidden_size)
         state = new_state(self.model)
-        latent, pos = self.net.compress(li, x, torch.tensor([0, 1]), state)
+        latent, pos = self.net.compress(li, x, torch.tensor([0, 1]), [0, 1], state)
         self.assertIsNotNone(latent)
-        self.assertEqual(int(pos[0]), 0)
+        self.assertEqual(pos[0], 0)
         # recompute by hand
         lw = self.net.weights.layers[li]
         kv = (x.to(self.net.weights.dtype) @ lw.compressor["wkv"].T).float()

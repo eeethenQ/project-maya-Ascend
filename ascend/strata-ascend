@@ -1,0 +1,21 @@
+#!/bin/sh
+# ascend/strata-ascend - the Ascend DeepSeek-V4.1 engine, as the `exe` serve/server.py starts.
+#
+# A serve config names an executable and its arguments, and the server runs `[exe, "--serve", *args]`
+# (serve/server.py:979).  This is that executable for the Ascend backend: it hands the same argv to
+# `python -m ascend.serve_engine`.  Point a config at it, e.g.
+#
+#   {"exe": "<repo>/ascend/strata-ascend",
+#    "args": ["--model", "/mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8",
+#             "--tokenizer", "/mnt/weights/DeepSeek-V4-Flash-0731-w8a8/tokenizer.json"],
+#    "tokenizer": "/mnt/weights/DeepSeek-V4-Flash-0731-w8a8/tokenizer.json",
+#    "model_name": "DeepSeek-V4.1-Flash"}
+#
+# PYTHON selects the interpreter (the CANN one that has torch_npu), MAYA_ASCEND_PYTHON_PATH the tree this
+# module lives in when the engine runs from a checkout other than this one.
+set -e
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(dirname "$here")
+: "${PYTHON:=python3}"
+: "${MAYA_ASCEND_PYTHON_PATH:=$root}"
+PYTHONPATH="$MAYA_ASCEND_PYTHON_PATH${PYTHONPATH:+:$PYTHONPATH}" exec "$PYTHON" -m ascend.serve_engine "$@"
