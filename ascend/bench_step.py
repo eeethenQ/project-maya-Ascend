@@ -75,6 +75,10 @@ def main() -> int:
     ap.add_argument("--prompt-tokens", type=int, default=8)
     ap.add_argument("--steps", type=int, default=4)
     ap.add_argument("--max-context", type=int, default=2048)
+    ap.add_argument("--ab", action="store_true",
+                    help="A/B the int8 expert matmul against dequantize-then-multiply, interleaved in one "
+                         "process: the shared machine drifts by 50% between runs, so two runs cannot decide")
+    ap.add_argument("--ab-steps", type=int, default=6)
     a = ap.parse_args()
 
     cfg = TextConfig.from_json(Path(a.model) / "config.json")
@@ -112,6 +116,40 @@ def main() -> int:
     dense.close()
     del dense
     _release(a.device)
+
+    if a.ab:
+        full = build(a.model, a.device, a.hbm_share, a.expert_slots, a.expert_batch, False,
+                     a.expert_reserve_gib)
+        print(f"int8 expert matmul available: {full.model.int8_experts}")
+        state = full.state(a.max_context)
+        ids = [(i * 7 + 3) % 40000 for i in range(a.prompt_tokens)]
+        full.model.forward(ids, state, compute_logits=True)
+        rounds = {"int8": [], "dequant": []}
+        tok = 3
+        for repeat in range(3):                      # three alternations, so drift cancels
+            for label, use in (("int8", True), ("dequant", False)):
+                full.model.int8_experts = use and str(a.device).startswith("npu")
+                for _ in range(a.ab_steps):
+                    if str(a.device).startswith("npu"):
+                        torch.npu.synchronize()
+                    t0 = time.perf_counter()
+                    logits = full.model.forward([tok], state, logits_last_only=True)
+                    tok = int(logits[0].argmax())
+                    if str(a.device).startswith("npu"):
+                        torch.npu.synchronize()
+                    rounds[label].append((time.perf_counter() - t0) * 1e3)
+        for label in ("int8", "dequant"):
+            xs = sorted(rounds[label])
+            median = xs[len(xs) // 2]
+            print(f"  {label:8s} {sum(xs) / len(xs):7.1f} ms/token mean, {median:7.1f} median, "
+                  f"{min(xs):7.1f} best (n={len(xs)})")
+        a_int8 = sorted(rounds["int8"])[a.ab_steps]
+        a_deq = sorted(rounds["dequant"])[a.ab_steps]
+        print(f"  int8 is {a_deq / max(a_int8, 1e-9):.2f}x the dequant path at the same percentile")
+        full.close()
+        del full
+        _release(a.device)
+        return 0
 
     # the phases inside the full model, with synchronisation between them
     full = build(a.model, a.device, a.hbm_share, a.expert_slots, a.expert_batch, False,

@@ -31,6 +31,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+try:                                                    # the int8 expert path needs the Ascend runtime
+    import torch_npu  # noqa: F401
+except Exception:                                       # noqa: BLE001 - the host has no torch_npu
+    torch_npu = None
+
 from .checkpoint import Checkpoint
 from .config import FULL, REUSE, SWA_ONLY, LayerRole, TextConfig, Topology, build_layer_plan
 
@@ -149,6 +154,9 @@ class Weights:
         self.verbose = verbose
         self.experts = expert_source or NullExpertSource(ckpt, cfg, dtype)
         self.layers: list[LayerWeights] = []
+        # the int8 matmul path has no zero point; the checkpoint is symmetric (offset 0), and this records
+        # whether everything the loader touched agrees, so the path can be used without checking per expert
+        self.offsets_are_zero = True
 
     # -- one tensor ------------------------------------------------------------------------------
     def _dequant(self, name: str) -> torch.Tensor:
@@ -158,6 +166,8 @@ class Weights:
             w = self.ckpt.numpy(name)
             s = self.ckpt.numpy(name + "_scale")
             o = self.ckpt.numpy(name + "_offset") if (name + "_offset") in self.ckpt else None
+            if o is not None and o.any():
+                self.offsets_are_zero = False
             return torch.from_numpy(dequant_int8(w, s, o))
         # a copy: the file view is read-only and the device transfer wants a writable source
         return torch.from_numpy(np.array(self.ckpt.numpy(name), dtype=np.float32, copy=True))
@@ -528,6 +538,8 @@ class Dsv41:
         self.timers: dict[str, float] | None = None
         # experts per MoE batch: the staging ring is sized for this many, so the two must agree
         self.expert_batch = int(getattr(weights.experts, "_max_batch", 8))
+        # the int8 fast path needs an Ascend runtime and a symmetric (zero-point-free) checkpoint
+        self.int8_experts = (str(device).startswith("npu") and getattr(weights, "offsets_are_zero", False))
 
     @contextmanager
     def phase(self, name: str):
@@ -760,6 +772,21 @@ class Dsv41:
         u = self.mm(x, w3).clamp(-self.lim, self.lim)
         return F.silu(g) * u
 
+    def expert_mm(self, x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+        """x [T,in] times an expert's int8 [1,out,in] and its per-channel scale, as [T,out] fp32.
+
+        Two ways, and the difference is not the multiply: dequantizing first writes 71 MB of bf16 per expert
+        and allocates it, which on a card already holding a 9 GiB expert tier is most of what a decode step
+        spends.  The int8 Cube multiplies the weights where they are (measured: 82 us against 250 us for
+        dequantize-then-multiply) - the activation is quantized per token, exactly the scheme the checkpoint
+        was quantized for, and its dequant scale multiplies the result.
+        """
+        if self.int8_experts and torch_npu is not None:
+            xq, xs = per_token_int8(x)
+            got = torch_npu.npu_quant_matmul(xq, q[0].T, scale.view(-1), output_dtype=torch.bfloat16)
+            return got.float() * xs
+        return self.mm(x, self.dequant(q, scale, offset)[0])
+
     def dequant(self, q: torch.Tensor, scale: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
         """(q - offset) * scale, in the compute dtype.
 
@@ -795,11 +822,10 @@ class Dsv41:
             for i, e in enumerate(batch):
                 rows, slot = torch.where(idx == e)
                 xs = x[rows]
-                w1 = self.dequant(*blocks[i]["w1"])
-                w2 = self.dequant(*blocks[i]["w2"])
-                w3 = self.dequant(*blocks[i]["w3"])
-                h = self.swiglu(xs, w1[0], w3[0])
-                y.index_add_(0, rows, self.mm(h, w2[0]) * wts[rows, slot, None])
+                g = self.expert_mm(xs, *blocks[i]["w1"]).clamp(max=self.lim)
+                u = self.expert_mm(xs, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
+                h = F.silu(g) * u
+                y.index_add_(0, rows, self.expert_mm(h, *blocks[i]["w2"]) * wts[rows, slot, None])
         shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
         y = y + self.mm(shared, lw.ffn["shared_w2"])
         return y

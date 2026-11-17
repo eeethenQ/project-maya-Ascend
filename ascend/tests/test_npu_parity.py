@@ -109,6 +109,21 @@ class Parity(unittest.TestCase):
         finally:
             run.close()
 
+    def test_the_int8_expert_path_matches_the_dequantized_one(self):
+        """The w8a8 fast path multiplies the weights where they are; it must agree with dequantizing them."""
+        npu = self.build(self.dev, torch.bfloat16)
+        self.assertTrue(npu.int8_experts, "the checkpoint is symmetric, so the int8 path should be available")
+        ids = [3, 5, 7, 11, 13]
+        npu.int8_experts = True
+        got = npu.forward(ids, self.state(self.dev, torch.bfloat16)).float().cpu()
+        npu.int8_experts = False
+        want = npu.forward(ids, self.state(self.dev, torch.bfloat16)).float().cpu()
+        rel = (got - want).abs().max() / want.abs().max().clamp_min(1e-6)
+        self.assertLess(rel.item(), 5e-2,
+                        f"int8 expert matmul vs dequantize-then-multiply: max rel err {rel.item():.2e}")
+        # and the ranking a greedy engine acts on must not change
+        self.assertEqual(int(got.argmax()), int(want.argmax()))
+
     def test_the_share_is_respected_while_the_model_runs(self):
         """mem_get_info reports the card; what matters is that this process never allocates past its share."""
         npu = self.build(self.dev, torch.bfloat16)

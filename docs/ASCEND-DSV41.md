@@ -221,10 +221,21 @@ Three bugs the measurement found, each worth more than the tuning that followed:
 3. **The staging ring is pinned *host* memory** and was being subtracted from the HBM budget, and
    `fetch_int8` concatenated every batch into a second copy of itself.  Both gone.
 
-And one measurement that reorders the remaining work: with the tier working, the routed branch costs 72%
-of a decode step, but the *fetch* is only ~100 ms of it - the rest is the per-expert compute, where
-dequantization alone outweighs the matrix multiply it exists to feed.  The int8 `npu_quant_matmul` path
-(82 µs above) is therefore the next step, ahead of anything to do with I/O.
+With the tier working, the routed branch costs 72% of a decode step, but the *fetch* is only ~100 ms of it;
+the rest is per-expert compute on single-row tensors, where dequantization alone outweighs the matrix
+multiply it feeds.  So the int8 path went in: `expert_mm` now multiplies the int8 weights where they are and
+quantizes the activation per token - the scheme the checkpoint was quantized for - which also removes a
+71 MB allocation per expert per token.
+
+**It is worth ~8%, not the 3x the micro-benchmark promised**, and that is the useful finding: A/B'd
+interleaved in one process (`--ab`, because this shared machine drifts by 50% between runs), int8 comes out
+at 0.92x the dequant path.  The matmul was never the bulk of the per-expert cost; whatever else is in that
+loop is, and it is the next thing to measure rather than guess at.
+
+**On the numbers in this document**: they were taken on a card shared with other tenants, and the same
+configuration measured 1 926 ms/token in a quiet window and 3 247 ms/token in a busy one.  The
+before/after figures above come from interleaved or back-to-back runs for that reason; treat absolute
+tok/s as a range and comparisons as the signal.
 
 ## 9. Where the remaining time goes
 
