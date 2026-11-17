@@ -61,3 +61,5 @@ build-vision.bat
 /data/glm-link-cpu-cal.txt
 # the Ascend engine's converted tokenizer directory (ascend/setup_tokenizer.sh)
 .ascend-tokenizer/
+# GSM8K questions for ascend/eval_gsm8k.py (copied, not vendored)
+.gsm8k/

@@ -66,6 +66,7 @@ class Engine:
                            io_threads=args.io_threads, expert_batch=args.expert_batch,
                            expert_reserve_gib=args.expert_reserve_gib,
                            expert_devices=args.expert_devices.split(",") if args.expert_devices else None,
+                           engram_tokenizer=args.engram_tokenizer or None,
                            verbose=args.verbose)
         self.cfg = self.rt.cfg
         self.load_s = time.time() - t0
@@ -330,6 +331,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dtype", default="bfloat16", choices=list(rt.DTYPES))
     ap.add_argument("--hbm-share", type=float, default=0.5)
     ap.add_argument("--expert-slots", type=int, default=None)
+    ap.add_argument("--engram-tokenizer", default="",
+                    help="the model's Hugging Face tokenizer.json: enables Engram (it hashes n-grams "
+                         "through the tokenizer's compressed map).  Off when not given.")
     ap.add_argument("--expert-devices", default="",
                     help="comma-separated cards to spread the routed experts' tier over, e.g. "
                          "npu:0,npu:1,npu:2,npu:3; the layers stay on --device")

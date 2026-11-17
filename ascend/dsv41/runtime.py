@@ -31,6 +31,7 @@ class Runtime:
     device: str
     dtype: torch.dtype
     experts: ExpertSource
+    engram: object | None = None          # Engram, when the checkpoint's 203 GB of tables are present
 
     @property
     def expert_slots(self) -> int:
@@ -90,7 +91,7 @@ def free_hbm_bytes(device: str) -> int:
 def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_share: float = 0.5,
           expert_slots: int | None = None, io_threads: int = 6, expert_batch: int = 8,
           expert_reserve_gib: float = 6.0, expert_devices: "list[str] | None" = None,
-          no_experts: bool = False, verbose: bool = False) -> Runtime:
+          engram_tokenizer: str | None = None, no_experts: bool = False, verbose: bool = False) -> Runtime:
     """Load the checkpoint's resident weights and size the expert tier to what is left of the cards.
 
     `expert_devices` spreads the routed experts' tier over several cards, a contiguous block of layers per
@@ -131,11 +132,27 @@ def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_sha
                 per_card = {dev: max(0, free_hbm_bytes(dev) - reserve)}
                 for extra in dict.fromkeys(pool):
                     if extra != dev:
-                        per_card[extra] = max(0, free_hbm_bytes(extra) - int(1.0 * GIB))
+                        # a card that only holds experts still needs room for the batch in flight: the
+                        # staged copy, the slots it is cloned into, and the allocator's own padding.  At
+                        # 1 GiB the tier filled the card and the next insert ran it out of memory.
+                        per_card[extra] = max(0, free_hbm_bytes(extra) - int(3.0 * GIB))
             # never more slots on a card than the model has experts
             cap = cfg.num_hidden_layers * cfg.n_routed_experts
             src.set_slots({d: min(int(b // per_expert), cap) for d, b in per_card.items()})
         else:
             src.set_slots(total=min(int(expert_slots), cfg.num_hidden_layers * cfg.n_routed_experts))
-    model_obj = Dsv41(cfg, weights, dev, dt)
-    return Runtime(cfg=cfg, ckpt=ckpt, weights=weights, model=model_obj, device=dev, dtype=dt, experts=src)
+    engram = None
+    if engram_tokenizer and cfg.engram_layer_ids and f"layers.{cfg.engram_layer_ids[0]}.engram.embed.weight" in ckpt:
+        from .engram import Engram                      # only when the 203 GB of tables are actually present
+        engram = Engram(ckpt, cfg, engram_tokenizer, dev, dt)
+        for layer in cfg.engram_layer_ids:
+            proj = weights.engram_projection(layer)
+            engram.attach(layer, proj["wkv"], proj["q_weight"], proj["k_weight"])
+        if verbose:
+            print(f"  engram: layers {list(cfg.engram_layer_ids)}, "
+                  f"{engram.cols} rows per token, tables mapped not loaded", flush=True)
+    elif engram_tokenizer:
+        print("  engram: the checkpoint has no tables for this config; disabled", flush=True)
+    model_obj = Dsv41(cfg, weights, dev, dt, engram=engram)
+    return Runtime(cfg=cfg, ckpt=ckpt, weights=weights, model=model_obj, device=dev, dtype=dt, experts=src,
+                   engram=engram)

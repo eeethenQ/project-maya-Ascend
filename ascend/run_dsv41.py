@@ -54,7 +54,10 @@ def main() -> int:
                     help="routed experts kept resident on the card (33.8 MiB each)")
     ap.add_argument("--hbm-share", type=float, default=0.5, help="this process's fraction of one card")
     ap.add_argument("--device", default="npu:0")
+    ap.add_argument("--expert-devices", default="", help="cards to spread the expert tier over")
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    ap.add_argument("--engram-tokenizer", default="",
+                    help="enables Engram (hash n-grams through this Hugging Face tokenizer.json)")
     ap.add_argument("--no-experts", action="store_true", help="skip the routed branch (a shape check)")
     a = ap.parse_args()
 
@@ -71,22 +74,26 @@ def main() -> int:
     ckpt = Checkpoint(model_dir)
     print(f"index: {ckpt.summary()}  ({time.time() - t0:.1f}s)", flush=True)
 
-    src = ExpertStreamer(ckpt, cfg, device, dtype, cache_slots=a.expert_slots)
+    from .dsv41 import runtime as rt
     t0 = time.time()
-    weights = Weights(ckpt, cfg, device, dtype, expert_source=src, verbose=False).load()
+    run = rt.build(model=str(model_dir), device=device, dtype=a.dtype,
+                   expert_slots=a.expert_slots,
+                   expert_devices=[d for d in a.expert_devices.split(",") if d] or None,
+                   engram_tokenizer=a.engram_tokenizer or None,
+                   no_experts=a.no_experts)
+    weights, net, src = run.weights, run.model, run.experts
     load_s = time.time() - t0
     resident = weights.resident_bytes()
     print(f"resident: {resident / GIB:.2f} GiB on {device} in {load_s:.1f}s "
           f"({resident / load_s / 1e9:.2f} GB/s)", flush=True)
     per_expert = 3 * cfg.moe_intermediate_size * cfg.hidden_size
     routed = cfg.num_hidden_layers * cfg.num_experts_per_tok
-    print(f"expert tier: {a.expert_slots} slots = {a.expert_slots * per_expert / (1 << 20):.0f} MiB; "
-          f"a decode step routes {routed} experts = {routed * per_expert / 1e9:.2f} GB, "
-          f"{routed * per_expert / 20e9 * 1e3:.0f} ms of host link at 20 GB/s if none is resident",
-          flush=True)
+    print(f"expert tier: {run.expert_slots} slots"
+          + (f" over {len(set(src.layer_devices))} cards" if getattr(src, 'layer_devices', None) else "")
+          + f"; a decode step routes {routed} experts = {routed * per_expert / 1e9:.2f} GB", flush=True)
+    print(f"engram: {'on' if run.engram else 'off'}", flush=True)
 
-    net = Dsv41(cfg, weights, device, dtype)
-    state = State(cfg, build_layer_plan(cfg), device, dtype, max_context=a.max_context)
+    state = run.state(a.max_context)
 
     if a.ids:
         ids = [int(x) for x in a.ids.split(",")]

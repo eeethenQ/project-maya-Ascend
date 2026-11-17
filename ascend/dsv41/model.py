@@ -236,6 +236,14 @@ class Weights:
                 print(f"  layer {li:2d} {role.mode:6s} loaded", flush=True)
         return self
 
+    def engram_projection(self, layer: int) -> dict[str, torch.Tensor]:
+        """One Engram layer's projections (`wkv` from 24 x 256 channels to (hc + 1) x hidden, and the
+        per-channel gate weights).  The table itself is never loaded - it is mapped by `engram.py`."""
+        B = f"layers.{layer}.engram."
+        return {"wkv": self._put(B + "wkv.weight", self.dtype),
+                "q_weight": self._put(B + "q_weight", torch.float32),
+                "k_weight": self._put(B + "k_weight", torch.float32)}
+
     def resident_bytes(self) -> int:
         total = 0
         for t in (self.embed, self.head, self.final_norm):
@@ -525,6 +533,7 @@ class State:
         # the same position as a host integer: the forward pass branches on it several times per layer,
         # and a `.item()` there would flush the device pipeline each time
         self.next_pos = 0
+        self.token_ids: list[int] = []      # Engram hashes the n-gram ending at each position
         self.topk = None
         self.candidates = None
         # statistics
@@ -541,6 +550,7 @@ class State:
         self.next_pos -= n
         self.pos -= n
         self.tokens -= n
+        del self.token_ids[len(self.token_ids) - n:]
 
     def entries(self, layer: int, position: int | None = None) -> int:
         """How many compressed entries a query at `position` (default: the next one) can see."""
@@ -559,8 +569,9 @@ class Dsv41:
     (a prompt, or a single decode step) and extends the :class:`State` it is given.
     """
 
-    def __init__(self, cfg: TextConfig, weights: Weights, device, dtype=torch.bfloat16):
+    def __init__(self, cfg: TextConfig, weights: Weights, device, dtype=torch.bfloat16, engram=None):
         self.cfg = cfg
+        self.engram = engram
         self.plan = build_layer_plan(cfg)
         self.weights = weights
         self.device = device
@@ -901,11 +912,18 @@ class Dsv41:
 
         h = self.weights.embed[ids_t].float()                     # [T, dim]
         h = h.unsqueeze(1).repeat(1, self.hc, 1)                  # four identical streams
+        # Engram is a lookup keyed by the token history: hash the whole sequence, take this chunk's rows
+        engram_rows = None
+        if self.engram is not None:
+            history = state.token_ids + [int(t) for t in ids_t.tolist()]
+            engram_rows = self.engram.hashes(history)[len(state.token_ids):]
         pre = torch.zeros(T, self.hc, device=dev, dtype=torch.float32)
         pre[:, 0] = 1.0
 
         for li in range(cfg.num_hidden_layers):
             lw = self.weights.layers[li]
+            if engram_rows is not None and li in self.engram.slot:
+                h = self.engram.apply(li, h, engram_rows[:, self.engram.slot[li]], self.mm)
             res = h
             with self.phase("hc"):
                 a_pre, a_post, a_comb = self.hc_mixes(h, lw.hc["attn_fn"], lw.hc["attn_scale"],
@@ -923,6 +941,7 @@ class Dsv41:
             pre = f_pre
 
         x = rms(self.hc_pre(h, pre), self.weights.final_norm, self.eps)
+        state.token_ids.extend(int(t) for t in ids_t.tolist())
         state.pos += T
         state.next_pos += T
         state.tokens += T
