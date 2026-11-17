@@ -39,10 +39,10 @@ def _release(device: str) -> None:
 
 
 def build(model: str, device: str, share: float, slots: int | None, batch: int, no_experts: bool,
-          reserve: float = 6.0):
+          reserve: float = 6.0, expert_devices: list[str] | None = None):
     return rt.build(model=model, device=device, dtype="bfloat16", hbm_share=share,
                     expert_slots=slots, expert_batch=batch, expert_reserve_gib=reserve,
-                    no_experts=no_experts)
+                    expert_devices=expert_devices, no_experts=no_experts)
 
 
 def time_decode(run: rt.Runtime, max_context: int, prompt: int, steps: int) -> tuple[float, list[float]]:
@@ -79,21 +79,39 @@ def main() -> int:
                     help="A/B the int8 expert matmul against dequantize-then-multiply, interleaved in one "
                          "process: the shared machine drifts by 50% between runs, so two runs cannot decide")
     ap.add_argument("--ab-steps", type=int, default=6)
+    ap.add_argument("--expert-devices", default="",
+                    help="cards to spread the expert tier over, e.g. npu:0,npu:1,npu:2,npu:3")
+    ap.add_argument("--ab-batch", action="store_true",
+                    help="sweep the experts per fetch batch: a batch smaller than the top-k lets the "
+                         "device compute one batch while the host reads the next")
     a = ap.parse_args()
 
+    devices = [d for d in a.expert_devices.split(",") if d] or None
     cfg = TextConfig.from_json(Path(a.model) / "config.json")
     print(f"model: {cfg.num_hidden_layers} layers, top-{cfg.num_experts_per_tok} of {cfg.n_routed_experts} experts")
 
     full = build(a.model, a.device, a.hbm_share, a.expert_slots, a.expert_batch, False,
-                 a.expert_reserve_gib)
+                 a.expert_reserve_gib, devices)
     slots = getattr(full.experts, "cache_slots", 0)
     resident = full.weights.resident_bytes()
     staging = getattr(full.experts, "staging_bytes", lambda: 0)()
+    if devices:
+        print(f"expert tier spread over {devices}: "
+              f"{[full.experts.device_for(i) for i in (0, 10, 20, 30)]} for layers 0/10/20/30")
     print(f"resident {resident / GIB:.2f} GiB, expert tier {slots} slots "
           f"({slots * 3 * cfg.moe_intermediate_size * cfg.hidden_size / GIB:.2f} GiB), "
           f"staging {staging / GIB:.2f} GiB")
 
+    def hit_counts(run):
+        st = run.experts.stats() if hasattr(run.experts, "stats") else {}
+        return st.get("expert_hits", 0), st.get("expert_misses", 0)
+
+    before = hit_counts(full)
     mean_full, times = time_decode(full, a.max_context, a.prompt_tokens, a.steps)
+    after = hit_counts(full)
+    self_prefill = None
+    print(f"         decode-only fetches: {after[0] - before[0]} hits / {after[1] - before[1]} misses "
+          f"({100 * (after[0] - before[0]) / max(1, (after[0] - before[0]) + (after[1] - before[1])):.0f}% hit)")
     print(f"full   : {mean_full:8.1f} ms/token  ({1000 / mean_full:.2f} tok/s)  steps {['%.0f' % t for t in times]}")
     st = full.experts.stats() if hasattr(full.experts, "stats") else {}
     print(f"         experts: {st.get('expert_hits', 0)} hits / {st.get('expert_misses', 0)} misses, "
@@ -117,9 +135,42 @@ def main() -> int:
     del dense
     _release(a.device)
 
+    if a.ab_batch:
+        full = build(a.model, a.device, a.hbm_share, a.expert_slots, a.expert_batch, False,
+                     a.expert_reserve_gib, devices)
+        state = full.state(a.max_context)
+        ids = [(i * 7 + 3) % 40000 for i in range(a.prompt_tokens)]
+        full.model.forward(ids, state, compute_logits=True)
+        sweep = [b for b in (1, 2, 3, 4, 6, 8) if b <= a.expert_batch]
+        print(f"sweeping fetch batch over {sweep} (top-k is {full.cfg.num_experts_per_tok})")
+        seen: dict[int, list[float]] = {b: [] for b in sweep}
+        tok = 3
+        for repeat in range(2):
+            for b in sweep:                          # interleaved, so a drifting machine cancels
+                full.model.expert_batch = b
+                full.experts._max_batch = b
+                for _ in range(a.ab_steps):
+                    if str(a.device).startswith("npu"):
+                        torch.npu.synchronize()
+                    t0 = time.perf_counter()
+                    logits = full.model.forward([tok], state, logits_last_only=True)
+                    tok = int(logits[0].argmax())
+                    if str(a.device).startswith("npu"):
+                        torch.npu.synchronize()
+                    seen[b].append((time.perf_counter() - t0) * 1e3)
+        for b in sweep:
+            xs = sorted(seen[b])
+            print(f"  batch {b}: median {xs[len(xs) // 2]:7.1f} ms/token, best {xs[0]:7.1f} (n={len(xs)})")
+        best = min(sweep, key=lambda b: sorted(seen[b])[len(seen[b]) // 2])
+        print(f"  best median: batch {best}")
+        full.close()
+        del full
+        _release(a.device)
+        return 0
+
     if a.ab:
         full = build(a.model, a.device, a.hbm_share, a.expert_slots, a.expert_batch, False,
-                     a.expert_reserve_gib)
+                     a.expert_reserve_gib, devices)
         print(f"int8 expert matmul available: {full.model.int8_experts}")
         state = full.state(a.max_context)
         ids = [(i * 7 + 3) % 40000 for i in range(a.prompt_tokens)]
@@ -153,7 +204,7 @@ def main() -> int:
 
     # the phases inside the full model, with synchronisation between them
     full = build(a.model, a.device, a.hbm_share, a.expert_slots, a.expert_batch, False,
-                 a.expert_reserve_gib)
+                 a.expert_reserve_gib, devices)
     full.model.timers = {}
     time_decode(full, a.max_context, a.prompt_tokens, a.steps)
     total = sum(full.model.timers.values()) / max(1, a.steps)

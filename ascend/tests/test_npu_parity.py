@@ -109,6 +109,36 @@ class Parity(unittest.TestCase):
         finally:
             run.close()
 
+    def test_experts_on_a_second_card_give_the_same_answer(self):
+        """The tier may be spread over several cards; where an expert is computed must not change the result."""
+        from ascend.dsv41 import runtime as rt
+
+        cards = [f"npu:{i}" for i in range(min(2, torch.npu.device_count()))]
+        if len(cards) < 2:
+            self.skipTest("needs two visible cards")
+        ids = [3, 5, 7, 11, 13]
+        single = rt.build(model=str(self.model.root), device=cards[0], dtype="bfloat16",
+                          hbm_share=HBM_SHARE, expert_batch=8)
+        try:
+            want = single.model.forward(ids, single.state(64)).float().cpu()
+        finally:
+            single.close()
+        del single
+        import gc
+        gc.collect()
+        torch.npu.empty_cache()
+        spread = rt.build(model=str(self.model.root), device=cards[0], dtype="bfloat16",
+                          hbm_share=HBM_SHARE, expert_batch=8, expert_devices=cards)
+        try:
+            self.assertEqual(spread.experts.layer_devices[:1], [cards[0]])
+            self.assertIn(cards[1], spread.experts.layer_devices)
+            got = spread.model.forward(ids, spread.state(64)).float().cpu()
+        finally:
+            spread.close()
+        rel = (got - want).abs().max() / want.abs().max().clamp_min(1e-6)
+        self.assertLess(rel.item(), 1e-2, f"one card vs two: max rel err {rel.item():.2e}")
+        self.assertEqual(int(got.argmax()), int(want.argmax()))
+
     def test_the_int8_expert_path_matches_the_dequantized_one(self):
         """The w8a8 fast path multiplies the weights where they are; it must agree with dequantizing them."""
         npu = self.build(self.dev, torch.bfloat16)

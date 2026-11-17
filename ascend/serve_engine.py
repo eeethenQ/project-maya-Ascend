@@ -64,7 +64,9 @@ class Engine:
         self.rt = rt.build(model=args.model, device=args.device, dtype=args.dtype,
                            hbm_share=args.hbm_share, expert_slots=args.expert_slots,
                            io_threads=args.io_threads, expert_batch=args.expert_batch,
-                           expert_reserve_gib=args.expert_reserve_gib, verbose=args.verbose)
+                           expert_reserve_gib=args.expert_reserve_gib,
+                           expert_devices=args.expert_devices.split(",") if args.expert_devices else None,
+                           verbose=args.verbose)
         self.cfg = self.rt.cfg
         self.load_s = time.time() - t0
         self.state = None
@@ -328,6 +330,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dtype", default="bfloat16", choices=list(rt.DTYPES))
     ap.add_argument("--hbm-share", type=float, default=0.5)
     ap.add_argument("--expert-slots", type=int, default=None)
+    ap.add_argument("--expert-devices", default="",
+                    help="comma-separated cards to spread the routed experts' tier over, e.g. "
+                         "npu:0,npu:1,npu:2,npu:3; the layers stay on --device")
     ap.add_argument("--expert-reserve-gib", type=float, default=6.0,
                     help="HBM kept free for activations and temporaries; the tier gets the rest")
     ap.add_argument("--io-threads", type=int, default=6)

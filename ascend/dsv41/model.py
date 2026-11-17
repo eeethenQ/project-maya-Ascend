@@ -295,11 +295,18 @@ class ExpertStreamer(ExpertSource):
     """
 
     def __init__(self, ckpt: Checkpoint, cfg: TextConfig, device, dtype=torch.bfloat16,
-                 cache_slots: int = 0, io_threads: int = 6, pin: bool = True, max_batch: int = 8):
+                 cache_slots: int = 0, io_threads: int = 6, pin: bool = True, max_batch: int = 8,
+                 layer_devices: "list[str] | None" = None):
         self.ckpt, self.cfg, self.device, self.dtype = ckpt, cfg, device, dtype
+        # the experts of a layer may live on another card than the layer itself: their tier is what needs
+        # the room, and moving a token's 20 KB activation costs nothing next to a 35 MB expert
+        self.layer_devices = list(layer_devices) if layer_devices else None
         self.cache_slots = max(0, int(cache_slots))
         self._cache: dict[tuple[int, int], dict] = {}
-        self._order: list[tuple[int, int]] = []
+        # one LRU per card: the slots are HBM on a card, so a single global LRU can put more expert bytes
+        # on one card than its share allows, which is exactly what the 32 GB cap forbids
+        self._order: dict[str, list[tuple[int, int]]] = {}
+        self._slots: dict[str, int] = {}
         self.hits = self.misses = 0
         self.bytes_in = 0
         self._shapes = {"w1": (cfg.moe_intermediate_size, cfg.hidden_size),
@@ -319,6 +326,8 @@ class ExpertStreamer(ExpertSource):
         self._fds: dict[str, int] = {}
         self._pool = ThreadPoolExecutor(max_workers=max(1, io_threads))
         self._staging_mib = 0
+        if self.cache_slots:                 # constructed directly with a slot count: split it over the cards
+            self.set_slots(total=self.cache_slots)
 
     # -- host staging -------------------------------------------------------------------------
     def _ensure_staging(self, n: int) -> None:
@@ -359,8 +368,29 @@ class ExpertStreamer(ExpertSource):
             os.preadv(self._fd(info.shard), [memoryview(views[p][slot]).cast("B")],
                       shard.data_start + info.begin)
 
+    def set_slots(self, per_device: dict[str, int] | None = None, total: int | None = None) -> None:
+        """Bound the tier per card; a single total is split evenly over the cards the experts live on."""
+        devices = list(dict.fromkeys(self.layer_devices or [self.device]))
+        if per_device is not None:
+            self._slots = {d: max(0, int(per_device.get(d, 0))) for d in devices}
+        else:
+            share = max(0, int(total or self.cache_slots)) // max(1, len(devices))
+            self._slots = {d: share for d in devices}
+        self.cache_slots = sum(self._slots.values())
+        for key in list(self._cache):
+            dev = self.device_for(key[0])
+            if len(self._order.setdefault(dev, [])) > self._slots.get(dev, 0):
+                while len(self._order[dev]) > self._slots.get(dev, 0):
+                    self._cache.pop(self._order[dev].pop(0), None)
+
+    def device_for(self, layer: int) -> str:
+        if not self.layer_devices:
+            return self.device
+        return self.layer_devices[layer % len(self.layer_devices)]
+
     def _read_many(self, layer: int, experts: list[int]) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         n = len(experts)
+        device = self.device_for(layer)
         self._ensure_staging(n)
         slot = self._slot
         self._slot = (slot + 1) % self._ring
@@ -374,7 +404,7 @@ class ExpertStreamer(ExpertSource):
         for p in ("w1", "w2", "w3"):
             # copy=True even when the device *is* the host: an expert that lands in the resident cache must
             # own its bytes, or the next layer's read overwrites it (the slots are reused)
-            q = self._staging[p][slot][:n].to(self.device, non_blocking=True, copy=True)
+            q = self._staging[p][slot][:n].to(device, non_blocking=True, copy=True)
             ss, os_ = [], []
             for e in experts:
                 base = f"layers.{layer}.ffn.experts.{e}.{p}.weight"
@@ -385,8 +415,8 @@ class ExpertStreamer(ExpertSource):
                            else np.zeros_like(ss[-1]))
             # the scales and offsets are a few tens of KB: copied synchronously, because an async copy
             # would outlive the temporary numpy array it is reading from
-            out[p] = (q, torch.from_numpy(np.stack(ss)).to(self.device),
-                      torch.from_numpy(np.stack(os_)).to(self.device))
+            out[p] = (q, torch.from_numpy(np.stack(ss)).to(device),
+                      torch.from_numpy(np.stack(os_)).to(device))
         if self._events:
             self._events[slot].record()
         return out
@@ -402,11 +432,13 @@ class ExpertStreamer(ExpertSource):
             block = self._cache.get((layer, e))
             if block is not None:
                 self.hits += 1
-                if self.cache_slots:
+                dev = self.device_for(layer)
+                if self._slots.get(dev, 0):
                     key = (layer, e)
-                    if key in self._order:
-                        self._order.remove(key)
-                    self._order.append(key)
+                    order = self._order.setdefault(dev, [])
+                    if key in order:
+                        order.remove(key)
+                    order.append(key)
                 blocks[i] = block
             else:
                 missing.append((i, e))
@@ -416,14 +448,16 @@ class ExpertStreamer(ExpertSource):
             for j, (i, e) in enumerate(missing):
                 block = {p: tuple(t[j:j + 1] for t in read[p]) for p in read}
                 blocks[i] = block
-                if self.cache_slots:
+                dev = self.device_for(layer)
+                if self._slots.get(dev, 0):
                     # clone for the cache: a slice of the batch keeps the whole batch's storage alive, so
-                    # 284 cached "experts" would pin 284 batches (8x the tier's stated size)
+                    # caching a view would pin the whole batch instead of one expert
                     cached = {p: tuple(t.clone() for t in block[p]) for p in block}
                     self._cache[(layer, e)] = cached
-                    self._order.append((layer, e))
-                    while len(self._order) > self.cache_slots:
-                        self._cache.pop(self._order.pop(0), None)
+                    order = self._order.setdefault(dev, [])
+                    order.append((layer, e))
+                    while len(order) > self._slots[dev]:
+                        self._cache.pop(order.pop(0), None)
         return blocks
 
     def staging_bytes(self) -> int:
@@ -433,7 +467,7 @@ class ExpertStreamer(ExpertSource):
 
     def stats(self) -> dict[str, int]:
         return {"expert_hits": self.hits, "expert_misses": self.misses, "expert_bytes": self.bytes_in,
-                "expert_slots": len(self._order), "staging_mib": int(self._staging_mib)}
+                "expert_slots": len(self._cache), "staging_mib": int(self._staging_mib)}
 
     def close(self) -> None:
         import os
@@ -447,6 +481,7 @@ class ExpertStreamer(ExpertSource):
         self._staging.clear()
         self._cache.clear()
         self._order.clear()
+        self._slots.clear()
 
 
 # --------------------------------------------------------------------------- state
@@ -536,6 +571,8 @@ class Dsv41:
         self.lim = cfg.swiglu_limit
         # set to a dict to attribute a step's time to its parts (ascend/bench_step.py); off costs nothing
         self.timers: dict[str, float] | None = None
+        # where each layer's experts are computed; empty means "on the card the layer is on"
+        self.expert_device_for = getattr(weights.experts, "device_for", None)
         # experts per MoE batch: the staging ring is sized for this many, so the two must agree
         self.expert_batch = int(getattr(weights.experts, "_max_batch", 8))
         # the int8 fast path needs an Ascend runtime and a symmetric (zero-point-free) checkpoint
@@ -799,6 +836,12 @@ class Dsv41:
         return (q.to(dt) - offset.to(dt)) * scale.to(dt)
 
     def moe(self, li: int, x: torch.Tensor) -> torch.Tensor:
+        """The routed experts plus the shared one, for one layer.
+
+        Only the routed branch may run on another card: its weights are 35 MB per expert and that is where
+        the room has to be, while the token's rows are a few KB.  The router and the shared expert stay with
+        the layer, so nothing else has to move.
+        """
         cfg, lw = self.cfg, self.weights.layers[li]
         T = x.shape[0]
         gw, bias = lw.ffn["gate"], lw.ffn["gate_bias"]
@@ -806,12 +849,24 @@ class Dsv41:
         idx = (scores + bias).topk(cfg.num_experts_per_tok, dim=-1).indices
         wts = scores.gather(1, idx)
         wts = wts / (wts.sum(-1, keepdim=True) + 1e-20) * cfg.routed_scaling_factor
-        y = torch.zeros(T, cfg.hidden_size, device=x.device, dtype=torch.float32)
 
         if isinstance(self.weights.experts, NullExpertSource):
             # no expert source: the routed branch is skipped, which is what a shape or dense-only check wants
             shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
             return self.mm(shared, lw.ffn["shared_w2"])
+
+        dev = self.expert_device_for(li) if self.expert_device_for else None
+        if dev is not None and dev != str(x.device):
+            y = self._routed_sum(li, x.to(dev), idx.to(dev), wts.to(dev)).to(x.device)
+        else:
+            y = self._routed_sum(li, x, idx, wts)
+        shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
+        return y + self.mm(shared, lw.ffn["shared_w2"])
+
+    def _routed_sum(self, li: int, x: torch.Tensor, idx: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+        """Sum over the routed experts, all tensors on the card the layer's experts live on."""
+        T = x.shape[0]
+        y = torch.zeros(T, self.cfg.hidden_size, device=x.device, dtype=torch.float32)
         uniq = torch.unique(idx).tolist()
         # A prompt routes far more distinct experts than a decode step - up to all 384 - and holding their
         # dequantized weights at once is 13 GiB.  Batching bounds both the staging ring and the device.
@@ -826,8 +881,6 @@ class Dsv41:
                 u = self.expert_mm(xs, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
                 h = F.silu(g) * u
                 y.index_add_(0, rows, self.expert_mm(h, *blocks[i]["w2"]) * wts[rows, slot, None])
-        shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
-        y = y + self.mm(shared, lw.ffn["shared_w2"])
         return y
 
     # -- the whole forward ----------------------------------------------------------------------

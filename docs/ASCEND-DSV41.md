@@ -237,7 +237,33 @@ configuration measured 1 926 ms/token in a quiet window and 3 247 ms/token in a 
 before/after figures above come from interleaved or back-to-back runs for that reason; treat absolute
 tok/s as a range and comparisons as the signal.
 
-## 9. Where the remaining time goes
+## 9. The other three cards: the expert tier, not the layers
+
+The first question was which part of the model to split, and the measurement answered it: **the expert tier
+is what needs room, and the layers need very little.**  Spreading the *layers* would have meant replicating
+the shared caches across the new card boundaries (layer 20's compressed KV is read by layers 21-39, which do
+not fit on one card) and moving the attention state around.  Spreading only the tier costs two copies of a
+token's activation per layer - 40 KB against 8.5 GB of experts - and touches nothing else.
+
+So `--expert-devices npu:0,npu:1,npu:2,npu:3` gives each card a contiguous block of layers' experts, the
+router and the shared expert stay with the layer, and each card keeps its **own** LRU: a single global LRU
+would put more expert bytes on one card than its share allows, which is exactly what the 32 GB cap forbids.
+The two-card case is checked against the one-card case by a test (same logits, same argmax).
+
+| decode, 8-token prompt | one card | four cards |
+|---|---:|---:|
+| expert tier | 284 slots (9.4 GiB) | **2 967 slots (98 GiB)** |
+| decode hit rate | 46-54% | **74%** |
+| read per 20 steps | 94 GB | **52 GB** |
+| ms/token (same window) | 2 656 | **2 241** |
+
+The hit rate and the bytes read are the real result; the wall clock moves less than they do because the
+remaining 26% of misses still go to a 1.1 GB/s array, and because this shared machine's noise (±50%) is the
+same size as the improvement.  What the tier cannot fix is the shape of the traffic: a token routes 6 of 384
+experts per layer and the next token routes a partly different set, so the set a conversation touches grows
+with every token - which is why 240 experts of a decode step need thousands of slots, not hundreds.
+
+## 10. Where the remaining time goes
 
 After this round the split is: 544 ms the dense floor, ~1 380 ms the routed experts.  Of the experts, the
 fetch is ~100 ms and the rest is per-expert work on single-row tensors - the launch/op-count problem this
@@ -245,7 +271,7 @@ project solved on CUDA with per-layer graph capture (`include/strata/core/sessio
 replayed 1.51x faster than dispatched), plus the dequantization that int8 matmul removes outright.  Prefill
 at 0.9 s/token against a cold array stays storage-bound, as expected.
 
-## 10. Reflecting on the numbers
+## 11. Reflecting on the numbers
 
 The measured chain per decode step is: 8.1 GB of routed experts, read at 12.7 GB/s when the page cache
 holds them (0.67 s) or at ~2.5 GB/s when it does not (~3 s), copied at 20 GB/s, then multiplied. An HBM

@@ -89,33 +89,53 @@ def free_hbm_bytes(device: str) -> int:
 
 def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_share: float = 0.5,
           expert_slots: int | None = None, io_threads: int = 6, expert_batch: int = 8,
-          expert_reserve_gib: float = 6.0, no_experts: bool = False, verbose: bool = False) -> Runtime:
-    """Load the checkpoint's resident weights and size the expert tier to what is left of the card."""
+          expert_reserve_gib: float = 6.0, expert_devices: "list[str] | None" = None,
+          no_experts: bool = False, verbose: bool = False) -> Runtime:
+    """Load the checkpoint's resident weights and size the expert tier to what is left of the cards.
+
+    `expert_devices` spreads the routed experts' tier over several cards, a contiguous block of layers per
+    card.  The layers themselves stay on `device`: the tier is what needs room (a decode step routes 240
+    experts, 8.5 GB, and the ones a token routes change from token to token, so the set a conversation
+    touches is many times that), while the attention state and the resident weights need very little.
+    """
     model_dir = Path(model)
     cfg = TextConfig.from_json(model_dir / "config.json")
     dev = resolve_device(device, hbm_share)
     dt = DTYPES[dtype]
+    # claim the share of every card the experts will use, and record which layers go where
+    pool = [d for d in (expert_devices or []) if d != "cpu"]
+    for d in pool:
+        resolve_device(d, hbm_share)
+    layer_devices = None
+    if pool and len(pool) > 1:
+        n = cfg.num_hidden_layers
+        layer_devices = [pool[layer * len(pool) // n] for layer in range(n)]
     ckpt = Checkpoint(model_dir)
     if no_experts:
         src: ExpertSource = NullExpertSource(ckpt, cfg, dt)
     else:
-        src = ExpertStreamer(ckpt, cfg, dev, dt, cache_slots=0, io_threads=io_threads, max_batch=expert_batch)
+        src = ExpertStreamer(ckpt, cfg, dev, dt, cache_slots=0, io_threads=io_threads,
+                             max_batch=expert_batch, layer_devices=layer_devices)
     weights = Weights(ckpt, cfg, dev, dt, expert_source=src, verbose=verbose).load()
-    if not no_experts and expert_slots is None:
-        # size the tier from what is *actually* left once the resident weights are on the card, less the
-        # staging ring and a reserve for activations, KV and the allocator's own fragmentation
-        per_expert = 3 * cfg.moe_intermediate_size * cfg.hidden_size
-        # The reserve covers the head's matmul, the prompt's activations and the dequantized experts of one
-        # batch.  It is not free to set at zero: the tier fills during the run rather than at load, and the
-        # tier is also the difference between a decode step that re-reads its 240 experts and one that does
-        # not - below about 8.2 GiB of tier (240 experts) the LRU thrashes and every step re-reads.
-        # the staging ring is *host* pinned memory, so it does not come out of HBM at all
-        reserve = int(expert_reserve_gib * GIB)
-        budget = max(0, (free_hbm_bytes(dev) if dev != "cpu" else 8 * GIB) - reserve)
-        expert_slots = int(budget // per_expert)
     if not no_experts:
-        # never more slots than the model has experts: on the host the budget formula would allow millions
-        expert_slots = min(int(expert_slots), cfg.num_hidden_layers * cfg.n_routed_experts)
-        src.cache_slots = expert_slots
+        per_expert = 3 * cfg.moe_intermediate_size * cfg.hidden_size
+        if expert_slots is None:
+            # The reserve is for the activations and temporaries of the card the layers run on; a card that
+            # only holds experts needs room for little else.  The staging ring is *host* pinned memory and
+            # does not come out of HBM at all.  Sized per card, so no card can be pushed past its share by
+            # the others - the tier is HBM, and the cap is per card.
+            reserve = int(expert_reserve_gib * GIB)
+            if dev == "cpu":
+                per_card = {dev: 8 * GIB}
+            else:
+                per_card = {dev: max(0, free_hbm_bytes(dev) - reserve)}
+                for extra in dict.fromkeys(pool):
+                    if extra != dev:
+                        per_card[extra] = max(0, free_hbm_bytes(extra) - int(1.0 * GIB))
+            # never more slots on a card than the model has experts
+            cap = cfg.num_hidden_layers * cfg.n_routed_experts
+            src.set_slots({d: min(int(b // per_expert), cap) for d, b in per_card.items()})
+        else:
+            src.set_slots(total=min(int(expert_slots), cfg.num_hidden_layers * cfg.n_routed_experts))
     model_obj = Dsv41(cfg, weights, dev, dt)
     return Runtime(cfg=cfg, ckpt=ckpt, weights=weights, model=model_obj, device=dev, dtype=dt, experts=src)
