@@ -297,6 +297,9 @@ The setup shows every download before it starts it, builds everything once (20-4
 - **Mac with Apple Silicon (experimental, GLM-5.3-Flash only):** `./maya.sh --backend metal` (on a Mac, `./maya.sh`
   picks Metal by itself) - see [docs/METAL.md](docs/METAL.md). Built and unit-tested on GitHub's Macs, not yet tested
   by us with the real model (we have no Mac): if you run it, please tell us how it went in an issue.
+- **Huawei Ascend 910B (experimental, DeepSeek-V4.1-Flash W8A8 only):** a second implementation of that model's
+  forward pass under [`ascend/`](ascend/), run from the same server - see
+  [Ascend 910B](#ascend-910b) below and [docs/ASCEND-DSV41.md](docs/ASCEND-DSV41.md).
 - **Intel Arc:** not supported by Maya's engine; a community report of the Maya-XS DeepSeek GGUFs on llama.cpp's SYCL backend: [docs/INTEL_ARC.md](docs/INTEL_ARC.md).
 - **Updating:** the page's **Settings › About and updates**, or `git pull` then `./setup.sh`. The model isn't downloaded again.
 - **Model files downloaded another way** (a download manager, another PC, a Hugging Face cache): `./maya.sh --import-model FOLDER`
@@ -306,6 +309,73 @@ The setup shows every download before it starts it, builds everything once (20-4
 
 > **The start takes a few minutes:** the engine pins most of the free RAM (all but about 6 GB) for its expert tier,
 > so other programs get little RAM while Maya runs.
+
+## Ascend 910B
+
+Maya's engine is CUDA, HIP and Metal. `ascend/` is a **second implementation of one model's forward pass**,
+written against this repository's own reference (`tools/ds4/ref.py`, the oracle its CUDA kernels are checked
+against) and speaking the same `--serve` line protocol - so `serve/server.py`, the OpenAI- and
+Anthropic-compatible API, the tools, the thinking levels and the web UI drive it **without a change to
+`serve/`**. It is a port that works and is measured; it is not a supported platform yet.
+
+**The model.** DeepSeek-V4.1-Flash only, and only from the **Ascend ModelSlim W8A8** export
+(`quant_method: ascend`: int8 weights per output channel, int8 activations per token) - not Maya's 1.6-4 bit
+packs. That export is **578 GB**, so the 545 GB of routed experts stream from the host while about 15 GB of
+attention, embeddings, shared experts and norms stay resident on a card.
+
+**What is implemented.** The whole 40-layer text backbone: mHC residual streams, CSA2 attention (128-token
+window, four compressed KV caches with a two-level indexer and its candidate blocks), the sqrt-softplus
+router over 384 experts plus the shared expert, **Engram** at layers 1 and 14 (its two 101 GB tables are
+mapped, not loaded: a token reads 24 rows), the per-request state that makes one-token-at-a-time decoding
+match a whole-prompt pass, the W8A8 int8 expert path, and an expert tier spread across several cards with a
+per-card LRU. **Not** implemented: vision, DSpark speculative decoding, MTP, and more than one conversation at
+a time.
+
+**How fast, measured** on 4x 910B3 (64 GB each, shared; each process kept inside 32 GB):
+
+| | |
+| --- | --- |
+| decode, one token at a time | **0.47 tokens/s** (2.1 s/token) on the run below |
+| prompt reading | 0.9-1.1 s per prompt token - limited by the disk array, not the NPU |
+| decode with the routed experts switched off | 544 ms/token - the floor the 40 layers' small operations set |
+| one MoE layer, its experts resident | 12.5 ms |
+| expert stream | ~9.6 GB/s effective: 1.1 GB/s from the array cold, 12.7 GB/s from the page cache |
+| the card itself | 246 TFLOP/s bf16, 20 GB/s host-to-HBM, 30.48 GiB per process |
+
+**How right, measured.** Ten sampled GSM8K questions (seed 0, greedy, non-thinking), **9 correct**, 0.47 tokens/s
+decode and 56 s mean prompt reading; the one miss ran out of its 192-token budget rather than getting the
+arithmetic wrong. The report, with every answer, is
+[`ascend/results/gsm8k-10q-engram.json`](ascend/results/gsm8k-10q-engram.json). Two honest caveats: that is
+zero-shot with a short instruction, not the 8-shot protocol GSM8K is scored with, so it is not comparable
+with published numbers; and ten questions separate "wired correctly" from "broken", not much more.
+
+Known-knowns from the port itself, in case they save someone a week: a CPU expert lane is **useless** on a
+Kunpeng 920 (PyTorch's aarch64 bf16 path runs at 0.12 GB/s, four times slower than the host link); the
+checkpoint's residual stream is in the **QuaRot rotated basis** while Engram's key and gate weights are in the
+original one, so the Engram gate's dot product needs one explicit un-rotation; and at 8.5 GB of experts per
+token the storage array, not the NPU, is what sets the speed.
+
+**Configuration.** Two files, both in the repository: [`ascend/setup_tokenizer.sh`](ascend/setup_tokenizer.sh)
+builds the tokenizer directory the server wants (the W8A8 export ships no tokenizer at all), then
+[`ascend/serve-config.example.json`](ascend/serve-config.example.json) points the server at the engine:
+
+```sh
+./ascend/setup_tokenizer.sh /mnt/weights/DeepSeek-V4-Flash-0731-w8a8 .ascend-tokenizer
+python3 -m serve.server --engine strata --config ascend/serve-config.example.json --port 8095
+./ascend/run-e2e.sh                 # or: one chat request end to end, with both logs
+python3 -m ascend.eval_gsm8k --help # accuracy and speed on a GSM8K sample
+```
+
+Add `--engram-tokenizer <the model's tokenizer.json>` to enable Engram; `--expert-devices npu:0,npu:1,npu:2,npu:3`
+spreads the expert tier over four cards. The engine sizes the tier from the HBM actually left after the resident
+weights, less a reserve; `--expert-slots` overrides it, and a card that runs out of room drops an expert from the
+tier instead of failing the request.
+
+**What is next**, in the order the measurements argue for: per-layer graph capture (the 544 ms floor is 40 layers
+x about thirty small operations each, the problem this project already solved on CUDA with per-layer graphs);
+batched prompt reading; a profiled expert placement instead of the LRU, so the tier holds what a conversation
+actually routes; keeping the resident weights in int8 to free several GB for that tier; and multi-session
+(`READY ... multi=n`) for the `--parallel` the server already speaks.
 
 ## Something went wrong?
 
