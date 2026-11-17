@@ -63,3 +63,10 @@ build-vision.bat
 .ascend-tokenizer/
 # GSM8K questions for ascend/eval_gsm8k.py (copied, not vendored)
 .gsm8k/
+# Ascend scratch: probe scripts, logs, profiling output and anything a run leaves behind.
+# Never part of a commit - keep working files under .ascend-work/ or in /tmp.
+.ascend-work/
+/ascend-*.sh
+/probe*.sh
+*.ascend_pt/
+profiler_out/

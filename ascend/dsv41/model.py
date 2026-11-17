@@ -122,6 +122,30 @@ class Rope:
         return torch.stack((y0, y1), -1).flatten(-2).to(x.dtype)
 
 
+def mixes_numpy(mixes: np.ndarray, scale: np.ndarray, base: np.ndarray, eps: float, iters: int,
+                hc: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The 24 mHC scalars' post-processing: pre, post and the Sinkhorn-balanced comb, in numpy.
+
+    The same arithmetic the device path does, on 24 numbers instead of tensors.  It exists because the
+    profiler showed what it costs there: 20 Sinkhorn iterations are 40 sums and 40 divisions per mix, two
+    mixes per layer, 40 layers - about 9 000 of the 42 500 operator calls a decode step makes, all on a
+    4x4 matrix.  Done here it is a few numpy operations on 16 values.
+    """
+    m = mixes.astype(np.float32)
+    pre = (1.0 / (1.0 + np.exp(-(m[:hc] * scale[0] + base[:hc])))).astype(np.float32) + eps
+    post = (2.0 / (1.0 + np.exp(-(m[hc:2 * hc] * scale[1] + base[hc:2 * hc])))).astype(np.float32)
+    comb = (m[2 * hc:] * scale[2] + base[2 * hc:]).reshape(hc, hc).astype(np.float32)
+    e = np.float32(eps)
+    shifted = comb - comb.max(-1, keepdims=True)
+    ex = np.exp(shifted)
+    comb = (ex / ex.sum(-1, keepdims=True)).astype(np.float32) + e
+    comb = comb / (comb.sum(-2, keepdims=True) + e)
+    for _ in range(iters - 1):
+        comb = comb / (comb.sum(-1, keepdims=True) + e)
+        comb = comb / (comb.sum(-2, keepdims=True) + e)
+    return pre.reshape(1, hc), post.reshape(1, hc), comb.reshape(1, hc, hc)
+
+
 def rms(x: torch.Tensor, w: torch.Tensor | None, eps: float) -> torch.Tensor:
     """RMSNorm as the oracle writes it: the whole accumulation in fp32, then scaled by ``w``."""
     xf = x.float()
@@ -593,6 +617,10 @@ class Dsv41:
         self.lim = cfg.swiglu_limit
         # set to a dict to attribute a step's time to its parts (ascend/bench_step.py); off costs nothing
         self.timers: dict[str, float] | None = None
+        # single-token steps do the mHC scalars' Sinkhorn on the host, and take the routing path that needs
+        # no `unique`/gather; both are measured against the general path by bench_step --ab-dense
+        self.host_mixes = True
+        self.fast_moe = True
         # where each layer's experts are computed; empty means "on the card the layer is on"
         self.expert_device_for = getattr(weights.experts, "device_for", None)
         # experts per MoE batch: the staging ring is sized for this many, so the two must agree
@@ -637,6 +665,14 @@ class Dsv41:
         hc = self.hc
         xf = x.flatten(1).float()
         rstd = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
+        if x.shape[0] == 1 and self.host_mixes:
+            # one matmul on the device, then 24 numbers on the host: see `mixes_numpy` for why
+            got = ((xf.to(fn.dtype) @ fn.T).float() * rstd)[0]
+            pre, post, comb = mixes_numpy(got.cpu().numpy(), scale.cpu().numpy(), base.cpu().numpy(),
+                                          self.cfg.hc_eps, self.cfg.hc_sinkhorn_iters, hc)
+            dev, dt = x.device, torch.float32
+            return (torch.from_numpy(pre).to(dev, dtype=dt), torch.from_numpy(post).to(dev, dtype=dt),
+                    torch.from_numpy(comb).to(dev, dtype=dt))
         mixes = (xf.to(fn.dtype) @ fn.T).float() * rstd
         pre = torch.sigmoid(mixes[:, :hc] * scale[0] + base[:hc]) + self.cfg.hc_eps
         post = 2 * torch.sigmoid(mixes[:, hc:2 * hc] * scale[1] + base[hc:2 * hc])
@@ -831,6 +867,18 @@ class Dsv41:
         u = self.mm(x, w3).clamp(-self.lim, self.lim)
         return F.silu(g) * u
 
+    def expert_mm_q(self, xq: torch.Tensor, xs: torch.Tensor, q: torch.Tensor, scale: torch.Tensor,
+                    offset: torch.Tensor) -> torch.Tensor:
+        """The int8 multiply with the activation quantized by the caller: one quantization for many experts.
+
+        The profiler put this first: `per_token_int8` is six operators, and it ran once per expert per
+        projection - about 1 200 times a step - although every expert of a token multiplies the same rows.
+        """
+        if self.int8_experts and torch_npu is not None:
+            got = torch_npu.npu_quant_matmul(xq, q[0].T, scale.view(-1), output_dtype=torch.bfloat16)
+            return got.float() * xs
+        return self.mm(xq, self.dequant(q, scale, offset)[0])
+
     def expert_mm(self, x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
         """x [T,in] times an expert's int8 [1,out,in] and its per-channel scale, as [T,out] fp32.
 
@@ -888,6 +936,8 @@ class Dsv41:
     def _routed_sum(self, li: int, x: torch.Tensor, idx: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
         """Sum over the routed experts, all tensors on the card the layer's experts live on."""
         T = x.shape[0]
+        if T == 1 and self.fast_moe:
+            return self._routed_one(li, x, idx, wts)
         y = torch.zeros(T, self.cfg.hidden_size, device=x.device, dtype=torch.float32)
         uniq = torch.unique(idx).tolist()
         # A prompt routes far more distinct experts than a decode step - up to all 384 - and holding their
@@ -903,6 +953,34 @@ class Dsv41:
                 u = self.expert_mm(xs, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
                 h = F.silu(g) * u
                 y.index_add_(0, rows, self.expert_mm(h, *blocks[i]["w2"]) * wts[rows, slot, None])
+        return y
+
+    def _routed_one(self, li: int, x: torch.Tensor, idx: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+        """One token, whose top-k experts are distinct and all own the same single row.
+
+        That makes three things unnecessary, and the profiler showed each of them costing real time: no
+        `unique` (topk cannot repeat an index), no `where`/gather (every expert's rows are just [0]), and one
+        activation quantization for the whole layer instead of one per expert per projection.
+        """
+        ids = [int(e) for e in idx[0].tolist()]          # one small sync per layer, as `unique` also was
+        weights = wts[0]
+        y = torch.zeros(1, self.cfg.hidden_size, device=x.device, dtype=torch.float32)
+        xq, xs = per_token_int8(x) if (self.int8_experts and torch_npu is not None) else (None, None)
+        for start in range(0, len(ids), self.expert_batch):
+            batch = ids[start:start + self.expert_batch]
+            with self.phase("moe_fetch"):
+                blocks = self.weights.experts.fetch_int8(li, batch)
+            for i, _e in enumerate(batch):
+                if xq is not None:
+                    g = self.expert_mm_q(xq, xs, *blocks[i]["w1"]).clamp(max=self.lim)
+                    u = self.expert_mm_q(xq, xs, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
+                    h = F.silu(g) * u
+                    y = y + self.expert_mm_q(*per_token_int8(h), *blocks[i]["w2"]) * weights[start + i]
+                else:
+                    g = self.expert_mm(x, *blocks[i]["w1"]).clamp(max=self.lim)
+                    u = self.expert_mm(x, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
+                    h = F.silu(g) * u
+                    y = y + self.expert_mm(h, *blocks[i]["w2"]) * weights[start + i]
         return y
 
     # -- the whole forward ----------------------------------------------------------------------

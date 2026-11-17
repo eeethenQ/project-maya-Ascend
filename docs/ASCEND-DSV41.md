@@ -263,15 +263,56 @@ same size as the improvement.  What the tier cannot fix is the shape of the traf
 experts per layer and the next token routes a partly different set, so the set a conversation touches grows
 with every token - which is why 240 experts of a decode step need thousands of slots, not hundreds.
 
-## 10. Where the remaining time goes
+## 10. Profiling: 46 000 operator calls a step, and what came of counting them
 
-After this round the split is: 544 ms the dense floor, ~1 380 ms the routed experts.  Of the experts, the
+`ascend/bench_profile.py --msprof` runs a few steps under the Ascend profiler (`msprof`) and reads the
+`op_summary_*.csv` it writes.  torch's own profiler cannot do this here: `ProfilerActivity.PrivateUse1`
+accepts the setting and reports no device time.
+
+The first profile, for one decode step (the totals include the prompt read, so the shape matters more than
+the absolute):
+
+| | before | after the fixes |
+|---|---:|---:|
+| operator calls per step | **46 476** | **32 242** |
+| device time per step | 201.9 ms | 164.3 ms |
+| calls under 100 us | 98% | 99% |
+
+That table is the whole finding: **the step is not compute-bound, it is call-bound.** 200 ms of device time
+against ~2 100 ms of wall clock, and 98% of the calls are under 100 us - the model is paying launch and Python
+overhead 46 000 times a token.  The largest single source was not what one would guess: mHC's 20 Sinkhorn
+iterations are 40 sums and 40 divisions per mix, two mixes per layer, 40 layers - **about 9 000 calls a step
+on a 4x4 matrix**.  Next came `per_token_int8` in the expert loop, six operators run once per expert per
+projection although every expert of a token multiplies the same rows.
+
+Two fixes, both single-token paths:
+
+* **The mHC scalars' post-processing moves to the host for T=1.** The matmul stays on the device; the 24
+  resulting numbers have their sigmoid/softmax/Sinkhorn done in numpy (`mixes_numpy`), replacing ~120
+  operator calls per mix with a few numpy operations on 16 values.  A test pins the numpy result to the
+  device path to 2e-5.
+* **One-token routing needs no `unique`, no `where` and no gather.** `topk` cannot repeat an index, and every
+  expert owns the token's single row, so the loop walks the six ids directly and quantizes the activation
+  **once per layer** instead of once per expert per projection.
+
+Measured interleaved in one process (`bench_step --ab-dense`, because this machine drifts by 50%):
+**1.42x on the median step**, 2 258 -> 1 588 ms/token.
+
+**And one optimisation that did not work, kept out of the code**: Engram's row indices depend only on the
+token ids, so the next layer's 24 rows can be prefetched while earlier layers compute - the model document
+says so explicitly.  It was implemented and measured: **0.90x, slower.**  The gather is 6 KB, the page cache
+holds those rows after the first token, and a thread handoff plus a `Future` costs more than the reads it
+hides.  The comment in `engram.py` records it so the next reader does not try again.
+
+## 11. Where the remaining time goes
+
+After the dense fast paths the split is: ~478 ms the dense floor, the rest the routed experts.  Of those, the
 fetch is ~100 ms and the rest is per-expert work on single-row tensors - the launch/op-count problem this
 project solved on CUDA with per-layer graph capture (`include/strata/core/session.hpp:108-112`: 43 nodes
 replayed 1.51x faster than dispatched), plus the dequantization that int8 matmul removes outright.  Prefill
 at 0.9 s/token against a cold array stays storage-bound, as expected.
 
-## 11. Accuracy: 9 of 10 GSM8K questions, and speed
+## 12. Accuracy: 9 of 10 GSM8K questions, and speed
 
 `ascend/eval_gsm8k.py` samples questions from a GSM8K jsonl, renders each with the repository's own
 DeepSeek-V4.1 encoder, decodes greedily (non-thinking) and reads the final number.  Ten questions, seed 0,
@@ -293,7 +334,7 @@ Two caveats worth stating: this is zero-shot with a short instruction rather tha
 is usually scored on, so the number is not comparable with published ones; and ten questions can only tell
 "wired correctly" from "broken", not a percentage with any confidence.
 
-## 12. Reflecting on the numbers
+## 13. Reflecting on the numbers
 
 The measured chain per decode step is: 8.1 GB of routed experts, read at 12.7 GB/s when the page cache
 holds them (0.67 s) or at ~2.5 GB/s when it does not (~3 s), copied at 20 GB/s, then multiplied. An HBM

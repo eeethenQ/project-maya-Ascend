@@ -124,6 +124,9 @@ class Engram:
         self.projections: dict[int, dict[str, torch.Tensor]] = {}
         self.block = self._rotation_block(ckpt, cfg.hidden_size)     # numpy, so the format stays torch-free
         self._block_on: dict[str, object] = {}
+        # A prefetch of the next layer's rows was measured and did not pay: 24 rows are 6 KB and the page
+        # cache holds them after the first token, so the gather is microseconds and a thread handoff costs
+        # more than it saves (0.90x - slower - interleaved A/B in bench_step).  The gather stays inline.
 
     @staticmethod
     def _rotation_block(ckpt, hidden: int, size: int = 32):
@@ -173,10 +176,16 @@ class Engram:
 
     def lookup(self, layer: int, rows: np.ndarray) -> torch.Tensor:
         """The gathered, dequantized, bf16-valued embedding rows for one layer, on the device."""
-        got = self.tables[layer].rows_at(rows)
-        return torch.from_numpy(got).to(self.device, dtype=torch.float32).to(self.dtype)
+        return self.embedding(layer, self.gather(layer, rows))
 
-    def apply(self, layer: int, h: torch.Tensor, rows: np.ndarray, mm) -> torch.Tensor:
+    def gather(self, layer: int, rows: np.ndarray) -> np.ndarray:
+        """The rows themselves, dequantized, on the host."""
+        return self.tables[layer].rows_at(rows)
+
+    def embedding(self, layer: int, gathered: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(gathered).to(self.device, dtype=torch.float32).to(self.dtype)
+
+    def apply(self, layer: int, h: torch.Tensor, gathered: np.ndarray, mm) -> torch.Tensor:
         """The residual update: `h [T, hc, d]` plus the gated value the lookup produces."""
         cfg = self.cfg
         proj = self.projections[layer]
@@ -184,7 +193,7 @@ class Engram:
         T = h.shape[0]
         # `lookup` returns one row per hash (T x cols of them); a token's embedding is its cols rows
         # concatenated, which is the layout wkv's input expects
-        e = self.lookup(layer, rows).view(T, self.cols * self.head_dim).float()
+        e = self.embedding(layer, gathered).view(T, self.cols * self.head_dim).float()
         kv = mm(e, proj["wkv"])                                 # [T, (hc + 1) * d]
         key = kv[:, :hc * d].view(T, hc, d)
         value = kv[:, hc * d:]

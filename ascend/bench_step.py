@@ -81,6 +81,9 @@ def main() -> int:
     ap.add_argument("--ab-steps", type=int, default=6)
     ap.add_argument("--expert-devices", default="",
                     help="cards to spread the expert tier over, e.g. npu:0,npu:1,npu:2,npu:3")
+    ap.add_argument("--ab-dense", action="store_true",
+                    help="A/B the single-token fast paths (host-side Sinkhorn, routing without unique/"
+                         "gather) against the general ones, interleaved in one process")
     ap.add_argument("--ab-batch", action="store_true",
                     help="sweep the experts per fetch batch: a batch smaller than the top-k lets the "
                          "device compute one batch while the host reads the next")
@@ -134,6 +137,40 @@ def main() -> int:
     dense.close()
     del dense
     _release(a.device)
+
+    if a.ab_dense:
+        full = build(a.model, a.device, a.hbm_share, a.expert_slots, a.expert_batch, False,
+                     a.expert_reserve_gib, devices)
+        state = full.state(a.max_context)
+        ids = [(i * 7 + 3) % 40000 for i in range(a.prompt_tokens)]
+        full.model.forward(ids, state, compute_logits=True)
+        rounds = {"fast": [], "general": []}
+        tok = 3
+        for repeat in range(3):
+            for label, use in (("fast", True), ("general", False)):
+                full.model.host_mixes = use
+                full.model.fast_moe = use
+                for _ in range(a.ab_steps):
+                    if str(a.device).startswith("npu"):
+                        torch.npu.synchronize()
+                    t0 = time.perf_counter()
+                    logits = full.model.forward([tok], state, logits_last_only=True)
+                    tok = int(logits[0].argmax())
+                    if str(a.device).startswith("npu"):
+                        torch.npu.synchronize()
+                    rounds[label].append((time.perf_counter() - t0) * 1e3)
+        for label in ("fast", "general"):
+            xs = sorted(rounds[label])
+            print(f"  {label:8s} mean {sum(xs) / len(xs):7.1f}  median {xs[len(xs) // 2]:7.1f}  "
+                  f"best {xs[0]:7.1f} ms/token (n={len(xs)})")
+        fast, general = sorted(rounds["fast"]), sorted(rounds["general"])
+        mid = len(fast) // 2
+        print(f"  fast paths are {general[mid] / max(fast[mid], 1e-9):.2f}x the general ones at the median")
+        print(f"  top-1 after both: {tok}")
+        full.close()
+        del full
+        _release(a.device)
+        return 0
 
     if a.ab_batch:
         full = build(a.model, a.device, a.hbm_share, a.expert_slots, a.expert_batch, False,

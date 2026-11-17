@@ -221,6 +221,25 @@ class ThePieces(unittest.TestCase):
                         f"column sums {cols.tolist()}")
         self.assertTrue((comb > 0).all())
 
+    def test_the_host_sinkhorn_matches_the_device_one(self):
+        """A single-token step does the mHC scalars' Sinkhorn in numpy; it must be the same arithmetic."""
+        from ascend.dsv41.model import mixes_numpy
+
+        hc = self.cfg.hc_mult
+        res = torch.randn(3, hc, self.cfg.hidden_size)          # T > 1: the device path
+        lw = self.net.weights.layers[0].hc
+        pre, post, comb = self.net.hc_mixes(res, lw["attn_fn"], lw["attn_scale"], lw["attn_base"])
+        xf = res.flatten(1).float()
+        rstd = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.net.eps)
+        mixes = ((xf.to(lw["attn_fn"].dtype) @ lw["attn_fn"].T).float() * rstd)
+        for t in range(3):
+            p2, o2, c2 = mixes_numpy(mixes[t].cpu().numpy(), lw["attn_scale"].cpu().numpy(),
+                                     lw["attn_base"].cpu().numpy(), self.cfg.hc_eps,
+                                     self.cfg.hc_sinkhorn_iters, hc)
+            torch.testing.assert_close(torch.from_numpy(p2[0]), pre[t], rtol=2e-5, atol=2e-6)
+            torch.testing.assert_close(torch.from_numpy(o2[0]), post[t], rtol=2e-5, atol=2e-6)
+            torch.testing.assert_close(torch.from_numpy(c2[0]), comb[t], rtol=2e-4, atol=2e-5)
+
     def test_hc_pre_collapses_the_streams_with_the_given_mix(self):
         res = torch.randn(2, self.cfg.hc_mult, 8)
         mix = torch.zeros(2, self.cfg.hc_mult)

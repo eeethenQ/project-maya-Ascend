@@ -335,9 +335,9 @@ a time.
 
 | | |
 | --- | --- |
-| decode, one token at a time | **0.47 tokens/s** (2.1 s/token) on the run below |
+| decode, one token at a time | **0.47 tokens/s** (2.1 s/token) on the run below, before the single-token fast paths; those are worth **1.42x** on the step (`bench_step --ab-dense`) |
 | prompt reading | 0.9-1.1 s per prompt token - limited by the disk array, not the NPU |
-| decode with the routed experts switched off | 544 ms/token - the floor the 40 layers' small operations set |
+| decode with the routed experts switched off | 478-544 ms/token - the floor the 40 layers' small operations set |
 | one MoE layer, its experts resident | 12.5 ms |
 | expert stream | ~9.6 GB/s effective: 1.1 GB/s from the array cold, 12.7 GB/s from the page cache |
 | the card itself | 246 TFLOP/s bf16, 20 GB/s host-to-HBM, 30.48 GiB per process |
