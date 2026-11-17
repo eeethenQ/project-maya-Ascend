@@ -135,7 +135,7 @@ def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_sha
                         # a card that only holds experts still needs room for the batch in flight: the
                         # staged copy, the slots it is cloned into, and the allocator's own padding.  At
                         # 1 GiB the tier filled the card and the next insert ran it out of memory.
-                        per_card[extra] = max(0, free_hbm_bytes(extra) - int(3.0 * GIB))
+                        per_card[extra] = max(0, free_hbm_bytes(extra) - int(5.0 * GIB))
             # never more slots on a card than the model has experts
             cap = cfg.num_hidden_layers * cfg.n_routed_experts
             src.set_slots({d: min(int(b // per_expert), cap) for d, b in per_card.items()})

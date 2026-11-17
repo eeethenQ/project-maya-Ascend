@@ -317,6 +317,7 @@ class ExpertStreamer(ExpertSource):
         self._slots: dict[str, int] = {}
         self.hits = self.misses = 0
         self.bytes_in = 0
+        self.oom_skips = 0          # experts the tier had no room to keep; they are streamed instead
         self._shapes = {"w1": (cfg.moe_intermediate_size, cfg.hidden_size),
                         "w2": (cfg.hidden_size, cfg.moe_intermediate_size),
                         "w3": (cfg.moe_intermediate_size, cfg.hidden_size)}
@@ -460,7 +461,16 @@ class ExpertStreamer(ExpertSource):
                 if self._slots.get(dev, 0):
                     # clone for the cache: a slice of the batch keeps the whole batch's storage alive, so
                     # caching a view would pin the whole batch instead of one expert
-                    cached = {p: tuple(t.clone() for t in block[p]) for p in block}
+                    try:
+                        cached = {p: tuple(t.clone() for t in block[p]) for p in block}
+                    except torch.OutOfMemoryError:
+                        # The card is shared and the budget is a prediction.  A tier that cannot grow must
+                        # not end the request: stream this expert and go on, with the card's free memory
+                        # kept up to date so the next attempt is not made needlessly.
+                        self._slots[dev] = len(self._order.get(dev, []))
+                        self.oom_skips += 1
+                        torch.npu.empty_cache()
+                        continue
                     self._cache[(layer, e)] = cached
                     order = self._order.setdefault(dev, [])
                     order.append((layer, e))
@@ -475,7 +485,8 @@ class ExpertStreamer(ExpertSource):
 
     def stats(self) -> dict[str, int]:
         return {"expert_hits": self.hits, "expert_misses": self.misses, "expert_bytes": self.bytes_in,
-                "expert_slots": len(self._cache), "staging_mib": int(self._staging_mib)}
+                "expert_slots": len(self._cache), "staging_mib": int(self._staging_mib),
+                "oom_skips": self.oom_skips}
 
     def close(self) -> None:
         import os
