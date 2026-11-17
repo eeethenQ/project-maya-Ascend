@@ -21,6 +21,14 @@ from pathlib import Path
 
 from ascend.tests.synthetic import TinyModel
 
+try:                                                    # the engine loads a model, which needs torch
+    import torch  # noqa: F401
+    HAVE_TORCH = True
+except Exception:                                       # noqa: BLE001
+    HAVE_TORCH = False
+
+NEEDS_TORCH = unittest.skipUnless(HAVE_TORCH, "needs torch")
+
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE = ROOT / "ascend" / "strata-ascend"
 GIB = 1 << 30
@@ -87,6 +95,7 @@ def kv(line: str) -> dict:
     return dict(x.split("=", 1) for x in line.split()[1:] if "=" in x)
 
 
+@NEEDS_TORCH
 class TheProtocol(unittest.TestCase):
     """One engine for the class: the weights load once, as in the server's resident engine."""
 
@@ -180,6 +189,7 @@ class TheProtocol(unittest.TestCase):
         self.assertIn("text-only", line)
 
 
+@NEEDS_TORCH
 class Quit(unittest.TestCase):
     def test_quit_ends_the_engine_with_exit_code_zero(self):
         with TinyModel() as model:

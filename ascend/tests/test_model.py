@@ -10,14 +10,20 @@ from __future__ import annotations
 
 import unittest
 
-import torch
-
 from ascend.dsv41.checkpoint import Checkpoint
 from ascend.dsv41.config import build_layer_plan
-from ascend.dsv41.model import Dsv41, ExpertStreamer, Rope, State, Weights, rms
 from ascend.tests.synthetic import TinyModel
 
-DTYPE = torch.float32
+try:                                                    # torch is only installed where the engine runs
+    import torch
+    from ascend.dsv41.model import Dsv41, ExpertStreamer, Rope, State, Weights, rms
+    HAVE_TORCH = True
+except Exception:                                       # noqa: BLE001 - the CI job has no torch: skip
+    torch = None
+    HAVE_TORCH = False
+
+DTYPE = torch.float32 if HAVE_TORCH else None
+NEEDS_TORCH = unittest.skipUnless(HAVE_TORCH, "needs torch")
 
 
 def build(model: TinyModel, device="cpu", cache_slots: int = 0):
@@ -31,6 +37,7 @@ def new_state(model: TinyModel, max_context=64, device="cpu"):
     return State(model.cfg, build_layer_plan(model.cfg), device, DTYPE, max_context=max_context)
 
 
+@NEEDS_TORCH
 class TheForward(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -96,6 +103,7 @@ class TheForward(unittest.TestCase):
         self.assertFalse(torch.allclose(a, b))
 
 
+@NEEDS_TORCH
 class TheExpertSource(unittest.TestCase):
     """The routed experts stream from the checkpoint; a resident cache must not change the answer."""
 
@@ -146,6 +154,7 @@ class TheExpertSource(unittest.TestCase):
         self.assertLessEqual(st["expert_bytes"], per_expert * experts)
 
 
+@NEEDS_TORCH
 class ThePieces(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
