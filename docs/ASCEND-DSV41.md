@@ -271,7 +271,29 @@ project solved on CUDA with per-layer graph capture (`include/strata/core/sessio
 replayed 1.51x faster than dispatched), plus the dequantization that int8 matmul removes outright.  Prefill
 at 0.9 s/token against a cold array stays storage-bound, as expected.
 
-## 11. Reflecting on the numbers
+## 11. Accuracy: 9 of 10 GSM8K questions, and speed
+
+`ascend/eval_gsm8k.py` samples questions from a GSM8K jsonl, renders each with the repository's own
+DeepSeek-V4.1 encoder, decodes greedily (non-thinking) and reads the final number.  Ten questions, seed 0,
+Engram on, all four cards - the report is `ascend/results/gsm8k-10q-engram.json`:
+
+| # | gold | got | | # | gold | got | |
+|---:|---:|---:|---|---:|---:|---:|---|
+| 1 | 16 | 16 | ok | 6 | 22 | 22 | ok |
+| 2 | 240 | 240 | ok | 7 | 8 | 8 | ok |
+| 3 | 80 | 80 | ok | 8 | 11 | 11 | ok |
+| 4 | 15 | 5 | **no** | 9 | 25 | 25 | ok |
+| 5 | 91 | 91 | ok | 10 | 482 | 482 | ok |
+
+**9/10**, at **0.47 tok/s** decode and 56 s mean prefill.  The one failure is the 192-token budget: it was
+the only question that used the whole budget (192 tokens, 417 s), so its reasoning was cut off before the
+arithmetic finished - a length artifact of running at this speed, not a wrong answer.
+
+Two caveats worth stating: this is zero-shot with a short instruction rather than the 8-shot protocol GSM8K
+is usually scored on, so the number is not comparable with published ones; and ten questions can only tell
+"wired correctly" from "broken", not a percentage with any confidence.
+
+## 12. Reflecting on the numbers
 
 The measured chain per decode step is: 8.1 GB of routed experts, read at 12.7 GB/s when the page cache
 holds them (0.67 s) or at ~2.5 GB/s when it does not (~3 s), copied at 20 GB/s, then multiplied. An HBM
