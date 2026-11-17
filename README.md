@@ -339,7 +339,7 @@ a time.
 | prompt reading | 0.9-1.1 s per prompt token - limited by the disk array, not the NPU |
 | decode with the routed experts switched off | 478-544 ms/token - the floor the 40 layers' small operations set |
 | one MoE layer, its experts resident | 12.5 ms |
-| expert stream | ~9.6 GB/s effective: 1.1 GB/s from the array cold, 12.7 GB/s from the page cache |
+| expert stream | ~4 GB/s effective in the engine; 2.8-3.2 GB/s per `preadv` thread even on a second pass (the page cache does not keep them), 12.7 GB/s with six threads |
 | the card itself | 246 TFLOP/s bf16, 20 GB/s host-to-HBM, 30.48 GiB per process |
 
 **How right, measured.** Ten sampled GSM8K questions (seed 0, greedy, non-thinking), **9 correct**, 0.47 tokens/s

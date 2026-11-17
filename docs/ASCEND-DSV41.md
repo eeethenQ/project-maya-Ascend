@@ -18,7 +18,7 @@ cores, 8 NUMA nodes). Each number below is a test in `ascend/tests/test_env.py`.
 | this process's HBM | `set_per_process_memory_fraction(0.5)` → **30.48 GiB allowed** of 60.96 | a request past it OOMs instead of taking a neighbour's HBM — the 32 GB cap is enforced, not hoped for |
 | bf16 Cube | **246–259 TFLOP/s** at 1024x5120x5120 | the dense part of the model is free; nothing here is compute-bound |
 | host → HBM | **20 GB/s**, pageable or pinned (no faster pinned path) | the expert stream is the whole design problem |
-| storage (RAID6, `/mnt/weights`) | **1.1 GB/s** direct, ~2.5 GB/s through a cold page cache | a cold 8.1 GB decode step cannot go faster than ~3 s however well the code is written |
+| storage (RAID6, `/mnt/weights`) | **1.1 GB/s** direct; one `preadv` thread reaches 2.3-3.2 GB/s, six reach 12.7 GB/s | the expert stream is storage-and-copy bound, and reads are *not* retained: a second pass over the same 40 experts was 3.2 GB/s against 2.8 GB/s the first time |
 | int8 w8a8 matmul | `npu_quant_matmul`, `npu_quant_grouped_matmul_dequant`, … exist | the checkpoint's int8 weights can be multiplied natively, no dequantization needed on the fast path |
 | torch CPU bf16 GEMV | **0.12 GB/s** (100 ms for one 11.8 MB expert matrix, at any thread count) | the CPU expert lane this project uses on GPUs is *useless* here |
 | torch CPU fp16 GEMV | 3.7 GB/s (3.2 ms for the same matrix) | a CPU lane would still cost ~2.2 s/token — slower than streaming to the NPU |
@@ -180,12 +180,16 @@ with `" dog"` (p=0.999).
 
 ## 7. What is next, in order
 
+> Four optimisation directions were analysed in parallel against the profile in §10 and reconciled into
+> [`docs/ASCEND-OPTIMISATION.md`](ASCEND-OPTIMISATION.md) - read that for the plan and the four ideas that
+> measurement ruled out. The list below is the earlier, pre-analysis version kept for the record.
+
 1. **Storage, not the code, is the floor.** A decode step streams 8.1 GB; the array gives 1.1 GB/s, so a
-   cold step cannot beat ~3 s however the read path is written. The lever is the page cache: the model is
-   578 GB and the host has 1.9 TB, so a warm working set turns reads into 12.7 GB/s. Options, in order of
-   value: keep the *hot* experts (above all, the ones an expert profile says are routed most) resident in
-   page cache, which needs a profile rather than a guess; or pre-read the checkpoint once at start-up and
-   accept a several-minute first start.
+   cold step cannot beat ~3 s however the read path is written. Waking the page cache is **not** a reliable
+   lever on this node, which measurement corrected: the same 40 experts read twice gave 3.2 GB/s the second
+   time against 2.8 the first - the file's pages are not being retained, with 1.25 TB of cache belonging to
+   other tenants and churning. What did scale was **parallelism**: one `preadv` thread reaches ~3 GB/s and
+   six reach 12.7 GB/s, so the lever is threads per miss and fewer misses, not warmth.
 2. **Use all four cards.** The non-expert weights need 15.1 GiB, so three cards are idle: split the layers
    across them (a token's activations are 80 KiB, so a layer split is nearly free) and let each card own an
    expert tier — 30 GiB becomes ~105 GiB, or 3 100 of 15 360 experts.
@@ -336,8 +340,10 @@ is usually scored on, so the number is not comparable with published ones; and t
 
 ## 13. Reflecting on the numbers
 
-The measured chain per decode step is: 8.1 GB of routed experts, read at 12.7 GB/s when the page cache
-holds them (0.67 s) or at ~2.5 GB/s when it does not (~3 s), copied at 20 GB/s, then multiplied. An HBM
+The measured chain per decode step is: 8.1 GB of routed experts if nothing is resident, read at ~3 GB/s per
+`preadv` thread (12.7 GB/s across six), copied at 20 GB/s, then multiplied. The page cache is not a lever
+here - the same bytes read twice were not faster - so what counts is how few misses the tier leaves and how
+many threads read them. An HBM
 expert tier of 30 GiB covers ~5% of the 15 360 experts on one card and ~20% on four, so it shortens the
 stream but does not remove it; and the 15.1 GiB of resident non-expert weights leave no room to keep more.
 
