@@ -102,7 +102,8 @@ def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_sha
     touches is many times that), while the attention state and the resident weights need very little.
 
     `graphs` captures the one-token path as per-layer NPU graphs (see ``Dsv41``); it is off by default and
-    needs the expert tier on the layers' own card, because a captured layer cannot cross devices.
+    works with a spread tier: each layer's ``g_post`` - and its landing zone - is captured on the card that
+    layer's experts live on, and only the small register pack crosses a card boundary, outside the graphs.
     """
     model_dir = Path(model)
     cfg = TextConfig.from_json(model_dir / "config.json")
@@ -129,10 +130,12 @@ def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_sha
             # The reserve is for the activations and temporaries of the card the layers run on; a card that
             # only holds experts needs room for little else.  The staging ring is *host* pinned memory and
             # does not come out of HBM at all.  Sized per card, so no card can be pushed past its share by
-            # the others - the tier is HBM, and the cap is per card.  Capturing the decode adds the expert
-            # landing zone (406 MB) plus the graph pools, which are not allocated yet when the tier is
-            # sized, so they are taken out of the reserve rather than out of whatever is left.
-            reserve = int((expert_reserve_gib + (1.0 if graphs else 0.0)) * GIB)
+            # the others - the tier is HBM, and the cap is per card.  Capturing the decode adds one expert
+            # landing zone per card the experts live on (425 MB) plus that card's graph pool, which are not
+            # allocated yet when the tier is sized, so they are taken out of the reserve rather than out of
+            # whatever is left.
+            graph_reserve = 1.0 if graphs else 0.0
+            reserve = int((expert_reserve_gib + graph_reserve) * GIB)
             if dev == "cpu":
                 per_card = {dev: 8 * GIB}
             else:
@@ -140,9 +143,11 @@ def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_sha
                 for extra in dict.fromkeys(pool):
                     if extra != dev:
                         # a card that only holds experts still needs room for the batch in flight: the
-                        # staged copy, the slots it is cloned into, and the allocator's own padding.  At
-                        # 1 GiB the tier filled the card and the next insert ran it out of memory.
-                        per_card[extra] = max(0, free_hbm_bytes(extra) - int(5.0 * GIB))
+                        # staged copy, the slots it is cloned into, the allocator's own padding, and - with
+                        # graphs - its own landing zone and per-card graph pool.  At 1 GiB the tier filled
+                        # the card and the next insert ran it out of memory.
+                        per_card[extra] = max(0, free_hbm_bytes(extra)
+                                              - int((5.0 + graph_reserve) * GIB))
             # never more slots on a card than the model has experts
             cap = cfg.num_hidden_layers * cfg.n_routed_experts
             src.set_slots({d: min(int(b // per_expert), cap) for d, b in per_card.items()})

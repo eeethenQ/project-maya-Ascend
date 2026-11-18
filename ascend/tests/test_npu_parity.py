@@ -201,6 +201,42 @@ class Parity(unittest.TestCase):
             self.assertLess(rel.item(), 2e-3,
                             f"captured step {step} logits: max rel err {rel.item():.2e}")
 
+    def test_the_captured_decode_runs_on_a_spread_expert_tier(self):
+        """A spread tier is no longer a fallback: `g_post` is captured on the card the experts live on.
+
+        The split crosses the card boundary twice per layer - the register pack down, the residual back -
+        and both copies are outside the graphs, which is what makes capture legal on a spread tier at all.
+        """
+        from ascend.dsv41 import runtime as rt
+
+        cards = [f"npu:{i}" for i in range(min(2, torch.npu.device_count()))]
+        if len(cards) < 2:
+            self.skipTest("needs two visible cards")
+        run = rt.build(model=str(self.model.root), device=cards[0], dtype="bfloat16",
+                       hbm_share=HBM_SHARE, expert_batch=8, expert_devices=cards, graphs=True)
+        try:
+            net = run.model
+            net.host_mixes = False               # the branch a captured layer contains
+            prompt = [3, 5, 7, 11]
+            on_ids, on_rows = self.greedy(net, self.state(cards[0], torch.bfloat16), prompt, 4)
+            g = net._decode_graphs
+            self.assertIsNotNone(g, "graphs were requested but the spread tier fell back to eager")
+            self.assertEqual(len(g.cards), 2)
+            self.assertTrue(any(g.card_of[li] != g.compute_key
+                                for li in range(self.cfg.num_hidden_layers)),
+                            "the test did not put any layer's experts on the second card")
+            for name in g.post.values():
+                self.assertEqual(g.report(name).mode, "graph", f"{name} fell back instead of capturing")
+            net.graphs = False
+            off_ids, off_rows = self.greedy(net, self.state(cards[0], torch.bfloat16), prompt, 4)
+        finally:
+            run.close()
+        self.assertEqual(on_ids, off_ids, f"greedy ids differ: captured {on_ids}, eager {off_ids}")
+        for step, (on, off) in enumerate(zip(on_rows, off_rows)):
+            self.assertEqual(int(on.argmax()), int(off.argmax()), f"step {step} top-1 differs")
+            rel = (on - off).abs().max() / off.abs().max().clamp_min(1e-6)
+            self.assertLess(rel.item(), 2e-3, f"captured step {step}: max rel err {rel.item():.2e}")
+
     def test_the_capture_guard_proves_the_split_reads_live_inputs(self):
         """`graph_verify=True` runs the did-it-capture guard on every graph of the split.
 

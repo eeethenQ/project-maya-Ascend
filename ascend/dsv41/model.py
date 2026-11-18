@@ -638,9 +638,10 @@ class ExpertStreamer(ExpertSource):
         """Fetch into a fixed landing zone: ``slab[i, j]`` is expert ``i``'s w{j+1}, flattened int8.
 
         The copy into the slab is a device-to-device move from the batch this fetch just landed (or from
-        the resident tier), so it adds 203 MB of on-card bandwidth per layer and no host work.  Every
-        expert must be on the card the layer runs on: a captured graph cannot contain a cross-device copy,
-        and `Dsv41` refuses to enable graphs when the tier is spread.
+        the resident tier), so it adds 203 MB of on-card bandwidth per layer and no host work.  ``slab``
+        must live on the card the layer's experts live on (:meth:`device_for`), because that is the card
+        the captured ``g_post`` runs on: a captured graph cannot contain a cross-device copy, so the
+        landing zone, not the layer, is what follows the experts.
         """
         experts = [int(e) for e in experts]
         if not experts:
@@ -778,6 +779,10 @@ class Dsv41:
         self._graph_reason_logged = False
         # where each layer's experts are computed; empty means "on the card the layer is on"
         self.expert_device_for = getattr(weights.experts, "device_for", None)
+        # The captured decode puts each layer's `g_post` - and therefore that layer's landing zone - on
+        # the card its experts live on.  Normally that is the streamer's own placement; an explicit map
+        # (`{layer: "npu:2"}`) overrides it, which is also how the CPU tests exercise a spread tier.
+        self.expert_cards: "dict[int, str] | None" = None
         # experts per MoE batch: the staging ring is sized for this many, so the two must agree
         self.expert_batch = int(getattr(weights.experts, "_max_batch", 8))
         # the int8 fast path needs an Ascend runtime and a symmetric (zero-point-free) checkpoint
@@ -1361,9 +1366,19 @@ class Dsv41:
     # -- the decode graphs ----------------------------------------------------------------------
     def graph_summary(self, state: State) -> str:
         """The capture table this state will use, one line per index source (`describe()` logged)."""
+        per = (2 * self.cfg.num_experts_per_tok * 3 * self.cfg.moe_intermediate_size
+               * self.cfg.hidden_size / 1e6)
+        cards = (None if self.expert_cards is None
+                 else list(dict.fromkeys(str(self.expert_cards[li])
+                                         for li in range(self.cfg.num_hidden_layers))))
+        if cards is None:
+            device_for = self.expert_device_for
+            cards = (list(dict.fromkeys(str(device_for(li))
+                                        for li in range(self.cfg.num_hidden_layers)))
+                     if device_for is not None else [self.device])
         lines = [f"graphs: {'on' if self.graphs else 'off'} - 2 per layer (g_pre, g_post), one g_pre per "
-                 f"selection bucket per layer; the expert landing zone is "
-                 f"{2 * self.cfg.num_experts_per_tok * 3 * self.cfg.moe_intermediate_size * self.cfg.hidden_size / 1e6:.0f} MB"]
+                 f"selection bucket per layer; g_pre on {self.device}, g_post on the expert cards "
+                 f"({', '.join(cards)}), each with a {per:.0f} MB landing zone"]
         for li in self.plan.index_source_layer_ids:
             capacity = state.kv.group_entries[self.plan.layer(li).kv_source_layer]
             lines.append(f"  layer {li:2d}: {self.index_buckets.describe(capacity)}")
@@ -1385,15 +1400,11 @@ class Dsv41:
         if self.expert_batch < cfg.num_experts_per_tok:
             return (f"the staging ring holds {self.expert_batch} experts but a decode step routes "
                     f"{cfg.num_experts_per_tok}; raise --expert-batch")
-        device_for = getattr(src, "device_for", None)
-        if device_for is not None:
-            elsewhere = [li for li in range(cfg.num_hidden_layers) if str(device_for(li)) != str(self.device)]
-            if elsewhere:
-                # probe G: a cross-device copy cannot be captured, and g_post's math (experts + the shared
-                # expert on the layer's card) would straddle the two
-                return (f"the expert tier is spread over several cards (layer {elsewhere[0]}'s experts live "
-                        f"on {device_for(elsewhere[0])}, the layer on {self.device}); a captured layer "
-                        "cannot cross devices")
+        # A spread tier used to be a refusal here: `g_post` was captured on the layer's card and read a
+        # landing zone there, so a layer whose experts lived elsewhere would have needed a cross-device
+        # copy inside the capture.  It no longer is one: each card gets its own registers and its own
+        # landing zone, `g_post` is captured where the experts are, and only the ~200 KB register pack
+        # crosses a card boundary - outside every graph (`_DecodeGraphs.carry`).
         return None
 
     def _graphs_usable(self) -> bool:
@@ -1408,40 +1419,61 @@ class Dsv41:
     def _graph_decode(self, h: torch.Tensor, pre: torch.Tensor, state: State, engram_rows) -> torch.Tensor:
         """One decode token through 40 captured `g_pre` / `g_post` pairs, with the host seam between them.
 
-        Per layer: replay `g_pre` (engram, mHC, attention, compressor/indexer, router) which writes the
-        expert input and the six routing ids to fixed registers; read those ids with one ``cpu()``; fetch
-        the six experts into the parity's landing zone (host ``pread`` + async H2D, outside every graph);
-        replay `g_post` (six expert matmul triples, the shared expert, the post-mHC).  Anything that fails
-        to capture or replay disables graphs and finishes the step (and the request) on the eager path.
+        Per layer: replay `g_pre` (engram, mHC, attention, compressor/indexer, router, shared expert) on the
+        compute card, which writes the expert input and the six routing ids to fixed registers; read those
+        ids with one ``cpu()``; hand the register pack to the card the layer's experts live on (one small
+        cross-card copy, outside every graph); fetch the six experts into *that card's* landing zone (host
+        ``pread`` + async H2D, outside every graph); replay that card's `g_post` (six expert matmul triples,
+        the post-mHC); hand the residual back.  Anything that fails to capture or replay disables graphs and
+        finishes the step (and the request) on the eager path.
         """
         g = self._decode_graphs
         if g is None or g.state is not state or g.state.kv is not state.kv:
             if g is not None:
                 g.close()
-            g = self._decode_graphs = _DecodeGraphs(self, state, verify=self.graph_verify)
+            g = self._decode_graphs = _DecodeGraphs(self, state, verify=self.graph_verify,
+                                                   cards=self.expert_cards)
             print(g.describe(), flush=True)
         b = g.buffers
+        g.activate(g.compute_key)
         b.h.copy_(h)
         b.pres[0].copy_(pre)                       # layer 0 reads the first parity; the rest ping-pong
         li = 0
+        posted = -1                                # the last layer whose g_post completed on its card
         try:
             for li in range(self.cfg.num_hidden_layers):
+                g.activate(g.compute_key)
                 if self.engram is not None and li in self.engram.slot:
                     # the lookup is host work keyed by the token history; it cannot be captured, so the
                     # rows land in a fixed buffer here, between the replays
                     g.engram[li].copy_(self.engram.embedding(li, engram_rows[:, self.engram.slot[li]]))
                 g.replay_pre(li)
                 ids = b.idx.cpu().tolist()              # the ONE host break: six ints, one sync
+                key = g.card_of[li]
+                if key != g.compute_key:
+                    g.carry(li)                         # registers -> the expert card, outside the graphs
                 g.fetch(li, ids)                        # host pread + async H2D, outside the graphs
-                g.replay_post(li)
+                g.replay_post(li)                       # the experts' card
+                posted = li
+                if key != g.compute_key:
+                    g.carry_back(li)                    # the residual -> the compute card, outside
         except (GraphRunnerError, RuntimeError) as exc:
             # a capture the wrapper refused, or a replay the runtime refused: finish this step (and the
             # request) eagerly rather than fail the conversation half-way through a layer
+            g.activate(g.compute_key)
             self._disable_graphs(f"layer {li}: {type(exc).__name__}: {exc}")
+            start = li
+            if posted == li:
+                # the layer's g_post did finish and only the hand-off back failed: its residual is in the
+                # expert card's registers, so take it and carry on from the *next* layer
+                b.h.copy_(g.regs_for(li).h)
+                start = li + 1
             g.close()
             self._decode_graphs = None
-            # layer `li`'s own input pre-mix is still in its parity (g_pre writes the other one)
-            return self._eager_layers(b.h, b.pres[li % 2], state, state.pos, [], engram_rows, start=li)
+            # layer `start`'s own input pre-mix is still in its parity (g_pre writes the other one)
+            return self._eager_layers(b.h, b.pres[start % 2], state, state.pos, [], engram_rows,
+                                      start=start)
+        g.activate(g.compute_key)
         # the last layer wrote parity `num_layers % 2` (its input was the other one)
         return rms(self.hc_pre(b.h, b.pres[self.cfg.num_hidden_layers % 2]), self.weights.final_norm,
                    self.eps)
@@ -1454,9 +1486,13 @@ class Dsv41:
     def _layer_pre_body(self, li: int, g: "_DecodeGraphs", bucket: int):
         """What `g_pre` captures: everything from the layer's input up to the routing ids.
 
-        It writes the layer's expert input, the router's ids and weights, the post-MHC's residual and
-        mixes and the next layer's pre-mix into fixed buffers, so `g_post` and the next `g_pre` read the
-        same addresses on every replay.
+        It writes the layer's expert input, the router's ids and weights, the shared expert's output, the
+        post-MHC's residual and mixes and the next layer's pre-mix into fixed buffers, so `g_post` and the
+        next `g_pre` read the same addresses on every replay.
+
+        The *shared* expert is captured here, not in `g_post`: its weights live with the layer on the
+        compute card, while `g_post` runs on the card the routed experts live on.  It is added by `g_post`
+        in the same place the eager path adds it, so the arithmetic is unchanged.
         """
         role = self.plan.layer(li)
         lw = self.weights.layers[li]
@@ -1486,28 +1522,32 @@ class Dsv41:
         b.x.copy_(x_li)
         b.idx.copy_(idx[0])
         b.wts.copy_(wts[0])
+        b.yshared.copy_(self.mm(self.swiglu(x_li, lw.ffn["shared_w1"], lw.ffn["shared_w3"]),
+                                lw.ffn["shared_w2"]))
         b.res.copy_(h2)
         b.fpost.copy_(f_post)
         b.fcomb.copy_(f_comb)
         pre_out.copy_(f_pre)
-        return (b.x, b.idx, b.wts, b.res, b.fpost, b.fcomb, pre_out)
+        return (b.x, b.idx, b.wts, b.yshared, b.res, b.fpost, b.fcomb, pre_out)
 
     def _layer_post_body(self, li: int, g: "_DecodeGraphs"):
-        """What `g_post` captures: the six unrolled expert matmul triples and the shared expert.
+        """What `g_post` captures: the six unrolled expert matmul triples and the post-MHC.
 
         Same arithmetic as `_routed_one`, on the same per-token activation quantisation, but the expert
-        weights are read from this layer's parity of the landing zone (a fixed address, filled by the host
-        between the replays) and their scales from the matching fixed slab.
+        weights are read from this layer's parity of *this card's* landing zone (a fixed address, filled by
+        the host between the replays) and their scales from the matching fixed slab.  The registers it
+        reads live on this card too: `_DecodeGraphs.carry` is what puts them there, and the shared expert
+        was already folded into `yshared` by `g_pre`.
         """
-        cfg, lw = self.cfg, self.weights.layers[li]
+        cfg = self.cfg
         K = cfg.num_experts_per_tok
-        b = g.buffers
-        x = b.x
-        y = b.y
+        regs = g.regs_for(li)
+        x = regs.x
+        y = regs.y
         y.zero_()
-        slab = b.slab[g.parity(li)]
-        sc1, sc2, sc3 = b.scales
-        z1, z2, z3 = b.zeros
+        slab = regs.slab[g.parity(li)]
+        sc1, sc2, sc3 = regs.scales
+        z1, z2, z3 = regs.zeros
         xq = xs = None
         if self.int8_experts and torch_npu is not None:
             xq, xs = per_token_int8(x)
@@ -1519,15 +1559,14 @@ class Dsv41:
             if xq is not None:
                 g_ = self.expert_mm_q(xq, xs, w1[None], sc1[i], z1[i]).clamp(max=self.lim)
                 u_ = self.expert_mm_q(xq, xs, w3[None], sc3[i], z3[i]).clamp(-self.lim, self.lim)
-                y.add_(self.expert_mm_q(*per_token_int8(F.silu(g_) * u_), w2[None], sc2[i], z2[i]) * b.wts[i])
+                y.add_(self.expert_mm_q(*per_token_int8(F.silu(g_) * u_), w2[None], sc2[i], z2[i]) * regs.wts[i])
             else:
                 g_ = self.mm(x, self.dequant(w1, sc1[i], z1[i])).clamp(max=self.lim)
                 u_ = self.mm(x, self.dequant(w3, sc3[i], z3[i])).clamp(-self.lim, self.lim)
-                y.add_(self.mm(F.silu(g_) * u_, self.dequant(w2, sc2[i], z2[i])) * b.wts[i])
-        shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
-        y.add_(self.mm(shared, lw.ffn["shared_w2"]))
-        b.h.copy_(self.hc_post(y, b.res, b.fpost, b.fcomb))
-        return (b.h, b.y)
+                y.add_(self.mm(F.silu(g_) * u_, self.dequant(w2, sc2[i], z2[i])) * regs.wts[i])
+        y.add_(regs.yshared)          # the shared expert, computed by g_pre on the layer's own card
+        regs.h.copy_(self.hc_post(y, regs.res, regs.fpost, regs.fcomb))
+        return (regs.h, regs.y)
 
 
 class _DecodeGraphs:
@@ -1541,58 +1580,84 @@ class _DecodeGraphs:
     writes and reads, so a second conversation gets its own capture (and the first one's is dropped).  That
     is a log line, not a silent reuse - `GraphRunner`'s input contract would refuse the replay anyway.
 
-    The buffers below are the fixed registers the split needs:
+    The layers' attention runs on the compute card (``model.device``).  The routed experts' tier may be
+    spread over several cards (`ExpertStreamer.layer_devices`), and a cross-device copy cannot be captured,
+    so each layer's `g_post` - and with it that layer's landing zone and registers - is captured *on the
+    card its experts live on*.  The card boundary is crossed by two small copies outside the graphs:
 
-    * ``h``/``pre`` - the residual stream and the lagged pre-mix, read by `g_pre`, written by `g_post`
-      (``h``) and the next `g_pre` (``pre``);
-    * ``x``/``idx``/``wts`` - this layer's expert input, its six routing ids and weights: `g_pre` writes
-      them, the host reads the ids, `g_post` reads the other two;
-    * ``res``/``fpost``/``fcomb`` - what the post-MHC needs from the attention half;
-    * ``slab`` - the expert landing zone, ``[2, top_k, 3, inter*hidden]`` int8 (405 MB at the real
+        g_pre[li].replay()                 # compute card
+        ids = idx.cpu().tolist()           # the ONE host break: six ints, one sync
+        carry(li)                          # compute card -> expert card, one ~200 KB copy, eager
+        fetch_int8_into(li, ids, ...)      # host pread + async H2D into *that* card's landing zone
+        g_post[li].replay()                # expert card
+        carry_back(li)                     # expert card -> compute card, the residual, eager
+
+    The registers are the fixed addresses a capture bakes.  Everything a `g_post` reads or writes except the
+    routing ids lives in one contiguous ``pack`` per card, which is what makes each hand-off one copy
+    instead of seven: the layout is identical on every card, so ``pack.copy_(pack)`` is exact.
+
+    * ``pack`` - per card: ``h`` (the residual stream), ``x`` (the layer's expert input), ``wts`` (the six
+      routing weights), ``res``/``fpost``/``fcomb`` (what the post-MHC needs from the attention half) and
+      ``yshared`` (the shared expert's output, computed by `g_pre` because its weights stay with the layer
+      on the compute card).  ``h`` is written by `g_post` and read by the next `g_pre`; the rest is written
+      by `g_pre` and read by `g_post`;
+    * ``idx`` - the six routing ids, on the compute card: `g_pre` writes them, the host reads them;
+    * ``pres`` - the lagged pre-mix, two buffers ping-ponged by layer parity.  A single buffer would hand
+      the first replay the warm-up's output instead of its input (`capture(warmup=True)` runs the body
+      once eagerly), and two fixed buffers are also what keeps every graph's address fixed;
+    * ``slab`` - the expert landing zone, per card, ``[2, top_k, 3, inter*hidden]`` int8 (425 MB at the real
       geometry), double-buffered so the host can fill one parity while the other is still being read.  A
-      layer uses parity ``li % 2``; `g_post[li]` bakes that address, and that is why every layer can read
-      the same pair of buffers instead of owning 33.8 MB x 6 of HBM;
-    * ``scales``/``zeros`` - the experts' per-output-channel scales, in the same w1/w2/w3 order, at fixed
-      addresses (`fetch_int8_into` fills them);
-    * ``topk``/``candidates`` - the selection registers: one per index source, one for the candidate
-      source.  A source re-captured at a new bucket still writes the same address, so the consumer graphs
-      that read it stay valid.  They are padded (``-1`` / False) to their full width, which the attention
-      masks: the valid set is the same as eager, the softmax just sums a few hundred exact zeros.
+      layer uses parity ``li % 2``; its `g_post` bakes that address, and that is why the layers of one card
+      share a pair of buffers instead of owning 33.8 MB x 6 of HBM each;
+    * ``scales``/``zeros`` - per card: the experts' per-output-channel scales, in the same w1/w2/w3 order,
+      at fixed addresses (`fetch_int8_into` fills them);
+    * ``topk``/``candidates`` - the selection registers, on the compute card: one per index source, one for
+      the candidate source.  A source re-captured at a new bucket still writes the same address, so the
+      consumer graphs that read it stay valid.  They are padded (``-1`` / False) to their full width, which
+      the attention masks: the valid set is the same as eager, the softmax just sums a few hundred exact
+      zeros.
     """
 
-    def __init__(self, model: "Dsv41", state: State, verify: bool = False):
+    def __init__(self, model: "Dsv41", state: State, verify: bool = False,
+                 cards: "dict[int, str] | None" = None):
         self.model = model
         self.state = state                      # held: id() stays unique, and the graphs belong to it
         self.verify = bool(verify)
         cfg = model.cfg
         D, hc, K = cfg.hidden_size, cfg.hc_mult, cfg.num_experts_per_tok
         dev = model.device
-        f32 = torch.float32
+        layers = cfg.num_hidden_layers
 
-        def zeros(*shape, dtype=f32):
-            return torch.zeros(*shape, dtype=dtype, device=dev)
+        # -- which card runs each layer's g_post -------------------------------------------------
+        compute_key = str(dev)
+        if cards:
+            card_of = {li: str(cards[li]) for li in range(layers)}
+        else:
+            device_for = getattr(model.weights.experts, "device_for", None)
+            card_of = {li: str(device_for(li)) if device_for is not None else compute_key
+                       for li in range(layers)}
+        self.compute_key = compute_key
+        self.card_of = card_of
+        # A card name that is not an NPU device is the CPU fallback's way of naming more than one card:
+        # each is physically the process's own device.  That is what lets a test run the split - two
+        # register sets, the carries, two runners - without two cards.
+        self.physical: dict[str, str] = {}
+        for key in [compute_key] + [k for k in dict.fromkeys(card_of.values()) if k != compute_key]:
+            self.physical[key] = key if str(key).startswith("npu") else compute_key
+        self.cards: dict[str, _CardRegisters] = {}
+        for key in dict.fromkeys(self.physical):
+            self.cards[key] = _CardRegisters(self.physical[key], hc=hc, hidden=D, top_k=K,
+                                             inter=cfg.moe_intermediate_size)
+        b = self.buffers = _GraphBuffers(self.cards[compute_key])
+        b.cards = self.cards
 
-        b = self.buffers = _GraphBuffers()
-        b.h = zeros(1, hc, D)
         # The pre-mix is a *lagged* register: layer `li` reads the mix layer `li-1` wrote.  A g_pre both
         # reads and writes it, and `capture(warmup=True)` runs the body once eagerly - so a single buffer
         # would hand the first replay the warmup's output instead of its input.  Two buffers, ping-ponged
         # by layer parity, are also what keeps every graph's addresses fixed.
-        b.pres = (zeros(1, hc), zeros(1, hc))
-        b.x = zeros(1, D)
-        b.y = zeros(1, D)
-        b.idx = zeros(K, dtype=torch.long)
-        b.wts = zeros(K)
-        b.res = zeros(1, hc, D)
-        b.fpost = zeros(1, hc)
-        b.fcomb = zeros(1, hc, hc)
-        per = cfg.moe_intermediate_size * D
-        b.slab = torch.empty(2, K, 3, per, dtype=torch.int8, device=dev)
-        # [K, out, 1]: `.view(-1)` is the quant matmul's per-channel scale, and the same shape broadcasts
-        # over a [out, in] weight in the dequantising fallback
-        b.scales = (zeros(K, cfg.moe_intermediate_size, 1), zeros(K, D, 1),
-                    zeros(K, cfg.moe_intermediate_size, 1))
-        b.zeros = tuple(torch.zeros_like(s) for s in b.scales)
+        b.pres = (torch.zeros(1, hc, dtype=torch.float32, device=dev),
+                  torch.zeros(1, hc, dtype=torch.float32, device=dev))
+        b.idx = torch.zeros(K, dtype=torch.long, device=dev)
         self.topk: dict[int, torch.Tensor] = {}
         for src in model.plan.index_source_layer_ids:
             capacity = state.kv.group_entries[model.plan.layer(src).kv_source_layer]
@@ -1605,14 +1670,77 @@ class _DecodeGraphs:
             model.engram.warm(model.device)     # the rotation block's first use is a host copy
             cols = model.engram.cols * model.engram.head_dim
             for li in cfg.engram_layer_ids:
-                self.engram[li] = zeros(1, cols)
-        self.runner = GraphRunner(dev, capture_error_mode="relaxed")
+                self.engram[li] = torch.zeros(1, cols, dtype=torch.float32, device=dev)
+        self.runners: dict[str, GraphRunner] = {}
+        self._name_card: dict[str, str] = {}
+        self._events: dict[str, object] = {}
+        self.runner = self._runner(compute_key)     # the compute card's runner (and the old alias)
         self.pre: dict[tuple[int, int], str] = {}
         self.post: dict[int, str] = {}
         self.buckets: set[int] = set()
         self.captured = 0
         self.capture_s = 0.0
         self.closed = False
+
+    # -- cards ----------------------------------------------------------------------------------
+    def activate(self, key: str) -> None:
+        """Make the card `key` the current device; a no-op on the CPU fallback."""
+        phys = self.physical.get(key, key)
+        if not str(phys).startswith("npu") or not hasattr(torch, "npu"):
+            return
+        index = int(str(phys).split(":")[-1]) if ":" in str(phys) else 0
+        # Unconditional: measured 0.8 us, and it needs no assumption about which device a caller (the
+        # streamer's own copies, a test) left current.
+        torch.npu.set_device(index)
+
+    def regs_for(self, li: int) -> "_CardRegisters":
+        """The registers a layer's `g_post` was captured against: its expert card's, never the layer's."""
+        return self.cards[self.card_of[li]]
+
+    def carry(self, li: int) -> None:
+        """Compute card -> expert card: the registers `g_post` reads.  One copy, outside every graph."""
+        key = self.card_of[li]
+        self.activate(key)
+        self.cards[key].pack.copy_(self.cards[self.compute_key].pack)
+
+    def carry_back(self, li: int) -> None:
+        """Expert card -> compute card: the residual `g_post` wrote.  One copy, outside every graph."""
+        key = self.card_of[li]
+        self.activate(key)
+        compute = self.cards[self.compute_key]
+        compute.pack.copy_(self.cards[key].pack)
+        # The copy is enqueued on the expert card's stream (the current one).  The event makes the compute
+        # stream wait for it even if this stack ever makes the copy asynchronous; measured on this one it
+        # is host-synchronous, so the wait is a no-op today.
+        if hasattr(torch, "npu") and str(self.physical[key]).startswith("npu"):
+            ev = self._events.get(key)
+            if ev is None:
+                ev = self._events[key] = torch.npu.Event()
+            ev.record(torch.npu.current_stream(self._index(self.physical[key])))
+            torch.npu.current_stream(self._index(self.physical[self.compute_key])).wait_event(ev)
+        self.activate(self.compute_key)
+
+    @staticmethod
+    def _index(device: str) -> int:
+        return int(str(device).split(":")[-1]) if ":" in str(device) else 0
+
+    def _runner(self, key: str) -> GraphRunner:
+        """The GraphRunner of one card: one capture pool per device, created where its graphs are.
+
+        Each runner draws its graphs on that card's own capture stream (see `GraphRunner`), which is what
+        makes a capture legal on more than one card in one process.
+        """
+        runner = self.runners.get(key)
+        if runner is None:
+            self.activate(key)
+            runner = self.runners[key] = GraphRunner(self.physical[key],
+                                                     capture_error_mode="relaxed")
+        return runner
+
+    def report(self, name: str):
+        """The capture verdict for `name`, from whichever card's runner holds it."""
+        key = self._name_card.get(name)
+        return self.runners[key].report(name) if key is not None else self.runner.report(name)
 
     # -- selection ------------------------------------------------------------------------------
     def bucket_for(self, li: int) -> int:
@@ -1634,13 +1762,23 @@ class _DecodeGraphs:
         capacity = self.state.kv.group_entries[role.kv_source_layer]
         return self.model.index_buckets.bucket_for(self.state.entries(li, self.state.next_pos), capacity)
 
+    def bytes(self) -> int:
+        """What this State's captured decode costs in HBM: every card's registers, landing zones included."""
+        return sum(regs.bytes() for regs in self.cards.values())
+
     def describe(self) -> str:
-        """One line for the capture log: geometry, devices and the copy the landing zone costs."""
+        """One line for the capture log: geometry, cards and the landing zones they cost."""
         cfg = self.model.cfg
         per = cfg.num_experts_per_tok * 3 * cfg.moe_intermediate_size * cfg.hidden_size
-        return (f"graphs: capturing on {self.model.device} - 2 per layer, one g_pre per selection bucket "
-                f"per layer; landing zone {2 * per / 1e6:.0f} MB ({per / 1e6:.0f} MB x 2 parities), "
-                f"top-{cfg.num_experts_per_tok} experts unrolled")
+        cards = list(dict.fromkeys(self.card_of.values()))
+        if cards == [self.compute_key]:
+            where = f"one card ({self.compute_key})"
+        else:
+            where = (f"g_post on {len(cards)} cards ({', '.join(str(k) for k in cards)}); each has its own "
+                     f"landing zone")
+        return (f"graphs: capturing on {self.compute_key} - 2 per layer, one g_pre per selection bucket "
+                f"per layer; {where}; landing zone {2 * per / 1e6:.0f} MB each "
+                f"({per / 1e6:.0f} MB x 2 parities), top-{cfg.num_experts_per_tok} experts unrolled")
 
     def parity(self, li: int) -> int:
         return li % 2
@@ -1652,28 +1790,33 @@ class _DecodeGraphs:
         if name is None:
             name = f"g_pre.{li}.{bucket}"
             self._capture(name, lambda: self.model._layer_pre_body(li, self, bucket),
-                          self._inputs_pre(li), self._perturb_pre)
+                          self._inputs_pre(li), self._perturb_pre, self.compute_key)
             self.pre[(li, bucket)] = name
             if bucket and bucket not in self.buckets:
                 self.buckets.add(bucket)
                 if len(self.buckets) > 1:
                     print(f"graphs: selection bucket {bucket} - capturing this rung's layer graphs "
                           f"(one g_pre per layer per rung; the width is a shape)", flush=True)
+        self.activate(self.compute_key)
         self.runner.replay(name)
 
     def replay_post(self, li: int) -> None:
+        key = self.card_of[li]
         name = self.post.get(li)
         if name is None:
             name = f"g_post.{li}"
             self._capture(name, lambda: self.model._layer_post_body(li, self), self._inputs_post(li),
-                          None)
+                          None, key)
             self.post[li] = name
-        self.runner.replay(name)
+        self.activate(key)
+        self._runner(key).replay(name)
 
     def fetch(self, li: int, ids: list[int]) -> None:
-        """Land the routed experts in this layer's parity, outside every graph."""
-        self.model.weights.experts.fetch_int8_into(li, ids, self.buffers.slab[self.parity(li)],
-                                                   self.buffers.scales)
+        """Land the routed experts in this layer's parity, on the card its `g_post` runs on."""
+        key = self.card_of[li]
+        regs = self.cards[key]
+        self.activate(key)
+        self.model.weights.experts.fetch_int8_into(li, ids, regs.slab[self.parity(li)], regs.scales)
 
     def _inputs_pre(self, li: int) -> dict:
         b = self.buffers
@@ -1683,10 +1826,10 @@ class _DecodeGraphs:
         return inputs
 
     def _inputs_post(self, li: int) -> dict:
-        b = self.buffers
-        return {"x": b.x, "wts": b.wts, "slab": b.slab[self.parity(li)], "res": b.res,
-                "fpost": b.fpost, "fcomb": b.fcomb, "scale1": b.scales[0], "scale2": b.scales[1],
-                "scale3": b.scales[2]}
+        regs = self.regs_for(li)
+        return {"x": regs.x, "wts": regs.wts, "slab": regs.slab[self.parity(li)], "res": regs.res,
+                "fpost": regs.fpost, "fcomb": regs.fcomb, "yshared": regs.yshared,
+                "scale1": regs.scales[0], "scale2": regs.scales[1], "scale3": regs.scales[2]}
 
     @staticmethod
     def _perturb_pre(inputs) -> None:
@@ -1703,16 +1846,18 @@ class _DecodeGraphs:
             else:
                 t.bitwise_xor_(1)
 
-    def _capture(self, name: str, fn, inputs: dict, perturb) -> None:
+    def _capture(self, name: str, fn, inputs: dict, perturb, key: str) -> None:
+        runner = self._runner(key)
         saved, self.model.timers = self.model.timers, None   # phase() synchronises, which capture refuses
         t0 = _perf()
         try:
-            self.runner.capture(name, fn, inputs=inputs, verify=self.verify, perturb=perturb)
+            runner.capture(name, fn, inputs=inputs, verify=self.verify, perturb=perturb)
         finally:
             self.model.timers = saved
             self.capture_s += _perf() - t0
         self.captured += 1
-        report = self.runner.report(name)
+        self._name_card[name] = key
+        report = runner.report(name)
         if self.verify and report is not None and not report.ok:
             raise GraphRunnerError(f"capture guard failed for {name}: {report}")
 
@@ -1721,7 +1866,12 @@ class _DecodeGraphs:
         if self.closed:
             return
         self.closed = True
-        self.runner.close()
+        for runner in self.runners.values():
+            runner.close()
+        self.runners.clear()
+        self.runner = None
+        self._events.clear()
+        self._name_card.clear()
         self.pre.clear()
         self.post.clear()
         # the buffers are the state's addresses, not the runner's: drop them so a re-capture cannot
@@ -1729,5 +1879,78 @@ class _DecodeGraphs:
         self.buffers = None
 
 
+class _CardRegisters:
+    """One card's fixed decode registers: the carried ``pack``, the ``y`` scratch and its landing zone.
+
+    ``pack`` is a single allocation and every register is a view into it.  That is what makes a card
+    hand-off one copy: the offsets are the same on every card, so ``pack.copy_(pack)`` moves all of them at
+    once, while each view still has the fixed address a captured graph bakes.  Layout, in floats:
+
+        h (hc*hidden) | x (hidden) | wts (top_k) | res (hc*hidden) | fpost (hc) | fcomb (hc*hc) |
+        yshared (hidden)
+
+    ``y`` is the routed sum's accumulator: written and consumed inside one `g_post`, so it is never carried
+    and does not belong in the pack.
+    """
+
+    def __init__(self, device, *, hc: int, hidden: int, top_k: int, inter: int):
+        D, K, hc = int(hidden), int(top_k), int(hc)
+        self.device = str(device)
+        n = 2 * hc * D + 2 * D + K + hc + hc * hc
+        self.pack = torch.zeros(n, dtype=torch.float32, device=device)
+        offset = 0
+
+        def view(count: int, shape: tuple) -> torch.Tensor:
+            nonlocal offset
+            t = self.pack[offset:offset + count].view(shape)
+            offset += count
+            return t
+
+        self.h = view(hc * D, (1, hc, D))
+        self.x = view(D, (1, D))
+        self.wts = view(K, (K,))
+        self.res = view(hc * D, (1, hc, D))
+        self.fpost = view(hc, (1, hc))
+        self.fcomb = view(hc * hc, (1, hc, hc))
+        self.yshared = view(D, (1, D))
+        if offset != n:                                     # pragma: no cover - the layout is static
+            raise AssertionError(f"register pack layout covers {offset} of {n} floats")
+        self.y = torch.zeros(1, D, dtype=torch.float32, device=device)
+        per = int(inter) * D
+        # [2, top_k, 3, inter*hidden] int8: all the layers whose g_post runs on this card read this pair
+        self.slab = torch.empty(2, K, 3, per, dtype=torch.int8, device=device)
+        # [K, out, 1]: `.view(-1)` is the quant matmul's per-channel scale, and the same shape broadcasts
+        # over a [out, in] weight in the dequantising fallback
+        self.scales = (torch.zeros(K, int(inter), 1, dtype=torch.float32, device=device),
+                       torch.zeros(K, D, 1, dtype=torch.float32, device=device),
+                       torch.zeros(K, int(inter), 1, dtype=torch.float32, device=device))
+        self.zeros = tuple(torch.zeros_like(s) for s in self.scales)
+
+    def bytes(self) -> int:
+        """What this card's registers cost, for the budget that sizes the tier."""
+        return (self.pack.numel() + self.y.numel() + sum(s.numel() * 2 for s in self.scales)
+                ) * 4 + self.slab.numel()
+
+
 class _GraphBuffers:
-    """The fixed-address registers of one State's captured decode (see `_DecodeGraphs`)."""
+    """The compute card's registers, every card's set of them, and the two registers only it needs.
+
+    ``h``/``x``/``wts``/``res``/``fpost``/``fcomb``/``yshared``/``slab``/``scales``/``zeros``/``y`` are
+    aliases of the compute card's registers (see `_CardRegisters`); ``pres`` and ``idx`` stay on the compute
+    card because only `g_pre` and the host touch them.  ``cards`` is every card's register set, keyed the
+    way `_DecodeGraphs.card_of` names them.
+    """
+
+    def __init__(self, compute: "_CardRegisters"):
+        self.cards: dict[str, _CardRegisters] = {}
+        self.h = compute.h
+        self.x = compute.x
+        self.y = compute.y
+        self.wts = compute.wts
+        self.res = compute.res
+        self.fpost = compute.fpost
+        self.fcomb = compute.fcomb
+        self.yshared = compute.yshared
+        self.slab = compute.slab
+        self.scales = compute.scales
+        self.zeros = compute.zeros

@@ -169,6 +169,88 @@ class TheCapturedDecode(unittest.TestCase):
         self.assertEqual(src.hits, 2 * len(ids), "both slab fetches must be served from the tier")
         src.close()
 
+    def test_the_captured_decode_follows_a_spread_expert_tier(self):
+        """The tier may be spread: each layer's `g_post` runs on the card its experts live on.
+
+        On the CPU fallback a "card" is just another set of registers (the physical device is the process's
+        own), which is enough to run the split - two register sets, the down and back carries, two
+        runners - and to require that it produce the eager answer exactly.
+        """
+        net = build(self.ckpt, self.model, graphs=True)
+        net.host_mixes = False
+        layers = net.cfg.num_hidden_layers
+        net.expert_cards = {li: ("cpu:0" if li < layers // 2 else "cpu:1") for li in range(layers)}
+        prompt = [3, 5, 7, 11]
+        rows, ids = self.greedy(net, new_state(self.model), prompt, 4)
+
+        eager = build(self.ckpt, self.model, graphs=False)
+        eager.host_mixes = False                 # the branch a captured layer contains
+        want_rows, want_ids = self.greedy(eager, new_state(self.model), prompt, 4)
+        self.assertEqual(ids, want_ids, f"greedy ids differ: spread graphs {ids}, eager {want_ids}")
+        for step, (got, want) in enumerate(zip(rows, want_rows)):
+            torch.testing.assert_close(got, want, rtol=0, atol=0,
+                                       msg=f"step {step}: spread split is not bit-identical to eager")
+        g = net._decode_graphs
+        self.assertEqual(set(g.cards), {"cpu", "cpu:0", "cpu:1"})
+        self.assertTrue(all(g.card_of[li] != g.compute_key for li in range(layers)),
+                        "the test did not move any layer off the compute card")
+        self.assertEqual(len(g.pre), layers)
+        self.assertEqual(len(g.post), layers)
+        self.assertEqual(g.report("g_post.0").mode, "fallback")   # the CPU runner, not a card
+        self.assertEqual(len({id(g.cards[k].slab) for k in g.cards}), len(g.cards),
+                         "every card needs its own landing zone")
+
+    def test_a_card_hand_off_moves_the_whole_register_pack(self):
+        """`carry` and `carry_back` are one copy each way, and the pack is what makes that exact."""
+        net = build(self.ckpt, self.model, graphs=True)
+        net.host_mixes = False
+        net.expert_cards = {li: "cpu:0" for li in range(net.cfg.num_hidden_layers)}
+        state = new_state(self.model)
+        net.forward([3, 5, 7], state)
+        net.forward([11], state)
+        g = net._decode_graphs
+        compute, card = g.cards[g.compute_key], g.cards["cpu:0"]
+        with torch.inference_mode():                # the forward allocated these registers
+            source = torch.arange(compute.pack.numel(), dtype=torch.float32)
+            compute.pack.copy_(source)
+            g.carry(0)                              # compute card -> expert card
+            self.assertTrue(torch.equal(card.pack, source), "the carry must move the whole pack")
+            card.h.fill_(42.0)                      # the residual g_post would have written
+            g.carry_back(0)                         # expert card -> compute card
+            self.assertTrue(torch.equal(compute.h, card.h), "the carry back must bring the residual")
+            self.assertTrue(torch.equal(compute.h, torch.full_like(compute.h, 42.0)))
+
+    def test_the_register_pack_is_one_allocation_with_every_register_in_it(self):
+        """One copy per hand-off is only exact if the registers tile one buffer: no gap, no overlap."""
+        net = build(self.ckpt, self.model, graphs=True)
+        net.host_mixes = False
+        state = new_state(self.model)
+        net.forward([3, 5, 7], state)
+        net.forward([11], state)
+        regs = net._decode_graphs.cards[net._decode_graphs.compute_key]
+        fields = [regs.h, regs.x, regs.wts, regs.res, regs.fpost, regs.fcomb, regs.yshared]
+        nbytes = sum(t.numel() * t.element_size() for t in fields)
+        self.assertEqual(nbytes, regs.pack.numel() * regs.pack.element_size())
+        base = regs.pack.data_ptr()
+        spans = sorted((t.data_ptr() - base, t.data_ptr() - base + t.numel() * t.element_size())
+                       for t in fields)
+        self.assertEqual(spans[0][0], 0)
+        self.assertEqual(spans[-1][1], nbytes)
+        for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
+            self.assertEqual(a1, b0, "the registers must tile the pack with no gap and no overlap")
+
+    def test_a_spread_expert_tier_is_no_longer_a_reason_to_refuse_graphs(self):
+        """The refusal that made the four-card tier fall back to eager is gone (the split is per card)."""
+        cfg = self.model.cfg
+        src = ExpertStreamer(self.ckpt, cfg, "cpu", DTYPE, cache_slots=0,
+                             layer_devices=["npu:0", "npu:1"])
+        weights = Weights(self.ckpt, cfg, "cpu", DTYPE, expert_source=src).load()
+        net = Dsv41(cfg, weights, "cpu", DTYPE, graphs=True)
+        self.assertEqual(str(src.device_for(0)), "npu:0")
+        self.assertEqual(str(src.device_for(1)), "npu:1")
+        self.assertIsNone(net._graph_unusable_reason())
+        self.assertTrue(net._graphs_usable())
+
 
 @NEEDS_TORCH
 class TheGraphSwitch(unittest.TestCase):

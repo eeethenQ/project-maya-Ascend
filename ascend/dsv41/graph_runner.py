@@ -173,10 +173,19 @@ class GraphRunner:
         self._graphs: OrderedDict[str, _Entry] = OrderedDict()
         self._torch_npu: Any = None
         self._pool: Any = None
+        self._capture_stream: Any = None
         if self._is_npu:
             index = self._npu_index(device)
             self._torch_npu = self._require_npu()
             torch.npu.set_device(index)
+            # A capture stream of this card's own.  `torch.npu.graph` otherwise captures on
+            # `torch.npu.graph.default_capture_stream`, a *class* attribute created once on whatever
+            # device was current at the first capture in the process - so every later capture on another
+            # card records an empty graph on the first card's stream: it reports a successful capture and
+            # then replays without executing.  A process that decodes on one card is unaffected, which is
+            # why the single-card path never saw it.  An explicit stream also has to be the *same* stream
+            # for every capture that shares a pool.
+            self._capture_stream = torch.npu.Stream()
             # One pool for every graph this runner captures, exactly as the vendor's acl_graph.py does.
             self._pool = torch.npu.graph_pool_handle()
 
@@ -352,6 +361,16 @@ class GraphRunner:
                 ". The graph reads the capture-time addresses; replay only through fixed, "
                 "preallocated buffers of the same shape, dtype and device")
 
+    def _graph_kwargs(self) -> dict:
+        """What every capture of this runner passes to `torch.npu.graph`.
+
+        ``stream`` is always explicit and always this runner's own capture stream: the default one is a
+        process-global created on the first capturing device (see ``__init__``), and ``pool`` is the
+        runner's one shared pool.
+        """
+        return {"capture_error_mode": self.capture_error_mode, "stream": self._capture_stream,
+                "pool": self._pool}
+
     def _record_inputs(self, inputs) -> tuple[InputSpec, ...]:
         if inputs is None:
             items: list[tuple[Any, Any]] = []
@@ -432,8 +451,7 @@ class GraphRunner:
             else:
                 if warmup:
                     fn()
-                with torch.npu.graph(graph, pool=self._pool,
-                                     capture_error_mode=self.capture_error_mode):
+                with torch.npu.graph(graph, **self._graph_kwargs()):
                     outputs = fn()
                 torch.npu.synchronize()
         except CaptureVerificationError:
@@ -473,7 +491,7 @@ class GraphRunner:
 
         # Capture with the original values restored: a host value the callable derives from an input
         # is therefore baked at A.  The replay at B below is what exposes that.
-        with torch.npu.graph(graph, pool=self._pool, capture_error_mode=self.capture_error_mode):
+        with torch.npu.graph(graph, **self._graph_kwargs()):
             outputs = fn()
         torch.npu.synchronize()
 
