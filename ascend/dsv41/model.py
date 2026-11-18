@@ -1568,8 +1568,13 @@ class Dsv41:
                 g.activate(g.compute_key)
                 if self.engram is not None and li in self.engram.slot:
                     # the lookup is host work keyed by the token history; it cannot be captured, so the
-                    # rows land in a fixed buffer here, between the replays
-                    g.engram[li].copy_(self.engram.embedding(li, engram_rows[:, self.engram.slot[li]]))
+                    # rows are gathered and landed in a fixed buffer here, between the replays.  `apply`
+                    # owns the gather for the eager path; the graph path splits it out because this
+                    # host->device copy has to happen outside the capture.  `gather` returns [rows,
+                    # head_dim]; the token's embedding is those rows concatenated, the layout wkv reads.
+                    rows = engram_rows[:, self.engram.slot[li]]
+                    e = self.engram.embedding(li, self.engram.gather(li, rows))
+                    g.engram[li].copy_(e.view_as(g.engram[li]))
                 g.replay_pre(li)
                 ids = b.idx.cpu().tolist()              # the ONE host break: six ints, one sync
                 key = g.card_of[li]

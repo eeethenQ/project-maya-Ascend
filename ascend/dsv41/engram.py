@@ -188,19 +188,25 @@ class Engram:
     def warm(self, device) -> None:
         """Materialise the rotation block on ``device`` before a capture: its first use is a host copy.
 
-        ``apply`` builds ``_block_on[dev]`` lazily from the numpy block; doing that inside a capture is a
-        pageable host->device transfer, which the Ascend runtime refuses during a graph.  Nothing else here
-        is lazy.
+        ``apply_device`` builds ``_block_on[dev]`` lazily from the numpy block; doing that inside a capture
+        is a pageable host->device transfer, which the Ascend runtime refuses during a graph.  Nothing else
+        here is lazy.
         """
         dev = str(device)
         if self.block is not None and dev not in self._block_on:
             self._block_on[dev] = torch.from_numpy(self.block).to(device)
 
-    def apply(self, layer: int, h: torch.Tensor, gathered: np.ndarray, mm) -> torch.Tensor:
-        """The residual update: `h [T, hc, d]` plus the gated value the lookup produces."""
+    def apply(self, layer: int, h: torch.Tensor, rows: np.ndarray, mm) -> torch.Tensor:
+        """The residual update: `h [T, hc, d]` plus the gated value the lookup produces.
+
+        ``rows`` are the table row *indices* the hasher picked (``[T, cols]``, int64), not gathered
+        values: this method owns the gather.  A caller that has already gathered the rows for a fixed
+        device buffer (the captured decode does, because a host->device copy cannot be captured) uses
+        :meth:`gather`, :meth:`embedding` and :meth:`apply_device` directly.
+        """
         # `lookup` returns one row per hash (T x cols of them); a token's embedding is its cols rows
         # concatenated, which is the layout wkv's input expects
-        e = self.embedding(layer, gathered)
+        e = self.embedding(layer, self.gather(layer, rows))
         return self.apply_device(layer, h, e, mm)
 
     def apply_device(self, layer: int, h: torch.Tensor, e: torch.Tensor, mm) -> torch.Tensor:
@@ -229,7 +235,11 @@ class Engram:
         rstd = (torch.rsqrt(hf.square().mean(-1) + cfg.rms_norm_eps)
                 * torch.rsqrt(key.square().mean(-1) + cfg.rms_norm_eps))
         dot = (gate_in * w.unsqueeze(0) * key).sum(-1) * rstd * (d ** -0.5)
-        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+        # copysign, but with no host fallback: `torch.copysign` has no NPU kernel on this stack and the
+        # CPU fallback synchronises the stream, which is exactly what a captured `g_pre` cannot contain.
+        # `where` is the same value for every finite dot except -0.0 (which has no sign to preserve here).
+        mag = dot.abs().clamp_min(1e-6).sqrt()
+        gate = torch.sigmoid(torch.where(dot < 0, -mag, mag))
         return hf + gate.unsqueeze(-1) * value.unsqueeze(1)
 
     def stats(self) -> dict[str, int]:
