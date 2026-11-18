@@ -122,7 +122,8 @@ def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_sha
         src: ExpertSource = NullExpertSource(ckpt, cfg, dt)
     else:
         src = ExpertStreamer(ckpt, cfg, dev, dt, cache_slots=0, io_threads=io_threads,
-                             max_batch=expert_batch, layer_devices=layer_devices)
+                             max_batch=expert_batch, layer_devices=layer_devices,
+                             landing_blocks=graphs)
     weights = Weights(ckpt, cfg, dev, dt, expert_source=src, verbose=verbose).load()
     if not no_experts:
         per_expert = 3 * cfg.moe_intermediate_size * cfg.hidden_size

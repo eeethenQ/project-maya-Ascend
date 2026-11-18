@@ -400,13 +400,16 @@ class ExpertSource:
         raise NotImplementedError
 
     def fetch_int8_into(self, layer: int, experts: list[int], slab: torch.Tensor,
-                        scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> None:
+                        scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                        scale_flat: "torch.Tensor | None" = None) -> None:
         """The same fetch, written into a caller-owned slab at an address the caller already fixed.
 
         A captured decode layer bakes the address it reads, so the 40 layers cannot each own a landing
         zone: they all read the same device buffer, filled here.  ``slab`` is ``[n, 3, out*in]`` int8 in
         w1/w2/w3 order and ``scales`` a matching 3-tuple of ``[n, out, 1]`` fp32 tensors (a slice of the
-        double buffer, so its address is fixed too).  The eager path keeps `fetch_int8`.
+        double buffer, so its address is fixed too).  ``scale_flat``, when the caller has it, is the
+        ``[n, 2*out1 + out2]`` fp32 buffer those three are views of, which lets the fill be one copy.
+        The eager path keeps `fetch_int8`.
         """
         raise NotImplementedError
 
@@ -443,7 +446,7 @@ class ExpertStreamer(ExpertSource):
 
     def __init__(self, ckpt: Checkpoint, cfg: TextConfig, device, dtype=torch.bfloat16,
                  cache_slots: int = 0, io_threads: int = 6, pin: bool = True, max_batch: int = 8,
-                 layer_devices: "list[str] | None" = None):
+                 layer_devices: "list[str] | None" = None, landing_blocks: bool = False):
         self.ckpt, self.cfg, self.device, self.dtype = ckpt, cfg, device, dtype
         # the experts of a layer may live on another card than the layer itself: their tier is what needs
         # the room, and moving a token's 20 KB activation costs nothing next to a 35 MB expert
@@ -462,6 +465,8 @@ class ExpertStreamer(ExpertSource):
         self._shapes = {"w1": (cfg.moe_intermediate_size, cfg.hidden_size),
                         "w2": (cfg.hidden_size, cfg.moe_intermediate_size),
                         "w3": (cfg.moe_intermediate_size, cfg.hidden_size)}
+        # all three projections have the same number of elements, so one expert is exactly [3, per]
+        self._per = int(cfg.moe_intermediate_size) * int(cfg.hidden_size)
         self._pin_enabled = pin
         # the staging ring is sized once, for at most `max_batch` experts; the caller batches larger sets
         self._max_batch = max(1, int(max_batch))
@@ -469,7 +474,9 @@ class ExpertStreamer(ExpertSource):
         # still be in flight when layer L+1 wants the same pinned buffer.  Each slot carries an event
         # recorded after its copy, and a slot is only reused once that copy has landed.
         self._ring = 3
-        self._staging: dict[str, list[torch.Tensor]] = {}
+        # [cap, 3, per] int8 per slot: an expert's w1|w2|w3 are laid out as they are in the checkpoint and
+        # in the landing zone, so a miss can be read into, and copied on to the slab as, one contiguous run
+        self._staging: list[torch.Tensor] = []
         # one event per staging slot per card, created where the bytes land: an event belongs to the
         # device that was current when it was constructed, and this process may be running with another
         # card current (a spread tier), so they are made on demand for the destination
@@ -486,6 +493,17 @@ class ExpertStreamer(ExpertSource):
         self._scale_cache: dict[tuple[int, int], tuple] = {}
         self._scale_bytes = 0
         self.scale_cache = True          # off only for the A/B that measures what keeping them buys
+        # How the landing zone is filled.  "merged": one `copy_` per expert (its three projections are
+        # contiguous in the slab) and one `cat` for the six experts' scales - 7 copies a layer instead of
+        # 36.  "split" is the per-(expert, projection) loop and exists only for the paired A/B in
+        # `ascend/bench_landing.py`; on this card 18 copies of 11.8 MB run at 294 GB/s where six of
+        # 35.4 MB run at 513 GB/s (ascend/bench_copy.py), so the merged path is the one the engine uses.
+        self.landing_mode = "merged"
+        # Cache an expert as one contiguous [3, per] block: the landing-zone consumer then moves it in one
+        # copy.  Off by default because `fetch_int8`'s eager blocks are per projection and
+        # `test_a_cached_expert_owns_exactly_its_own_bytes` pins each cached projection to its own storage;
+        # runtime.build turns it on for the captured decode, whose only consumer is the fixed slab.
+        self.landing_blocks = bool(landing_blocks)
         if self.cache_slots:                 # constructed directly with a slot count: split it over the cards
             self.set_slots(total=self.cache_slots)
 
@@ -496,19 +514,16 @@ class ExpertStreamer(ExpertSource):
         if n > self._max_batch:
             raise ValueError(f"{n} experts in one read exceeds max_batch={self._max_batch}")
         cap = self._max_batch
-        for p, (out, inn) in self._shapes.items():
-            slots = []
-            for _ in range(self._ring):
-                t = torch.empty((cap, out, inn), dtype=torch.int8)
-                if self._pin_enabled:
-                    try:
-                        t = t.pin_memory()
-                    except Exception:                      # noqa: BLE001 - pinned memory is a nicety
-                        self._pin_enabled = False
-                slots.append(t)
-            self._staging[p] = slots
+        for _ in range(self._ring):
+            t = torch.empty((cap, 3, self._per), dtype=torch.int8)
+            if self._pin_enabled:
+                try:
+                    t = t.pin_memory()
+                except Exception:                      # noqa: BLE001 - pinned memory is a nicety
+                    self._pin_enabled = False
+            self._staging.append(t)
         self._cap = cap
-        self._staging_mib = sum(t.numel() for t in self._staging.values() for t in t) / (1 << 20)
+        self._staging_mib = sum(t.numel() for t in self._staging) / (1 << 20)
 
     def _fd(self, shard: str) -> int:
         fd = self._fds.get(shard)
@@ -518,12 +533,13 @@ class ExpertStreamer(ExpertSource):
             self._fds[shard] = fd
         return fd
 
-    def _read_one(self, layer: int, e: int, slot: int, views: dict) -> None:
+    def _read_one(self, layer: int, e: int, i: int, buf: torch.Tensor) -> None:
         import os
-        for p in ("w1", "w2", "w3"):
+        for j, p in enumerate(("w1", "w2", "w3")):
             info = self.ckpt.info(f"layers.{layer}.ffn.experts.{e}.{p}.weight")
             shard = self.ckpt.shards[info.shard]
-            os.preadv(self._fd(info.shard), [memoryview(views[p][slot]).cast("B")],
+            # buf[i, j] is exactly this projection's contiguous `per` bytes
+            os.preadv(self._fd(info.shard), [memoryview(buf[i, j].numpy()).cast("B")],
                       shard.data_start + info.begin)
 
     def set_slots(self, per_device: dict[str, int] | None = None, total: int | None = None) -> None:
@@ -556,7 +572,7 @@ class ExpertStreamer(ExpertSource):
             events = self._events[key] = [torch.npu.Event() for _ in range(self._ring)]
         return events
 
-    def _read_many(self, layer: int, experts: list[int]) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def _read_many(self, layer: int, experts: list[int]) -> list[dict]:
         n = len(experts)
         device = self.device_for(layer)
         self._ensure_staging(n)
@@ -577,15 +593,18 @@ class ExpertStreamer(ExpertSource):
                 # waits only for this slot's own copy, not for the compute queued behind it (a no-op when
                 # that copy has already landed), so the host read still overlaps the device's work
                 events[slot].synchronize()
-            views = {p: self._staging[p][slot].numpy() for p in self._shapes}
+            views = self._staging[slot]
             list(self._pool.map(lambda i_e: self._read_one(layer, i_e[1], i_e[0], views),
                                 list(enumerate(experts))))
-            out = {}
-            for p in ("w1", "w2", "w3"):
-                # copy=True even when the device *is* the host: an expert that lands in the resident cache
-                # must own its bytes, or the next layer's read overwrites it (the slots are reused)
-                q = self._staging[p][slot][:n].to(device, non_blocking=True, copy=True)
-                scales = torch.empty((n, self._shapes[p][0], 1), dtype=torch.float32, device=device)
+            # one host->device copy for the batch, into [n, 3, per]: an expert is then a contiguous
+            # [3, per] slice of it, which is exactly the landing zone's row layout.  copy=True even when
+            # the device *is* the host: an expert that lands in the resident cache must own its bytes, or
+            # the next layer's read overwrites it (the slots are reused).
+            q = views[:n].to(device, non_blocking=True, copy=True)
+            scales = {}
+            for j, p in enumerate(("w1", "w2", "w3")):
+                out = self._shapes[p][0]
+                sc = torch.empty((n, out, 1), dtype=torch.float32, device=device)
                 for i, e in enumerate(experts):
                     info = self.ckpt.info(f"layers.{layer}.ffn.experts.{e}.{p}.weight")
                     self.bytes_in += info.nbytes
@@ -599,12 +618,20 @@ class ExpertStreamer(ExpertSource):
                         if self.scale_cache:
                             self._scale_cache[(layer, e)] = cached
                             self._scale_bytes += sum(t.numel() * t.element_size() for t in cached)
-                    scales[i, :, 0] = cached[("w1", "w2", "w3").index(p)][:, 0]
-                out[p] = (q, scales, torch.zeros_like(scales))
+                    sc[i, :, 0] = cached[j][:, 0]
+                scales[p] = sc
+            zeros = {p: torch.zeros_like(sc) for p, sc in scales.items()}
+            blocks = []
+            for i, _e in enumerate(experts):
+                block = {"slab": q[i]}
+                for j, p in enumerate(("w1", "w2", "w3")):
+                    out, inn = self._shapes[p]
+                    block[p] = (q[i, j].view(1, out, inn), scales[p][i:i + 1], zeros[p][i:i + 1])
+                blocks.append(block)
             if events:
                 # the destination device's stream is the one the copies were enqueued on
                 events[slot].record(torch.npu.current_stream(index))
-            return out
+            return blocks
         finally:
             if previous is not None and previous != index:
                 torch.npu.set_device(previous)
@@ -637,16 +664,15 @@ class ExpertStreamer(ExpertSource):
                 missing.append((i, e))
         if missing:
             self.misses += len(missing)
-            read = self._read_many(layer, [e for _, e in missing])
-            for j, (i, e) in enumerate(missing):
-                block = {p: tuple(t[j:j + 1] for t in read[p]) for p in read}
+            fresh = self._read_many(layer, [e for _, e in missing])
+            for (i, e), block in zip(missing, fresh):
                 blocks[i] = block
                 dev = self.device_for(layer)
                 if self._slots.get(dev, 0):
                     # clone for the cache: a slice of the batch keeps the whole batch's storage alive, so
                     # caching a view would pin the whole batch instead of one expert
                     try:
-                        cached = {p: tuple(t.clone() for t in block[p]) for p in block}
+                        cached = self._clone_for_cache(block)
                     except torch.OutOfMemoryError:
                         # The card is shared and the budget is a prediction.  A tier that cannot grow must
                         # not end the request: stream this expert and go on, with the card's free memory
@@ -662,11 +688,28 @@ class ExpertStreamer(ExpertSource):
                         self._cache.pop(order.pop(0), None)
         return blocks
 
+    def _clone_for_cache(self, block: dict) -> dict:
+        """A cache entry owns exactly one expert's bytes, never a slice of the batch it arrived in.
+
+        With ``landing_blocks`` the expert is one contiguous ``[3, per]`` block, so the landing-zone
+        consumer can move it in a single copy; its scale and zero views are per-fetch scratch that is
+        never written again, so they are shared rather than cloned.  Otherwise each projection is cloned
+        into its own storage, which is the layout the eager path and its ownership test require.
+        """
+        if self.landing_blocks:
+            cached = {"slab": block["slab"].clone()}
+            for j, p in enumerate(("w1", "w2", "w3")):
+                out, inn = self._shapes[p]
+                cached[p] = (cached["slab"][j].view(1, out, inn), block[p][1], block[p][2])
+            return cached
+        return {p: tuple(t.clone() for t in block[p]) for p in ("w1", "w2", "w3")}
+
     def fetch_int8(self, layer: int, experts: list[int]) -> list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         return self._blocks(layer, experts)
 
     def fetch_int8_into(self, layer: int, experts: list[int], slab: torch.Tensor,
-                        scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> None:
+                        scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                        scale_flat: "torch.Tensor | None" = None) -> None:
         """Fetch into a fixed landing zone: ``slab[i, j]`` is expert ``i``'s w{j+1}, flattened int8.
 
         The copy into the slab is a device-to-device move from the batch this fetch just landed (or from
@@ -674,6 +717,11 @@ class ExpertStreamer(ExpertSource):
         must live on the card the layer's experts live on (:meth:`device_for`), because that is the card
         the captured ``g_post`` runs on: a captured graph cannot contain a cross-device copy, so the
         landing zone, not the layer, is what follows the experts.
+
+        ``scale_flat`` is the optional ``[len(experts), 2*inter + hidden]`` fp32 buffer the three
+        ``scales`` are views of (``_CardRegisters.scale_slab``).  Given it, the experts' scales land in
+        one ``cat`` instead of 18 tiny copies; without it (the direct-call path in the tests) they are
+        copied per slice.
         """
         experts = [int(e) for e in experts]
         if not experts:
@@ -681,15 +729,27 @@ class ExpertStreamer(ExpertSource):
         if len(experts) > slab.shape[0]:
             raise ValueError(f"{len(experts)} experts do not fit a landing zone of {slab.shape[0]} slots")
         blocks = self._blocks(layer, experts)
+        n = len(experts)
         for i, block in enumerate(blocks):
+            whole = block.get("slab") if self.landing_mode == "merged" else None
+            if whole is not None:
+                # one expert is contiguous in the slab as [w1 | w2 | w3]: one copy, not three
+                slab[i].copy_(whole)
+                continue
             for j, p in enumerate(("w1", "w2", "w3")):
                 slab[i, j].copy_(block[p][0][0].reshape(-1))
-                scales[j][i].copy_(block[p][1][0])
+        if scale_flat is not None and self.landing_mode == "merged":
+            sources = [block[p][1][0].reshape(-1) for block in blocks
+                       for p in ("w1", "w2", "w3")]
+            torch.cat(sources, out=scale_flat[:n].reshape(-1))
+        else:
+            for i, block in enumerate(blocks):
+                for j, p in enumerate(("w1", "w2", "w3")):
+                    scales[j][i].copy_(block[p][1][0])
 
     def staging_bytes(self) -> int:
         """What the pinned staging ring costs, for the budget that decides the expert tier."""
-        per = sum(o * i for o, i in self._shapes.values())
-        return self._ring * self._max_batch * per
+        return self._ring * self._max_batch * 3 * self._per
 
     def stats(self) -> dict[str, int]:
         return {"expert_hits": self.hits, "expert_misses": self.misses, "expert_bytes": self.bytes_in,
@@ -1886,7 +1946,8 @@ class _DecodeGraphs:
         key = self.card_of[li]
         regs = self.cards[key]
         self.activate(key)
-        self.model.weights.experts.fetch_int8_into(li, ids, regs.slab[self.parity(li)], regs.scales)
+        self.model.weights.experts.fetch_int8_into(li, ids, regs.slab[self.parity(li)], regs.scales,
+                                                   scale_flat=regs.scale_slab)
 
     def _inputs_pre(self, li: int) -> dict:
         b = self.buffers
@@ -2002,11 +2063,16 @@ class _CardRegisters:
         per = int(inter) * D
         # [2, top_k, 3, inter*hidden] int8: all the layers whose g_post runs on this card read this pair
         self.slab = torch.empty(2, K, 3, per, dtype=torch.int8, device=device)
-        # [K, out, 1]: `.view(-1)` is the quant matmul's per-channel scale, and the same shape broadcasts
-        # over a [out, in] weight in the dequantising fallback
-        self.scales = (torch.zeros(K, int(inter), 1, dtype=torch.float32, device=device),
-                       torch.zeros(K, D, 1, dtype=torch.float32, device=device),
-                       torch.zeros(K, int(inter), 1, dtype=torch.float32, device=device))
+        # [K, 2*inter + D] fp32, one expert's w1 | w2 | w3 scales side by side.  The three `scales` are
+        # views with fixed addresses (a captured g_post reads `sc1[i]`); the tiling is what lets the
+        # landing-zone fetch fill all six experts' scales with one copy instead of 18.  `.view(-1)` on a
+        # row slice is the quant matmul's per-channel scale, and the same shape broadcasts over a
+        # [out, in] weight in the dequantising fallback.
+        span = 2 * int(inter) + D
+        self.scale_slab = torch.zeros(K, span, dtype=torch.float32, device=device)
+        self.scales = (self.scale_slab[:, :int(inter)].unsqueeze(-1),
+                       self.scale_slab[:, int(inter):int(inter) + D].unsqueeze(-1),
+                       self.scale_slab[:, int(inter) + D:].unsqueeze(-1))
         self.zeros = tuple(torch.zeros_like(s) for s in self.scales)
 
     def bytes(self) -> int:
