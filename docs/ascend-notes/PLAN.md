@@ -23,7 +23,7 @@ can see what is in flight, who owns it and what "done" means. The analysis behin
 | # | item | owner | state | acceptance |
 |---|---|---|---|---|
 | 0c | the step's RoPE tables, built once per layer | lead | **done** (`6966609`) | Cos/Sin counts halved in `op_summary`; decode-equals-chunk test green |
-| 0a | device-side state addressing (the KV planes) | `kv-device` | in flight | a drop-in plane module with CPU tests proving it equals today's slicing, including early positions, wrap, `-1` padding, and no host ints |
+| 0a | device-side state addressing (the KV planes) | `kv-device` built it, lead integrated | **done** (`a61bf27`) | `KvPlanes` is a drop-in: 18 CPU tests against today's slicing (positions 0..300, wrap, rewind, `-1` padding); `State` delegates to it; the write is one `index_copy_`, the read a fixed `sliding_window` gather plus a mask; the real-model probe still says `" dog"` |
 | 0b | mHC on the device path, the two mixes batched | lead | queued | one `[2, 4d] x [4d, 24]` matmul replacing two; equal to the current result to 2e-5 |
 | P1 | capture one layer, verify the replay | `capture-harness` → lead ran the probe | **done** (evidence below) | a probe that captures this engine's own ops (`npu_quant_matmul`, `index_copy_`, `index_select`, softmax, topk, two-graph handoff) and gets **bit-identical** results |
 | P2 | 80 graphs + one fixed expert landing zone | lead | queued | interleaved A/B, 48 paired samples, median; greedy token ids identical; target 1 661 -> ~831 ms |
@@ -53,6 +53,14 @@ fails to capture, an in-place write captures, and a two-graph pipeline with a ho
 replays reproduces the eager result exactly**. `GraphRunner` (`ascend/dsv41/graph_runner.py`) wraps this with
 the input contract (shape, dtype, device, `data_ptr` checked on every replay) and a guard that proves the
 graph reads live tensors rather than a baked value.
+
+## Two bugs the work found
+
+- `run_dsv41`'s `--expert-slots` defaulted to **0**, which meant "no tier" rather than "auto-size".  Every
+  `run_dsv41` run since that rewrite was measuring a token that re-read all 240 of its experts - 2.5 s
+  against 1.6.  The `bench_step` and GSM8K numbers are unaffected (they size the tier from the HBM left).
+- `State` kept two cursors of its own and `KvPlanes` a third; `forward` had to advance all of them, and the
+  rewind test is what caught the drift.
 
 ## Measured facts the queue is built on
 
