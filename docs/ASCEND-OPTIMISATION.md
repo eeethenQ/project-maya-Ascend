@@ -108,6 +108,45 @@ Eight proposals total **8 832 of the 32 242 calls (-27%)** for ~177 ms eager. Th
 bf16 into and out of every matmul, fp32 only for the four statistics that need it (norm reduction, softmax
 denominator, router top-k, mHC scalars) plus the residual and the logits.
 
+## What R2 then measured, and what it overturns
+
+The plan said to run one diagnostic before touching the expert stream. It was run, and it reverses two of
+the four analyses' conclusions:
+
+**The reads are cold, not cached.** `/proc/self/io` across five decode steps: `rchar` 1.47 GB/step against
+`read_bytes` **1.65 GB/step** - the bytes are genuinely coming from the block device, and the readahead even
+over-fetches a little past what the syscalls asked for. So the "the tier was sized against a warm-cache
+number" worry is moot: there is no warm cache to size against.
+
+**The array saturates at ~2.5 GB/s and more threads do not help.** 120 cold experts (1.42 GB) on one clean
+pass each:
+
+| threads | throughput |
+|---:|---:|
+| 1 | 1.4 GB/s |
+| 6 | 2.3 GB/s |
+| 12 | 2.5 GB/s |
+| 24 | 2.5 GB/s |
+
+**So R1 is dead.** Splitting each expert's three projections onto three tasks buys nothing: the engine
+already runs six reader threads and the array is at its ceiling. The engine's own effective rate
+(2.6 GB/step over a 606-800 ms fetch = 3.2-4.3 GB/s) is *better* than the cold ceiling, which is consistent
+with ~40% of its reads being served from whatever cache does survive.
+
+**And overlap is structurally limited.** The opportunity looked like "hide the read behind compute", but
+`h = hc_post(moe_out, ...)` makes layer L+1 depend on layer L's routed experts, so there is no later compute
+to hide behind; the only independent work in the window is the shared expert, 1-2 ms a layer.
+
+**A per-layer tier quota was implemented and is neutral**: 64-67% hit rate with or without it, 1.07x on the
+median (inside this machine's noise). It was reverted rather than kept.
+
+What survives, then, is a much shorter list, and the physics is simple: a token misses ~1/3 of its 240
+expert slots, each miss is 33.8 MB, and the array moves 2.5 GB/s. At 67% hits that is 2.8 GB and ~0.7-1.1 s
+of unavoidable read per token. **Only three things change that number**: a bigger tier (HBM, and the cap is
+32 GiB a card), fewer bytes per expert (4-bit - a different checkpoint, not a code change), or making the
+rest of the step overlap it. Graph capture attacks the third and the compute at once, which is why it is
+first below.
+
 ## The order to do it in, and why
 
 The analyses disagree about priority in an instructive way, and the disagreement resolves on one number:
@@ -115,10 +154,9 @@ The analyses disagree about priority in an instructive way, and the disagreement
 graph is in place - which demotes most of directions 3 and 4 from "worth 177 ms" to "worth ~17 ms" *if done
 second*, and promotes graph capture to first even though it is the largest single change.
 
-1. **R2: the two-hour diagnostic** (timers inside `_read_many` plus `/proc/self/io`) - it decides whether the
-   606 ms is concurrency or bytes, and R1 and R3 depend on the answer.
-2. **R1 + R3 + R4** (expert stream): 400-600 ms, small diffs, no graph needed, and R3 is a prerequisite for
-   capture anyway.
+1. ~~R2, then R1 + R3~~ - done: R2 says the array is the wall and R1 is worth nothing (above). Of the stream
+   work only **R4** (preload the 15 360 experts' scales and offsets, 0.61 GB) survives, worth 5-15 ms and,
+   more usefully, 120 synchronous copies a step that a graph would otherwise capture around.
 3. **The three capture prerequisites**, then **80 graphs**: 1 661 -> ~831 ms, the single biggest win.
 4. **Device-time cuts**, which a graph cannot remove: `npu_fusion_attention` with the sink (~35-45 ms of
    device time), `npu_dynamic_quant` for the per-token activation, `npu_clipped_swiglu`.

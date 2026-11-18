@@ -336,7 +336,9 @@ class ExpertStreamer(ExpertSource):
         self.cache_slots = max(0, int(cache_slots))
         self._cache: dict[tuple[int, int], dict] = {}
         # one LRU per card: the slots are HBM on a card, so a single global LRU can put more expert bytes
-        # on one card than its share allows, which is exactly what the 32 GB cap forbids
+        # on one card than its share allows, which is exactly what the 32 GB cap forbids.  A quota per
+        # *layer* was implemented and measured too - 64-67% hit rate either way, 1.07x on the median,
+        # inside this machine's noise - and removed again rather than kept as complexity.
         self._order: dict[str, list[tuple[int, int]]] = {}
         self._slots: dict[str, int] = {}
         self.hits = self.misses = 0
@@ -410,11 +412,11 @@ class ExpertStreamer(ExpertSource):
             share = max(0, int(total or self.cache_slots)) // max(1, len(devices))
             self._slots = {d: share for d in devices}
         self.cache_slots = sum(self._slots.values())
-        for key in list(self._cache):
-            dev = self.device_for(key[0])
-            if len(self._order.setdefault(dev, [])) > self._slots.get(dev, 0):
-                while len(self._order[dev]) > self._slots.get(dev, 0):
-                    self._cache.pop(self._order[dev].pop(0), None)
+        for dev in list(self._order):
+            while len(self._order[dev]) > self._slots.get(dev, 0):
+                self._cache.pop(self._order[dev].pop(0), None)
+            if not self._order[dev]:
+                self._order.pop(dev, None)
 
     def device_for(self, layer: int) -> str:
         if not self.layer_devices:
