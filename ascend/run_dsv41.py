@@ -50,8 +50,11 @@ def main() -> int:
     ap.add_argument("--ids", help="comma-separated token ids")
     ap.add_argument("--gen", type=int, default=8, help="greedy tokens to generate")
     ap.add_argument("--max-context", type=int, default=4096)
-    ap.add_argument("--expert-slots", type=int, default=0,
-                    help="routed experts kept resident on the card (33.8 MiB each)")
+    ap.add_argument("--expert-slots", type=int, default=None,
+                    help="routed experts kept resident (33.8 MiB each); the default sizes the tier from the "
+                         "HBM left after the resident weights.  0 disables the tier, which makes every token "
+                         "re-read all of its experts - the default used to be 0 by mistake, so this path "
+                         "measured 2.5 s a token against 1.6 with a tier")
     ap.add_argument("--hbm-share", type=float, default=0.5, help="this process's fraction of one card")
     ap.add_argument("--device", default="npu:0")
     ap.add_argument("--expert-devices", default="", help="cards to spread the expert tier over")

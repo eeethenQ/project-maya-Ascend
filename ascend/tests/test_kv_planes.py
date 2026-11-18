@@ -526,9 +526,12 @@ class TheEngineEquivalence(unittest.TestCase):
     def test_rewinding_matches_state_rewind(self):
         state, planes = self.state_and_planes()
         for _ in range(5):
+            # `State` now owns a `KvPlanes` and keeps its cursors in step with its own, so the loop drives
+            # all three: the state, the planes inside it, and the independent copy it is compared against
             state.pos += 1
             state.next_pos += 1
             state.tokens += 1
+            state.kv.advance(1)
             planes.advance(1)
         state.rewind(2)
         planes.rewind(2)

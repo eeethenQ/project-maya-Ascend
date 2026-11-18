@@ -556,27 +556,16 @@ class State:
         D = cfg.head_dim
         nh = cfg.index_n_heads
         hd = cfg.index_head_dim
-        # window ring per layer: only the last `sliding_window` positions are ever read, but a flat
-        # per-position plane keeps the indexing obvious and costs 40 x max_context x 512 x 2 B
-        self.swa = {r.layer_idx: torch.zeros(batch, self.max_context, D, device=device, dtype=dtype)
-                    for r in plan.layers}
-        # compressed caches: one per KV source, entry g covers tokens [g*r, g*r+r)
-        self.long_kv = {}
-        self.index_k = {}
-        self.comp_kv_raw = {}
-        self.comp_score_raw = {}
-        self.comp_closed = {}
-        for lid in plan.kv_source_layer_ids:
-            r = plan.layer(lid).compress_ratio
-            entries = self.max_context // r + 1
-            self.long_kv[lid] = torch.zeros(batch, entries, D, device=device, dtype=dtype)
-            if plan.layer(lid).is_index_source:
-                self.index_k[lid] = torch.zeros(batch, entries, hd, device=device, dtype=dtype)
-            if r > 1:                       # the gate needs a group to pool; ratio 1 has no open group
-                self.comp_kv_raw[lid] = torch.zeros(batch, self.max_context, D, device=device, dtype=torch.float32)
-                self.comp_score_raw[lid] = torch.zeros(batch, self.max_context, D, device=device,
-                                                       dtype=torch.float32)
-            self.comp_closed[lid] = 0
+        # the position-addressed planes live in KvPlanes (see below), which addresses them the way a
+        # captured graph needs
+        from .kv_planes import KvPlanes
+        self.kv = KvPlanes(cfg, plan, device, dtype, self.max_context, batch=batch)
+        self.swa = self.kv.swa
+        self.long_kv = self.kv.long_kv
+        self.index_k = self.kv.index_k
+        self.comp_kv_raw = self.kv.comp_kv_raw
+        self.comp_score_raw = self.kv.comp_score_raw
+        self.comp_closed = self.kv.comp_closed
         self.pos = torch.zeros(batch, dtype=torch.long, device=device)
         # the same position as a host integer: the forward pass branches on it several times per layer,
         # and a `.item()` there would flush the device pipeline each time
@@ -598,6 +587,7 @@ class State:
         self.next_pos -= n
         self.pos -= n
         self.tokens -= n
+        self.kv.rewind(n)
         del self.token_ids[len(self.token_ids) - n:]
 
     def entries(self, layer: int, position: int | None = None) -> int:
@@ -841,26 +831,25 @@ class Dsv41:
             g0 = group_pos[0] // r
             state.long_kv[li][:, g0:g0 + lat.shape[0]] = lat.to(state.dtype)
 
-        # the window rows for this chunk, written before any of them is read
-        for t in range(T):
-            state.swa[li][:, host_positions[t]] = kv[t].to(state.dtype)
+        # the window rows for this chunk, written before any of them is read: one index_copy_ with
+        # device-side indices instead of a host slice per token
+        state.kv.write_window(li, positions, kv.to(state.dtype))
 
         out = torch.empty(T, H, D, device=x.device, dtype=torch.float32)
-        win = cfg.sliding_window
         topk = state.topk if (r and state.topk is not None) else None
         for t in range(T):
-            p = host_positions[t]
-            w0 = max(0, p - win + 1)
-            wkeys = state.swa[li][:, w0:p + 1].float()                     # [1, nw, D]
+            # always `win` rows plus a mask, never a varying slice: the shape is what a graph replays
+            wkeys, wvalid = state.kv.read_window(li, positions[t:t + 1])
+            wkeys = wkeys.float()                                          # [win, D]
             if r:
                 j = topk[t]
                 kj = j.clamp_min(0)
                 ckeys = state.long_kv[role.kv_source_layer][:, kj].float()
                 cvalid = j >= 0
-                keys = torch.cat([wkeys[0], ckeys[0]], 0)
-                valid = torch.cat([torch.ones(wkeys.shape[1], dtype=torch.bool, device=x.device), cvalid])
+                keys = torch.cat([wkeys, ckeys[0]], 0)
+                valid = torch.cat([wvalid, cvalid])
             else:
-                keys, valid = wkeys[0], torch.ones(wkeys.shape[1], dtype=torch.bool, device=x.device)
+                keys, valid = wkeys, wvalid
             out[t] = self.sparse_attn(q[t:t + 1], keys[None], valid[None], lw.attn["attn_sink"],
                                       float(D) ** -0.5)[0]
 
@@ -1050,6 +1039,7 @@ class Dsv41:
         state.token_ids.extend(int(t) for t in ids_t.tolist())
         state.pos += T
         state.next_pos += T
+        state.kv.advance(T)
         state.tokens += T
         if not compute_logits:
             return None
