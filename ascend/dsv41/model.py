@@ -382,6 +382,7 @@ class ExpertStreamer(ExpertSource):
         # identically zero in this checkpoint, which the loader verified, so they are not kept at all).
         self._scale_cache: dict[tuple[int, int], tuple] = {}
         self._scale_bytes = 0
+        self.scale_cache = True          # off only for the A/B that measures what keeping them buys
         if self.cache_slots:                 # constructed directly with a slot count: split it over the cards
             self.set_slots(total=self.cache_slots)
 
@@ -465,15 +466,16 @@ class ExpertStreamer(ExpertSource):
             for i, e in enumerate(experts):
                 info = self.ckpt.info(f"layers.{layer}.ffn.experts.{e}.{p}.weight")
                 self.bytes_in += info.nbytes
-                cached = self._scale_cache.get((layer, e))
+                cached = self._scale_cache.get((layer, e)) if self.scale_cache else None
                 if cached is None:
                     # w1/w2/w3 have different output widths, so a tuple rather than one stacked tensor
                     cached = tuple(
                         torch.from_numpy(np.array(self.ckpt.numpy(
                             f"layers.{layer}.ffn.experts.{e}.{q2}.weight_scale"))).to(device)
                         for q2 in ("w1", "w2", "w3"))
-                    self._scale_cache[(layer, e)] = cached
-                    self._scale_bytes += sum(t.numel() * t.element_size() for t in cached)
+                    if self.scale_cache:
+                        self._scale_cache[(layer, e)] = cached
+                        self._scale_bytes += sum(t.numel() * t.element_size() for t in cached)
                 scales[i, :, 0] = cached[("w1", "w2", "w3").index(p)][:, 0]
             out[p] = (q, scales, torch.zeros_like(scales))
         if self._events:

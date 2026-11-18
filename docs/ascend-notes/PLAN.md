@@ -27,7 +27,7 @@ can see what is in flight, who owns it and what "done" means. The analysis behin
 | 0b | mHC on the device path, the two mixes batched | lead | **batching ruled out** | the two mixes take *different* inputs (`h` before and after the attention block), so one `[2, 4d] x [4d, 24]` matmul cannot serve both; what 0b actually needs is only `host_mixes=False`, which is already the general path |
 | P1 | capture one layer, verify the replay | `capture-harness` → lead ran the probe | **done** (evidence below) | a probe that captures this engine's own ops (`npu_quant_matmul`, `index_copy_`, `index_select`, softmax, topk, two-graph handoff) and gets **bit-identical** results |
 | P2 | 80 graphs + one fixed expert landing zone | lead | **partly unblocked** | layer 1 captures, replays bit-exactly and follows a live position (5.53x for that layer).  Still blocked on: the compressor/indexer of layers with `compress_ratio > 0` (host-derived group indices), and the MoE, which stays outside the graph |
-| R4 | an expert's scales read once and kept on the card | lead | **done** (`056d9ac`), effect unmeasured | the synchronous scale copies per step go away; 39 KB per expert, 0.6 GB across the model; 128 tests green.  The 5-15 ms the analysis predicted is queued for an interleaved A/B, not claimed |
+| R4 | an expert's scales read once and kept on the card | lead | **done** (`056d9ac`), measured **0.97x** | interleaved A/B: 1 158 ms cached against 1 125 ms fresh at the median, i.e. **no wall-clock gain**, at 56 MiB of measured tier in the run.  It stays for one reason only - it removes the *synchronous* device copies that a captured graph cannot contain - and on that basis it is an enabler, not a speed-up.  If capture of the 30 compress layers does not land, this is the first thing to take back out |
 | D1 | device-time cuts a graph cannot remove | unassigned | queued | `npu_fusion_attention` with the sink (~35-45 ms of device time), `npu_dynamic_quant`, `npu_clipped_swiglu` |
 
 ## The capture probe: every op this engine needs captures, bit-identically
@@ -104,6 +104,7 @@ raises names the operator to work around.
 ## Measured facts the queue is built on
 
 - 32 242 operator calls a step, 164 ms of device time, ~1 661 ms of wall clock: **call-bound**.
+- R4's scale cache is worth **0.97x**, i.e. nothing, on wall clock: the analysis's "5-15 ms" did not appear.
 - the expert reads are **cold** (`read_bytes` 1.65 GB/step against `rchar` 1.47) and the array saturates at
   **~2.5 GB/s** - threads do not help, which is why R1 is dead and the stream is not on this queue.
 - `torch.npu.graph` captures and replays on this stack; 47.4 us a call eager becomes 1.88 us a call
