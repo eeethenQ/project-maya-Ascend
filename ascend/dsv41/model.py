@@ -376,6 +376,12 @@ class ExpertStreamer(ExpertSource):
         self._fds: dict[str, int] = {}
         self._pool = ThreadPoolExecutor(max_workers=max(1, io_threads))
         self._staging_mib = 0
+        # The scales and offsets of an expert never change, and reading them cost a mmap read plus a
+        # *synchronous* device copy per expert per fetch - the copies a captured graph cannot contain.
+        # They are kept on the card the expert lives on: 39 KB of scale per expert (the offsets are
+        # identically zero in this checkpoint, which the loader verified, so they are not kept at all).
+        self._scale_cache: dict[tuple[int, int], tuple] = {}
+        self._scale_bytes = 0
         if self.cache_slots:                 # constructed directly with a slot count: split it over the cards
             self.set_slots(total=self.cache_slots)
 
@@ -455,18 +461,21 @@ class ExpertStreamer(ExpertSource):
             # copy=True even when the device *is* the host: an expert that lands in the resident cache must
             # own its bytes, or the next layer's read overwrites it (the slots are reused)
             q = self._staging[p][slot][:n].to(device, non_blocking=True, copy=True)
-            ss, os_ = [], []
-            for e in experts:
-                base = f"layers.{layer}.ffn.experts.{e}.{p}.weight"
-                info = self.ckpt.info(base)
+            scales = torch.empty((n, self._shapes[p][0], 1), dtype=torch.float32, device=device)
+            for i, e in enumerate(experts):
+                info = self.ckpt.info(f"layers.{layer}.ffn.experts.{e}.{p}.weight")
                 self.bytes_in += info.nbytes
-                ss.append(self.ckpt.numpy(base + "_scale"))
-                os_.append(self.ckpt.numpy(base + "_offset") if (base + "_offset") in self.ckpt
-                           else np.zeros_like(ss[-1]))
-            # the scales and offsets are a few tens of KB: copied synchronously, because an async copy
-            # would outlive the temporary numpy array it is reading from
-            out[p] = (q, torch.from_numpy(np.stack(ss)).to(device),
-                      torch.from_numpy(np.stack(os_)).to(device))
+                cached = self._scale_cache.get((layer, e))
+                if cached is None:
+                    # w1/w2/w3 have different output widths, so a tuple rather than one stacked tensor
+                    cached = tuple(
+                        torch.from_numpy(np.array(self.ckpt.numpy(
+                            f"layers.{layer}.ffn.experts.{e}.{q2}.weight_scale"))).to(device)
+                        for q2 in ("w1", "w2", "w3"))
+                    self._scale_cache[(layer, e)] = cached
+                    self._scale_bytes += sum(t.numel() * t.element_size() for t in cached)
+                scales[i, :, 0] = cached[("w1", "w2", "w3").index(p)][:, 0]
+            out[p] = (q, scales, torch.zeros_like(scales))
         if self._events:
             self._events[slot].record()
         return out
@@ -526,6 +535,7 @@ class ExpertStreamer(ExpertSource):
 
     def stats(self) -> dict[str, int]:
         return {"expert_hits": self.hits, "expert_misses": self.misses, "expert_bytes": self.bytes_in,
+                "scale_mib": int(self._scale_bytes / (1 << 20)),
                 "expert_slots": len(self._cache), "staging_mib": int(self._staging_mib),
                 "oom_skips": self.oom_skips}
 
