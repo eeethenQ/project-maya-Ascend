@@ -147,6 +147,30 @@ of unavoidable read per token. **Only three things change that number**: a bigge
 rest of the step overlap it. Graph capture attacks the third and the compute at once, which is why it is
 first below.
 
+## What it came to: 3 250 -> 324.5 ms a token
+
+Everything above was a plan. This is what it produced, on the real 40-layer model, four 910B3 cards, each
+process inside a 32 GiB share, measured with interleaved A/B in one process (never two runs - this machine
+drifts by up to 50%):
+
+| step | ms/token | how |
+|---|---:|---|
+| where this started | 3 250 | the first working port |
+| an expert tier that was not empty | 1 926 | a units bug had sized it to zero |
+| the two dense fast paths | ~1 360 | host-side Sinkhorn and routing without `unique`/gather, 1.42x paired |
+| 80 captured graphs, single card | 595 | paired 0.660 [0.612, 0.738] |
+| 80 captured graphs, four cards | **324.5** | paired 0.481 [0.261, 0.652] = **2.08x** against four-card eager |
+
+The last step is the interesting one, and it is the same lesson as the first: **the tier, not the code.** The
+graphs refused a spread expert tier because a cross-card copy cannot be captured - until the landing zone
+moved off the compute card, so each expert card holds its own and `g_post[li]` is captured where its experts
+live. The tier went from 254 slots at 64.6% hit and 3.004 GB/step read, to 2 480 slots at **90.9%** and
+**0.774 GB/step**. The capture did not make the reads cheaper; it made the reads unnecessary.
+
+What is left is different in kind: the step now spends **~90% of its non-captured time in the expert fetch**
+(the array's ~2.5 GB/s) and its floor is the **164 ms of device time**. Both of those are the next section's
+problem, not this one's.
+
 ## The order to do it in, and why
 
 The analyses disagree about priority in an instructive way, and the disagreement resolves on one number:
