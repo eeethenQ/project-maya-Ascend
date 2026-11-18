@@ -87,11 +87,19 @@ def main() -> int:
     ap.add_argument("--max-context", type=int, default=2048)
     ap.add_argument("--engram-tokenizer", default="",
                     help="enables Engram; the same value as --tokenizer is right")
+    ap.add_argument("--graphs", action="store_true",
+                    help="capture the one-token decode path as per-layer NPU graphs (the serve engine's "
+                         "fast path).  Every question gets a fresh State, and the graphs belong to the "
+                         "State, so this re-captures the 80 graphs per question; that capture time is "
+                         "included in the decode seconds reported.")
+    ap.add_argument("--graph-verify", action="store_true",
+                    help="run the did-it-capture guard on every graph (slow: 4 eager runs per graph)")
     ap.add_argument("--thinking", action="store_true", help="thinking mode (far slower)")
     ap.add_argument("--effort", default=None)
     ap.add_argument("--out", help="write the per-question report here as JSON")
     ap.add_argument("--show", action="store_true", help="print each answer in full")
     a = ap.parse_args()
+    t_start = time.perf_counter()
 
     from tokenizers import Tokenizer
     tokenizer = Tokenizer.from_file(a.tokenizer)
@@ -100,10 +108,12 @@ def main() -> int:
 
     run = rt.build(model=a.model, device=a.device, dtype=a.dtype,
                    expert_devices=[d for d in a.expert_devices.split(",") if d] or None,
-                   expert_slots=a.expert_slots, engram_tokenizer=a.engram_tokenizer or None)
+                   expert_slots=a.expert_slots, engram_tokenizer=a.engram_tokenizer or None,
+                   graphs=a.graphs, graph_verify=a.graph_verify)
     print(f"engine: {run.device}, engram {'on' if run.engram else 'off'}, expert tier {run.expert_slots} slots"
           + (f" over {run.experts.layer_devices[0]}..{run.experts.layer_devices[-1]}"
-             if getattr(run.experts, 'layer_devices', None) else ""))
+             if getattr(run.experts, 'layer_devices', None) else "")
+          + (f", decode graphs {'on' if run.model.graphs else 'off'}" if a.graphs else ""))
 
     rows, right, total_decode, total_tokens = [], 0, 0.0, 0
     for i, q in enumerate(questions, 1):
@@ -128,12 +138,19 @@ def main() -> int:
 
     acc = right / max(1, len(questions))
     tps = total_tokens / total_decode if total_decode > 0 else 0.0
+    elapsed_s = time.perf_counter() - t_start
+    captured = getattr(getattr(run.model, "_decode_graphs", None), "captured", None)
     print(f"\naccuracy: {right}/{len(questions)} = {acc:.0%}")
     print(f"speed   : {total_tokens} tokens in {total_decode:.0f}s decode = {tps:.2f} tok/s; "
           f"{sum(r['prefill_s'] for r in rows) / len(rows):.1f}s mean prefill")
+    print(f"wall    : {elapsed_s:.0f}s from build to last answer"
+          + (f"; {captured} graphs live, graphs {'still on' if run.model.graphs else 'turned OFF'}"
+             if a.graphs else ""))
     if a.out:
-        Path(a.out).write_text(json.dumps({"model": a.model, "n": len(questions), "seed": a.seed,
-                                          "accuracy": acc, "tok_s": tps, "rows": rows}, indent=1))
+        Path(a.out).write_text(json.dumps(
+            {"model": a.model, "n": len(questions), "seed": a.seed, "accuracy": acc, "tok_s": tps,
+             "graphs": a.graphs, "graph_captures": captured, "graphs_still_on": bool(run.model.graphs),
+             "engram": bool(run.engram), "elapsed_s": round(elapsed_s, 1), "rows": rows}, indent=1))
         print(f"report: {a.out}")
     run.close()
     return 0

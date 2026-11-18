@@ -1,0 +1,328 @@
+{
+ "purpose": "Does the captured-graph decode change GSM8K accuracy?  Same ten questions (seed 0, reproduced the committed sample exactly, prompt token counts included), graphs on vs off.",
+ "baseline": {
+  "file": "gsm8k-10q-engram.json",
+  "model": "/mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8",
+  "n": 10,
+  "seed": 0,
+  "accuracy": 0.9,
+  "tok_s": 0.47092861480707837,
+  "engram": true,
+  "decode_tokens": 1298,
+  "decode_s": 2756.3,
+  "note": "pre-graph, Engram ON. Its ten questions are reproduced exactly by this run's sample."
+ },
+ "config": {
+  "sample": "seed 0 of /data/gsm8k-test.jsonl, 10 questions; question texts and prompt token counts match the committed baseline exactly (70,67,66,94,79,67,109,77,98,96).",
+  "model": "/mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8",
+  "device": "npu:0",
+  "expert_devices": "npu:0,npu:1,npu:2,npu:3",
+  "dtype": "bfloat16",
+  "tokenizer": "/mnt/weights/DeepSeek-V4-Flash-0731-w8a8/tokenizer.json",
+  "data": "/data/gsm8k-test.jsonl",
+  "max_tokens": 384,
+  "max_context": 2048,
+  "engram": false,
+  "graphs": {
+   "on": "--graphs",
+   "off": "the flag absent"
+  },
+  "engram_note": "The committed baseline was Engram on; Engram cannot run on this tree (see engram_blocker), so both new runs are Engram off - also the served fast-path config."
+ },
+ "graphs_on": {
+  "file": "gsm8k-10q-graphs-on.json",
+  "accuracy": 0.9,
+  "tok_s": 1.7685477731605155,
+  "decode_tokens": 1467,
+  "decode_s": 829.5,
+  "prefill_s": 421.0,
+  "elapsed_s": 1289.1,
+  "graph_captures_last_state": 118,
+  "graphs_still_on": true,
+  "wall": "1289 s (21.5 min) from build to last answer"
+ },
+ "graphs_off": {
+  "file": "gsm8k-10q-graphs-off.json",
+  "accuracy": 1.0,
+  "tok_s": 0.8335830262637409,
+  "decode_tokens": 1450,
+  "decode_s": 1739.5,
+  "prefill_s": 421.5,
+  "elapsed_s": 2205.1,
+  "wall": "2205 s (36.8 min) from build to last answer"
+ },
+ "speed_summary": {
+  "graphs_on_tok_s": 1.769,
+  "graphs_off_tok_s": 0.834,
+  "baseline_tok_s": 0.471,
+  "on_vs_off": 2.12,
+  "on_vs_baseline": 3.76,
+  "off_vs_baseline": 1.77,
+  "note": "The on number includes the per-question graph re-capture (fresh State per question); a separate one-State warm probe measured 1.67 tok/s (599 ms/token mean, 2.9 s first step including 80-graph capture), so the harness's 1.77 is not capture-diluted beyond the per-step spread."
+ },
+ "answers_that_differ": [
+  {
+   "i": 4,
+   "question": "Comet Halley orbits the sun every 75 years. Bill's dad saw the Comet when he was 30 years old. Bill saw the comet a second time when he was three times the age his father was when he saw the Comet. How old was Bill when he saw the Comet for the first time?",
+   "gold": 15.0,
+   "graphs_on": 60.0,
+   "graphs_off": 15.0,
+   "on_tokens": 384,
+   "off_tokens": 364,
+   "on_text_tail": ", check:  \nIf Dad saw it at 30, and Bill was born 15 years later, Dad was 45 at Bill\u2019s birth.  \nBill\u2019s first sighting at 15 means Dad was 45 + 15 = 60 at that time.  \nThe comet\u2019s next appearance after",
+   "off_text_tail": "ighting = 75.\n\nLet Bill\u2019s age at first sighting = \\( x \\).  \nThen \\( 90 - x = 75 \\).  \nSo \\( x = 15 \\).\n\n---\n\n**Step 5 \u2013 Conclusion**  \nBill was 15 years old when he first saw the comet.\n\n---\n\n#### 15"
+  }
+ ],
+ "texts_that_differ_same_answer": [
+  {
+   "i": 6,
+   "gold": 22.0,
+   "on": 22.0,
+   "off": 22.0,
+   "on_tokens": 61,
+   "off_tokens": 63,
+   "first_diff_generated_token": 1,
+   "first_diff_position": 68
+  },
+  {
+   "i": 9,
+   "gold": 25.0,
+   "on": 25.0,
+   "off": 25.0,
+   "on_tokens": 112,
+   "off_tokens": 111,
+   "first_diff_generated_token": 38,
+   "first_diff_position": 136
+  },
+  {
+   "i": 10,
+   "gold": 482.0,
+   "on": 482.0,
+   "off": 482.0,
+   "on_tokens": 120,
+   "off_tokens": 122,
+   "first_diff_generated_token": 5,
+   "first_diff_position": 101
+  }
+ ],
+ "per_question": [
+  {
+   "i": 1,
+   "gold": 16.0,
+   "on": 16.0,
+   "off": 16.0,
+   "on_ok": true,
+   "off_ok": true,
+   "same_answer": true,
+   "on_tokens": 115,
+   "off_tokens": 115,
+   "same_text": true,
+   "first_diff_generated_token": null,
+   "first_diff_position": null
+  },
+  {
+   "i": 2,
+   "gold": 240.0,
+   "on": 240.0,
+   "off": 240.0,
+   "on_ok": true,
+   "off_ok": true,
+   "same_answer": true,
+   "on_tokens": 112,
+   "off_tokens": 112,
+   "same_text": true,
+   "first_diff_generated_token": null,
+   "first_diff_position": null
+  },
+  {
+   "i": 3,
+   "gold": 80.0,
+   "on": 80.0,
+   "off": 80.0,
+   "on_ok": true,
+   "off_ok": true,
+   "same_answer": true,
+   "on_tokens": 122,
+   "off_tokens": 122,
+   "same_text": true,
+   "first_diff_generated_token": null,
+   "first_diff_position": null
+  },
+  {
+   "i": 4,
+   "gold": 15.0,
+   "on": 60.0,
+   "off": 15.0,
+   "on_ok": false,
+   "off_ok": true,
+   "same_answer": false,
+   "on_tokens": 384,
+   "off_tokens": 364,
+   "same_text": false,
+   "first_diff_generated_token": 22,
+   "first_diff_position": 116
+  },
+  {
+   "i": 5,
+   "gold": 91.0,
+   "on": 91.0,
+   "off": 91.0,
+   "on_ok": true,
+   "off_ok": true,
+   "same_answer": true,
+   "on_tokens": 163,
+   "off_tokens": 163,
+   "same_text": true,
+   "first_diff_generated_token": null,
+   "first_diff_position": null
+  },
+  {
+   "i": 6,
+   "gold": 22.0,
+   "on": 22.0,
+   "off": 22.0,
+   "on_ok": true,
+   "off_ok": true,
+   "same_answer": true,
+   "on_tokens": 61,
+   "off_tokens": 63,
+   "same_text": false,
+   "first_diff_generated_token": 1,
+   "first_diff_position": 68
+  },
+  {
+   "i": 7,
+   "gold": 8.0,
+   "on": 8.0,
+   "off": 8.0,
+   "on_ok": true,
+   "off_ok": true,
+   "same_answer": true,
+   "on_tokens": 132,
+   "off_tokens": 132,
+   "same_text": true,
+   "first_diff_generated_token": null,
+   "first_diff_position": null
+  },
+  {
+   "i": 8,
+   "gold": 11.0,
+   "on": 11.0,
+   "off": 11.0,
+   "on_ok": true,
+   "off_ok": true,
+   "same_answer": true,
+   "on_tokens": 146,
+   "off_tokens": 146,
+   "same_text": true,
+   "first_diff_generated_token": null,
+   "first_diff_position": null
+  },
+  {
+   "i": 9,
+   "gold": 25.0,
+   "on": 25.0,
+   "off": 25.0,
+   "on_ok": true,
+   "off_ok": true,
+   "same_answer": true,
+   "on_tokens": 112,
+   "off_tokens": 111,
+   "same_text": false,
+   "first_diff_generated_token": 38,
+   "first_diff_position": 136
+  },
+  {
+   "i": 10,
+   "gold": 482.0,
+   "on": 482.0,
+   "off": 482.0,
+   "on_ok": true,
+   "off_ok": true,
+   "same_answer": true,
+   "on_tokens": 120,
+   "off_tokens": 122,
+   "same_text": false,
+   "first_diff_generated_token": 5,
+   "first_diff_position": 101
+  }
+ ],
+ "control_same_arithmetic": {
+  "why": "--graphs sets host_mixes=False (Dsv41.__init__), replacing the host numpy Sinkhorn mHC with the device Sinkhorn. So the naive off run differs from the on run in TWO ways: the one-token execution path and the mHC arithmetic. This control keeps graphs off but sets host_mixes=False, i.e. the same arithmetic as the graph run with no captured graph.",
+  "script": "/tmp/control_host_mixes.py (run in the container; not part of the tree)",
+  "rows": [
+   {
+    "i": 4,
+    "graphs": false,
+    "host_mixes": false,
+    "gold": 15.0,
+    "got": 60.0,
+    "ok": false,
+    "tokens": 384,
+    "decode_s": 631.39,
+    "tok_s": 0.608,
+    "text_equal_to_graphs_on": true
+   },
+   {
+    "i": 6,
+    "graphs": false,
+    "host_mixes": false,
+    "gold": 22.0,
+    "got": 22.0,
+    "ok": true,
+    "tokens": 61,
+    "decode_s": 100.73,
+    "tok_s": 0.606,
+    "text_equal_to_graphs_on": true
+   },
+   {
+    "i": 9,
+    "graphs": false,
+    "host_mixes": false,
+    "gold": 25.0,
+    "got": 25.0,
+    "ok": true,
+    "tokens": 112,
+    "decode_s": 269.78,
+    "tok_s": 0.415,
+    "text_equal_to_graphs_on": true
+   },
+   {
+    "i": 10,
+    "graphs": false,
+    "host_mixes": false,
+    "gold": 482.0,
+    "got": 482.0,
+    "ok": true,
+    "tokens": 120,
+    "decode_s": 282.21,
+    "tok_s": 0.425,
+    "text_equal_to_graphs_on": true
+   }
+  ],
+  "result": "On all four questions that differ between on and off (Q4, Q6, Q9, Q10) the control reproduces the graphs-on text TOKEN-FOR-TOKEN (text_equal_to_graphs_on = true; 677 generated tokens in total), including Q4's 384-token ramble that ends at 60. The captured 80-graph replay is therefore faithful to the eager path at the same mHC arithmetic; the accuracy and wording differences are the mHC switch."
+ },
+ "diagnosis": "On this sample the captured graphs do NOT change accuracy relative to eager with the same arithmetic: the graphs-off control with host_mixes=False reproduces the graphs-on output exactly on all four questions that differ (Q4, Q6, Q9, Q10). The measured 9/10 vs 10/10 gap is caused by --graphs also forcing host_mixes=False: the host-numpy Sinkhorn (default eager) answers Q4 correctly (15) while the device-Sinkhorn path rambles to 384 tokens and ends at 60; Q6/Q9/Q10 differ in wording from the first few generated tokens with the same answers. The first divergences are Q6 at generated token 1 (position 68), Q10 at token 5 (101) and Q4 at token 22 (116) - all before the first 64->128 indexer-bucket transition - and Q9 at token 38 (136), just after it. Because the no-graph control with the same bucketing reproduces all four exactly, the mHC arithmetic switch is the cause and bucketed top-k padding is not needed to explain it. Recommendation: an accuracy A/B of the graphs themselves must compare --graphs against eager with host_mixes=False (the tests already do this), and the device-vs-host mHC numerical difference is a separate question - it is the thing that moves accuracy here.",
+ "warm_decode_probe": {
+  "script": "/tmp/bench_graphs_steady.py (one State, 40 one-token steps at context 70..110)",
+  "graphs_live": 80,
+  "first_step_s": 2.921,
+  "steady_mean_ms": 598.5,
+  "steady_tok_s": 1.671,
+  "per_step_ms_range": [
+   430.7,
+   766.9
+  ],
+  "note": "per-step spread is wide (431-767 ms over 40 steps); this probe is context for the harness rate, not a replacement for it."
+ },
+ "engram_blocker": {
+  "eager_crash": "With --engram-tokenizer the current tree crashes in prefill: engram.apply receives table row indices where it expects gathered rows (`shape '[70, 6144]' is invalid for input of size 1680`), model.py:1402 -> engram.py apply/apply_device. Introduced when 5570990 changed Engram.apply from lookup(rows) to embedding(gathered); the two call sites were not updated (model.py:1402 eager, model.py:1576 graph).",
+  "graph_capture_failure": "With a local two-line gather-first fix, eager Engram works but --graphs cannot capture an Engram layer: `g_pre.1.0` capture fails with 'ACL stream synchronize failed ... copy_between_host_and_device_opapi' and the run disables graphs for the rest of the step (eager fallback). Engram-on + graphs is therefore not measurable on this tree.",
+  "consequence": "The committed 9/10 Engram-on baseline could not be re-run; the new numbers are Engram off. That is also what serve-config.example.json serves (no --engram-tokenizer)."
+ },
+ "harness_changes": [
+  "ascend/eval_gsm8k.py: added --graphs and --graph-verify, passed to rt.build; prints/reports graph_captures, graphs_still_on, engram and elapsed_s. No engine/model change.",
+  "The harness creates a fresh State per question, and graphs belong to the State, so 80+ graphs are re-captured per question (bucket rungs 128/256/512 added as context grows); those captures sit inside decode_s and are why the harness rate is below a warm decode loop.",
+  "No commit was made; the tree is left for the lead."
+ ]
+}
