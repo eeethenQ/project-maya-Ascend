@@ -77,9 +77,13 @@ class Rope:
         rd = cfg.qk_rope_head_dim
         rs = cfg.rope
         self.dim = rd
-        self.freqs_window = self._freqs(rd, 0, cfg.rope.theta, 1.0, rs.beta_fast, rs.beta_slow)
+        # The tables live on the device from the start.  They were built on the CPU, so every `angles()`
+        # call did a host->device copy of them - 136 of them per decode step - and a copy is exactly what a
+        # captured graph cannot contain: capturing one layer failed with "ACL stream synchronize failed"
+        # until this was moved here.
+        self.freqs_window = self._freqs(rd, 0, cfg.rope.theta, 1.0, rs.beta_fast, rs.beta_slow).to(device)
         self.freqs_comp = self._freqs(rd, rs.original_max_position, cfg.rope.compress_theta,
-                                      rs.scale_factor, rs.beta_fast, rs.beta_slow)
+                                      rs.scale_factor, rs.beta_fast, rs.beta_slow).to(device)
 
     @staticmethod
     def _freqs(dim: int, original_seq_len: int, base: float, factor: float,

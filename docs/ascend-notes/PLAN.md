@@ -54,7 +54,30 @@ replays reproduces the eager result exactly**. `GraphRunner` (`ascend/dsv41/grap
 the input contract (shape, dtype, device, `data_ptr` checked on every replay) and a guard that proves the
 graph reads live tensors rather than a baked value.
 
-## Where the capture stands, after 0a
+## Capture of a real layer now works - and the blocker was one host copy
+
+The bisect (`.ascend-work/bisect_capture.py`) named it on the first run: **`Rope`**. Its frequency tables
+were built on the **CPU**, so every `Rope.angles` call did a host->device copy of them - 136 a decode step -
+and a copy is precisely what a captured graph cannot contain. `read_window`, `sparse_attn` and
+`out_projection` captured fine all along; the tables are the only thing that touched the host. They are now
+created on the device, which also removes those 136 copies from the eager path.
+
+With that one change, `.ascend-work/probe_layer.py` on layer 1 (window-only):
+
+| | |
+|---|---|
+| capture | 56 ms, mode `graph` |
+| replay at the capture position vs eager | **bit-identical** (max diff 0.0) |
+| replay after moving the position tensor in place vs a *fresh eager* run at the new position | **rel 0.0** |
+| and the two eager runs do differ (0.543), so the position is not vacuous | |
+| one layer, eager vs graph | **3 351 us -> 606 us (5.53x)** |
+
+So the two properties that could have sunk the direction both hold: the graph replays bit-exactly, and it
+reads the live position rather than a value baked at capture. Phase 1 is unblocked; what remains for the
+per-layer split is the compressor/indexer (layers with `compress_ratio > 0` still derive group indices from
+host ints) and the MoE, which must stay outside the graph because it reads the host.
+
+## Where the capture stood before this
 
 The individual operators all capture and replay bit-identically (`probe_capture.py`, table above), and 0a
 removed the host integers and varying shapes from the layer's KV path. But **capturing the composed layer
