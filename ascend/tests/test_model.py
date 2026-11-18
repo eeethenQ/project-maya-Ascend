@@ -18,7 +18,7 @@ try:                                                    # torch is only installe
     import torch
     from ascend.dsv41.kv_planes import KvPlanes
     from ascend.dsv41.model import (Dsv41, ExpertStreamer, IndexerBucketPolicy, Rope, State, Weights,
-                                    rms)
+                                    _swiglu_torch, per_token_int8, rms)
     HAVE_TORCH = True
 except Exception:                                       # noqa: BLE001 - the CI job has no torch: skip
     torch = None
@@ -309,6 +309,46 @@ class ThePieces(unittest.TestCase):
         w = torch.randn(64)
         y = rms(x, w, 1e-20)
         self.assertTrue(torch.allclose(y, base * w, atol=1e-5))
+
+    def test_the_fused_operators_are_off_on_the_cpu_reference(self):
+        """`npu_dynamic_quant` is the card's; the CPU path stays the torch one.
+
+        Every test in this file and `test_npu_parity.py`'s reference run is on the CPU, so a fused op
+        that leaked into the reference would make the reference agree with itself and prove nothing.
+        """
+        self.assertFalse(self.net.fused_quant)
+        self.assertFalse(self.net.fused_swiglu, "the clipped SwiGLU was measured a loss and stays off")
+        q, scale = per_token_int8(torch.randn(2, 8))         # no device, so the torch path, always
+        self.assertEqual(q.dtype, torch.int8)
+
+    def test_the_swiglu_reference_is_the_clamped_formula(self):
+        """The form `npu_clipped_swiglu(alpha=1, bias=0, interleaved=False)` was verified against."""
+        limit = 10.0
+        g = torch.tensor([[20.0, -20.0, 1.0, -1.0]])
+        u = torch.tensor([[20.0, 20.0, 2.0, 2.0]])
+        want = torch.nn.functional.silu(g.clamp(max=limit)) * u.clamp(-limit, limit)
+        self.assertTrue(torch.equal(_swiglu_torch(g, u, limit), want))
+        # the gate is clamped only above (so +20 behaves as +10) and the linear term on both sides
+        unclamped = torch.nn.functional.silu(torch.tensor([[20.0]])) * torch.tensor([[20.0]])
+        self.assertLess(float(want[0, 0]), float(unclamped))
+        self.assertEqual(float(want[0, 1]), float(torch.nn.functional.silu(torch.tensor(-20.0)) * 10.0))
+
+    def test_per_token_int8_rounds_half_to_even_and_survives_a_zero_row(self):
+        """The two behaviours the fused operator had to match before it was adopted.
+
+        ``amax`` of 127 makes ``scale`` exactly 1.0, so 0.5/1.5/2.5 are exact ties: torch rounds half
+        to even (0, 2, 2).  An all-zero row has no scale; the clamp_min keeps it 1e-5 instead of 0/0.
+        """
+        x = torch.zeros(2, 127)
+        x[0, :4] = torch.tensor([0.5, 1.5, 2.5, 127.0])
+        q, scale = per_token_int8(x)
+        self.assertEqual(scale[0, 0].item(), 1.0)
+        self.assertEqual(q[0, :4].tolist(), [0, 2, 2, 127])
+        self.assertEqual(q[1].abs().max().item(), 0)
+        self.assertAlmostEqual(scale[1, 0].item(), 1e-5 / 127, places=12)
+        # and dequantizing is the original row to within one quantisation step
+        deq = q.float() * scale
+        self.assertLess((deq - x).abs().max().item(), 0.5 + 1e-6)
 
     def test_the_mhc_mixes_have_the_expected_ranges(self):
         """pre in (eps, 1+eps); post in (0, 2); comb column-balanced after the Sinkhorn."""

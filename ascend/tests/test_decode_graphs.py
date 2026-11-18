@@ -17,6 +17,7 @@ import unittest
 
 from ascend.dsv41.checkpoint import Checkpoint
 from ascend.dsv41.config import build_layer_plan
+from ascend.dsv41.graph_runner import GraphTeardownError
 
 try:                                                    # torch is only installed where the engine runs
     import torch
@@ -272,6 +273,35 @@ class TheGraphSwitch(unittest.TestCase):
         self.assertTrue(on.graphs)
         self.assertFalse(on.host_mixes, "the host Sinkhorn cannot be captured, so graphs force the device one")
         self.assertIsNone(on._decode_graphs, "no graph is captured until a decode step needs one")
+
+    def test_a_failed_teardown_is_reported_and_the_domain_still_drops(self):
+        """A leaked graph model must be named, and must not stop the next State from capturing.
+
+        `release_graphs` drops its reference *before* the teardown, so the failure cannot turn into a
+        half-closed domain whose next `close` reports the same leak twice.
+        """
+
+        class Fails:
+            def reset(self):
+                raise RuntimeError("rtModelDestroy execution failed: model not in current ctx")
+
+        net = build(self.ckpt, self.model, graphs=True)
+        net.forward([3, 5], new_state(self.model))
+        net.forward([7], new_state(self.model))
+        g = net._decode_graphs
+        runner = g.runners[g.compute_key]
+        victim = next(iter(runner.names))
+        runner._graphs[victim].graph = Fails()
+        with self.assertRaises(GraphTeardownError) as caught:
+            net.release_graphs()
+        self.assertIn(victim, str(caught.exception))
+        self.assertIn(g.compute_key, str(caught.exception))
+        self.assertIsNone(net._decode_graphs, "the domain must be dropped even when its teardown failed")
+        self.assertTrue(g.closed)
+        # and a new State captures a fresh domain
+        net.forward([9], new_state(self.model))
+        self.assertIsNotNone(net._decode_graphs)
+        self.assertEqual(len(net._decode_graphs.post), net.cfg.num_hidden_layers)
 
     def test_a_state_can_be_released_and_re_captured(self):
         net = build(self.ckpt, self.model, graphs=True)

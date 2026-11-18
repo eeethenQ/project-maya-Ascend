@@ -35,6 +35,8 @@ def build_and_run(a, steps: int, timed: bool) -> None:
                    expert_devices=[d for d in a.expert_devices.split(",") if d] or None,
                    engram_tokenizer=a.engram_tokenizer or None, graphs=a.graphs)
     model = run.model
+    if a.fused_quant:
+        model.fused_quant, model.fused_swiglu = True, False
     if timed:
         print(f"engine: {run.device}, engram {'on' if run.engram else 'off'}, "
               f"{run.expert_slots} expert slots", flush=True)
@@ -100,6 +102,8 @@ def run_msprof(a) -> int:
         inner += ["--engram-tokenizer", a.engram_tokenizer]
     if a.graphs:
         inner += ["--graphs"]
+    if a.fused_quant:
+        inner += ["--fused-quant"]
     command = ["msprof", f"--output={out}", "--task-time=on", "--ai-core=on", "--runtime-api=on",
                "--application=" + " ".join(inner)]
     print("running:", " ".join(command[:5]), "... (the profiler makes it several times slower)")
@@ -145,6 +149,10 @@ def main() -> int:
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--graphs", action="store_true",
                     help="run the decode steps as captured per-layer graphs (see ascend/run_dsv41.py)")
+    ap.add_argument("--fused-quant", action="store_true",
+                    help="use npu_dynamic_quant for the expert activation quantisation instead of the torch "
+                         "per_token_int8 (off by default: -2 240 operators/step and -3 ms of device time, "
+                         "but a numeric variant - see Dsv41.__init__ - and no effect on the decode step)")
     ap.add_argument("--msprof", action="store_true", help="profile with msprof and report per-operator time")
     ap.add_argument("--under-msprof", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()

@@ -91,6 +91,27 @@ class Parity(unittest.TestCase):
         rel = (got - whole).abs().max() / whole.abs().max().clamp_min(1e-6)
         self.assertLess(rel.item(), 5e-2, f"NPU decode vs chunk: max rel err {rel.item():.2e}")
 
+    def test_the_fused_quantiser_is_an_opt_in_numeric_variant(self):
+        """`npu_dynamic_quant` is available on the card, is off by default, and is a *variant*.
+
+        It takes bf16/fp16 only, so the activation is rounded before it is quantised; on this model that
+        moves the logits by up to 3.1e-2 and the greedy ids can diverge (measured), which is why the
+        engine does not use it by default and why this test asserts the tolerance the model itself is
+        held to on this device (5e-2, the same as NPU-vs-CPU) rather than identity.
+        """
+        npu = self.build(self.dev, torch.bfloat16)
+        self.assertTrue(npu._fused_available,
+                        "the card supports npu_dynamic_quant; the test would prove nothing without it")
+        self.assertFalse(npu.fused_quant, "the fused quantiser must stay off unless asked for")
+        prompt = [3, 5, 7, 11]
+        got = {}
+        for label, fused in (("fused", True), ("torch", False)):
+            npu.fused_quant = fused
+            got[label] = self.greedy(npu, self.state(self.dev, torch.bfloat16), prompt, 6)
+        for step, (a, b) in enumerate(zip(got["fused"][1], got["torch"][1])):
+            rel = (a - b).abs().max() / b.abs().max().clamp_min(1e-6)
+            self.assertLess(rel.item(), 5e-2, f"fused step {step}: max rel err {rel.item():.2e}")
+
     def test_the_expert_tier_is_sized_from_what_is_left(self):
         """With HBM free, the tier must not come out zero.
 

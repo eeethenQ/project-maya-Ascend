@@ -60,6 +60,27 @@ class GraphInputContractError(GraphRunnerError):
     """A declared input no longer has the shape/dtype/device/address it had at capture time."""
 
 
+class GraphTeardownError(GraphRunnerError):
+    """At least one captured graph could not be destroyed, so its model (and pool) is still alive.
+
+    Only the failures that *raise* can be reported this way: a wrong-context ``rtModelDestroy`` on this
+    stack prints an NPU warning and returns normally, with no exception and no memory given back.  That
+    is why ``close`` re-selects the capturing card before resetting instead of trying to notice the
+    failure afterwards - the guard is preventive by necessity, and this error covers everything else.
+    """
+
+    def __init__(self, device: str, failures: "list[tuple[str, str]]"):
+        self.device = device
+        self.failures = tuple(failures)
+        names = ", ".join(name for name, _ in failures)
+        first = failures[0][1] if failures else ""
+        super().__init__(
+            f"{len(failures)} of the graphs on {device} could not be destroyed ({names}): {first}. "
+            "Their models stay alive until this process exits - the HBM they hold is not returned. "
+            "A graph can only be destroyed from the context of the card that captured it; capture and "
+            "close on the same card, or re-select that card before close.")
+
+
 class CaptureVerificationError(GraphRunnerError):
     """The did-it-capture guard ran and did not prove the graph it was asked to prove."""
 
@@ -169,6 +190,7 @@ class GraphRunner:
         self._is_npu = device == "npu" or device.startswith("npu:")
         if not self._is_npu and device != "cpu":
             raise ValueError(f"unsupported device {device!r}; use 'cpu' or 'npu[:index]'")
+        self._index = self._npu_index(device) if self._is_npu else 0
         self._closed = False
         self._graphs: OrderedDict[str, _Entry] = OrderedDict()
         self._torch_npu: Any = None
@@ -309,28 +331,60 @@ class GraphRunner:
             torch.npu.synchronize()
 
     def close(self) -> None:
-        """Reset every graph and drop the shared pool handle.  Idempotent.
+        """Reset every graph and drop the shared pool handle.  Idempotent; raises on a failed teardown.
 
         The opaque pool token has no explicit ``free`` in this API; resetting the graphs and dropping
         the last references is what releases it.  ``close`` drains the device first so a graph is not
         reset out from under an in-flight replay.  A second ``close`` does nothing.
+
+        **The capturing card is re-selected for the teardown.**  A captured model belongs to the ACL
+        *context* of the card that captured it, and ``rtModelDestroy`` refuses a model from another
+        context - measured on this stack as ``rtModelDestroy ... model not in current ctx``, printed as
+        a warning, with no exception and no memory returned.  A process that captures on npu:1-3 and
+        closes while npu:0 is current therefore leaked one model per graph until it exited; this
+        method selects ``self.device`` first, and restores the caller's card afterwards, which
+        makes the destroy succeed (measured: the 30 `g_post` graphs on npu:1-3 that used to fail,
+        30 warnings per teardown, now tear down with none - and 10 recaptures of 80 graphs in one
+        process leave no warning at all).  Because the runtime only *warns*, a failure cannot be
+        noticed after the fact; if a reset does raise, every graph is still attempted and then
+        :class:`GraphTeardownError` names them, because a silent leak is the one failure mode this
+        wrapper must not have.
         """
         if self._closed:
             return
         self._closed = True
+        failures: list[tuple[str, str]] = []
+        previous: int | None = None
         if self._is_npu:
+            try:
+                previous = int(torch.npu.current_device())
+            except Exception:                              # noqa: BLE001 - restoring is best-effort
+                previous = None
+            try:
+                torch.npu.set_device(self._index)
+            except Exception as e:                         # noqa: BLE001 - reported below
+                failures.append(("<device>", f"could not select {self.device} for teardown: {e}"))
             try:
                 torch.npu.synchronize()
             except Exception:                              # noqa: BLE001 - teardown must not mask the reason
                 pass
-        for entry in self._graphs.values():
+        for name, entry in self._graphs.items():
             if entry.graph is not None:
-                _safe_reset(entry.graph)
+                problem = _reset_graph(entry.graph)
+                if problem is not None:
+                    failures.append((name, problem))
                 entry.graph = None
             entry.outputs = None
         self._graphs.clear()
         self._pool = None
         self._torch_npu = None
+        if self._is_npu and previous is not None and previous != self._index:
+            try:
+                torch.npu.set_device(previous)
+            except Exception:                              # noqa: BLE001 - the card is gone; nothing to do
+                pass
+        if failures:
+            raise GraphTeardownError(self.device, failures)
 
     def __enter__(self) -> "GraphRunner":
         return self
@@ -648,10 +702,22 @@ def _check_differs(name: str, a: "OrderedDict[str, torch.Tensor]",
     return Check(name, True, f"outputs changed ({detail})")
 
 
-def _safe_reset(graph: Any) -> None:
+def _reset_graph(graph: Any) -> str | None:
+    """Destroy one graph; return ``None`` on success or the failure's one-line reason.
+
+    The stack itself does not raise when ``rtModelDestroy`` fails (it prints an NPU warning and returns,
+    which is how a wrong-context close used to leak silently), so the exception path here is for the
+    wrapper-level failures and the returned string carries the runtime's own message when there is one.
+    """
     if graph is None:
-        return
+        return None
     try:
         graph.reset()
-    except Exception:                                  # noqa: BLE001 - the original error is more useful
-        pass
+        return None
+    except Exception as e:                             # noqa: BLE001 - the caller reports it by name
+        return f"{type(e).__name__}: {e}"
+
+
+def _safe_reset(graph: Any) -> None:
+    """Best-effort reset on a path that is already raising (a half-captured graph is not the story)."""
+    _reset_graph(graph)

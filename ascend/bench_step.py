@@ -39,10 +39,10 @@ def _release(device: str) -> None:
 
 
 def build(model: str, device: str, share: float, slots: int | None, batch: int, no_experts: bool,
-          reserve: float = 6.0, expert_devices: list[str] | None = None):
+          reserve: float = 6.0, expert_devices: list[str] | None = None, graphs: bool = False):
     return rt.build(model=model, device=device, dtype="bfloat16", hbm_share=share,
                     expert_slots=slots, expert_batch=batch, expert_reserve_gib=reserve,
-                    expert_devices=expert_devices, no_experts=no_experts)
+                    expert_devices=expert_devices, no_experts=no_experts, graphs=graphs)
 
 
 def time_decode(run: rt.Runtime, max_context: int, prompt: int, steps: int) -> tuple[float, list[float]]:
@@ -87,11 +87,24 @@ def main() -> int:
     ap.add_argument("--ab-batch", action="store_true",
                     help="sweep the experts per fetch batch: a batch smaller than the top-k lets the "
                          "device compute one batch while the host reads the next")
+    ap.add_argument("--ab-ops", action="store_true",
+                    help="A/B the fused vendor operators (npu_dynamic_quant, npu_clipped_swiglu) against "
+                         "the torch path, inside the captured decode, interleaved in one process.  Two "
+                         "States, one graph domain each, ABBA order: a device-time change is invisible "
+                         "against 32 000 launch overheads, so this runs behind the graphs")
+    ap.add_argument("--ab-samples", type=int, default=16, help="timed steps per arm")
+    ap.add_argument("--ab-epoch-steps", type=int, default=4,
+                    help="steps per arm between the arms alternating (the first of each is discarded: "
+                         "it (re)captures that arm's graphs)")
+    ap.add_argument("--ab-warm", type=int, default=2)
     a = ap.parse_args()
 
     devices = [d for d in a.expert_devices.split(",") if d] or None
     cfg = TextConfig.from_json(Path(a.model) / "config.json")
     print(f"model: {cfg.num_hidden_layers} layers, top-{cfg.num_experts_per_tok} of {cfg.n_routed_experts} experts")
+
+    if a.ab_ops:
+        return _ab_ops(a, devices)
 
     full = build(a.model, a.device, a.hbm_share, a.expert_slots, a.expert_batch, False,
                  a.expert_reserve_gib, devices)
@@ -251,6 +264,123 @@ def main() -> int:
     full.close()
     del full
     _release(a.device)
+    return 0
+
+
+def _ab_ops(a, devices) -> int:
+    """The fused operators against the torch path, in one process, inside the captured decode.
+
+    The flags change *which operators the graphs contain*, and a model holds one graph domain at a time
+    (a second State closes the first, on purpose - a captured body bakes the KV addresses of the State
+    it was drawn against).  So the arms run whole epochs of steps at the same positions, one after the
+    other, and every switch recaptures that arm's domain (the first step of an epoch is discarded, as
+    the graph-on arm of the graph A/B discards its capture).  Adjacent epochs over the same positions
+    are the paired samples.  A process that recaptures per State also exercises the graph teardown on
+    every switch, which is the leak's own reproduction.
+
+    Both arms share one model, one expert tier and one token stream - a fixed sequence fed to each State
+    at the same position, so a pair is the same token at the same KV length - and the only difference
+    between the arms is which operators the graphs contain.
+    """
+    import random
+    import statistics
+
+    run = build(a.model, a.device, a.hbm_share, a.expert_slots, a.expert_batch, False,
+                a.expert_reserve_gib, devices, graphs=True)
+    model = run.model
+    print(f"graphs: {model.graphs}, fused quant {model.fused_quant}")
+    if not model.graphs:
+        print("--ab-ops needs the captured decode; --graphs could not be used here")
+        run.close()
+        return 1
+    arms = {"fused": (True, False), "torch": (False, False)}   # (fused_quant, fused_swiglu)
+    states = {label: run.state(a.max_context) for label in arms}
+    ids = [(i * 7 + 3) % 40000 for i in range(a.prompt_tokens)]
+    logits = {}
+    for label, (fq, fs) in arms.items():
+        model.fused_quant, model.fused_swiglu = fq, fs
+        logits[label] = model.forward(ids, states[label], compute_logits=True)
+    print(f"prefill with both arms: bit-identical logits "
+          f"{torch.equal(logits['fused'], logits['torch'])}")
+    # A fixed token stream, fed to both arms at the *same position*: each arm's epoch starts where the
+    # previous epoch ended, so the two States stay in lockstep and a pair is the same token at the same
+    # KV length.  A self-generated stream would diverge the moment one arm's logits differed anywhere.
+    stream = [(i * 13 + 5) % 40000 for i in range(4096)]
+    seen: dict[int, tuple[str, torch.Tensor]] = {}
+    ms: dict[str, list[float]] = {label: [] for label in arms}
+    rounds = 0
+    tally = {"worst": 0.0, "agree": 0, "n": 0}
+    captures: list[int] = []
+    position = 0
+
+    def step(label: str, token: int):
+        model.fused_quant, model.fused_swiglu = arms[label]
+        if str(run.device).startswith("npu"):
+            torch.npu.synchronize()
+        t0 = time.perf_counter()
+        out = model.forward([token], states[label], logits_last_only=True)
+        if str(run.device).startswith("npu"):
+            torch.npu.synchronize()
+        return (time.perf_counter() - t0) * 1e3, out
+
+    def epoch_of(label: str, start: int, steps: int, timed: bool) -> list[float]:
+        """``steps`` decode steps for one arm, from position ``start``; the capture step is discarded.
+
+        The State is rewound after that first step rather than advanced, so both arms replay exactly the
+        same positions: a pair is the same token at the same KV length, and the position-dependent
+        shapes (the indexer's bucket) are identical on both sides.
+        """
+        model.fused_quant, model.fused_swiglu = arms[label]
+        step(label, stream[start])                       # (re)captures this arm's graph domain
+        states[label].rewind(1)
+        captures.append(model._decode_graphs.captured if model._decode_graphs else 0)
+        got: list[float] = []
+        for k in range(steps):
+            where = start + k
+            dt, logits = step(label, stream[where])
+            ref = seen.get(where)
+            if ref is not None and ref[0] != label:
+                tally["worst"] = max(tally["worst"], float((logits - ref[1]).abs().max()))
+                tally["agree"] += int(int(logits[0].argmax()) == int(ref[1][0].argmax()))
+                tally["n"] += 1
+            else:
+                seen[where] = (label, logits.clone())
+            if timed:
+                got.append(dt)
+        return got
+
+    def round_of(timed: bool) -> None:
+        """Both arms over the same ``ab_epoch_steps`` positions, in alternating order."""
+        nonlocal position, rounds
+        order = ("fused", "torch") if rounds % 2 == 0 else ("torch", "fused")
+        rounds += 1
+        got: dict[str, list[float]] = {}
+        for label in order:
+            got[label] = epoch_of(label, position, a.ab_epoch_steps, timed)
+            if timed:
+                ms[label].extend(got[label])
+        if timed and len(got) == 2:
+            # paired within the round: the same positions, adjacent in time, one operator set apart
+            ratios.extend(a / b for a, b in zip(got["fused"], got["torch"]) if b > 0)
+        position += a.ab_epoch_steps
+
+    for _ in range(a.ab_warm):                           # untimed: warms the tier and the graphs
+        round_of(timed=False)
+    while len(ms["fused"]) < a.ab_samples or len(ms["torch"]) < a.ab_samples:
+        round_of(timed=True)
+    print(f"{len(captures)} graph (re)captures of {captures[-1] if captures else 0} graphs each, "
+          f"{position} positions, {len(ms['fused'])} steps per arm")
+    for label in ("torch", "fused"):
+        xs = sorted(ms[label])
+        print(f"  {label:5s}: median {statistics.median(xs):7.1f}  mean {statistics.fmean(xs):7.1f}  "
+              f"min {xs[0]:7.1f} ms/token (n={len(xs)})")
+    boot = sorted(statistics.median(random.choices(ratios, k=len(ratios))) for _ in range(2000))
+    med = statistics.median(ratios)
+    print(f"  {len(ratios)} paired samples, top-1 agreement {tally['agree']}/{tally['n']}, "
+          f"worst per-step |logit delta| {tally['worst']:.3e}")
+    print(f"  median paired ratio (fused/torch) = {med:.3f}  [{boot[50]:.3f}, {boot[-51]:.3f}] 95% CI "
+          f"-> {1 / med:.3f}x")
+    run.close()
     return 0
 
 

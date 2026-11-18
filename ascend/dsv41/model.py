@@ -39,7 +39,7 @@ except Exception:                                       # noqa: BLE001 - the hos
 
 from .checkpoint import Checkpoint
 from .config import FULL, REUSE, SWA_ONLY, LayerRole, TextConfig, Topology, build_layer_plan
-from .graph_runner import GraphRunner, GraphRunnerError
+from .graph_runner import GraphRunner, GraphRunnerError, GraphTeardownError
 from .kv_planes import INDEX as INDEX_PLANE
 
 
@@ -57,12 +57,44 @@ def dequant_int8(weight: np.ndarray, scale: np.ndarray, offset: np.ndarray | Non
     return q * scale.astype(np.float32)
 
 
-def per_token_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dynamic per-token symmetric int8 activation quantization: ``q = round(x / (max|x|/127))``."""
+# `npu_dynamic_quant` is the card's own per-token symmetric quantiser (one operator for the ten torch
+# ones below).  It is behind a flag, off by default (see `Dsv41.__init__` for the measurement), and the
+# flag keeps the CPU reference path - the one every test compares against - on plain torch.
+_FUSED_QUANT = torch_npu is not None and hasattr(torch_npu, "npu_dynamic_quant")
+
+
+def per_token_int8(x: torch.Tensor, *, fused: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dynamic per-token symmetric int8 activation quantization: ``q = round(x / (max|x|/127))``.
+
+    On the card ``npu_dynamic_quant`` is that formula as one operator (its docstring says
+    ``scale = rowMax(abs(x)) / DTYPE_MAX; y = round(x / scale)``), replacing
+    ``float, abs, amax, clamp_min, div, div, round, clamp, to`` - ten dispatches, run 280 times a step.
+    Two things were measured against this function before offering it (``.ascend-work/probe_ops3.py``):
+    the int8 values are identical on a real activation, exact ties included (both round half to even),
+    and an all-zero row comes back ``q=0, scale=0`` instead of this function's clamped
+    ``scale=1e-5/127`` - which dequantizes to zero either way, the case the clamp existed for.
+
+    The op accepts bf16/fp16 only, so the activation is rounded first; fp16 is used because it is the
+    finer of the two and both call sites are bounded far inside its range (see below).  ``fused=False``
+    is the torch reference and stays the prompt (``T > 1``) path.
+    """
+    if fused and _FUSED_QUANT and x.device.type != "cpu":
+        # fp16, not bf16: the op accepts both, and fp16's 11 mantissa bits make the pre-rounding change
+        # the int8 result on ~1 value in 2000 instead of ~1 in 200.  Both call sites are bounded well
+        # inside fp16's range - the expert input is an RMS-normalised row (|x| <= sqrt(hidden)) and the
+        # gate output is |silu(clamp(g,10)) * clamp(u,+-10)| <= 100 - so 65504 is not a live concern.
+        q, scale = torch_npu.npu_dynamic_quant(x.to(torch.float16), dst_type=torch.int8)
+        return q, scale.reshape(-1, 1).float()
     amax = x.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-5)
     scale = amax / 127.0
     q = (x.float() / scale).round().clamp(-127, 127).to(torch.int8)
     return q, scale
+
+
+def _swiglu_torch(g: torch.Tensor, u: torch.Tensor, limit: float) -> torch.Tensor:
+    """``silu(clamp(g, max=limit)) * clamp(u, -limit, limit)``: `Dsv41.swiglu`, and the formula
+    `npu_clipped_swiglu` was verified against before it was set aside (see `Dsv41.__init__`)."""
+    return F.silu(g.clamp(max=limit)) * u.clamp(-limit, limit)
 
 
 # --------------------------------------------------------------------------- rope
@@ -787,6 +819,25 @@ class Dsv41:
         self.expert_batch = int(getattr(weights.experts, "_max_batch", 8))
         # the int8 fast path needs an Ascend runtime and a symmetric (zero-point-free) checkpoint
         self.int8_experts = (str(device).startswith("npu") and getattr(weights, "offsets_are_zero", False))
+        # Both fused operators are **off by default**, on the card only, and switchable at run time
+        # (`bench_step --ab-ops` A/Bs them in one process).  They were measured, and both lost:
+        #
+        # * `npu_dynamic_quant` replaces `per_token_int8`'s ten dispatches: -2 240 operators/step
+        #   (-7.5 %) and -3.0 ms of device time, but the op takes bf16/fp16 only, so the activation is
+        #   rounded before it is quantised, and on the parity model that moves the logits by 3.1e-2
+        #   (a 1-LSB int8 change in a few channels; the fused and torch runs then pick different greedy
+        #   ids).  The engine promises 2e-3, and the win does not reach the 324.5 ms step (the quantiser
+        #   is in `g_post`, which already overlaps the next layer's expert fetch), so it stays opt-in.
+        # * `npu_clipped_swiglu` runs on this 910B3 (A2 *training* is not in its documented model list)
+        #   and is bit-identical to the four torch ops, but it needs the two projections concatenated:
+        #   the `cat` costs +4.1 ms/step (ConcatD 254 -> 590) and the fused op 2.8 ms, against -4.2 ms
+        #   for the clamp/clamp/silu/mul it replaces.  Net +1.9 ms of device time for -560 operators, so
+        #   the flag is off and the code was removed rather than left dead.  It becomes a win the day w1
+        #   and w3 land in one slab and the projections write [g|u] directly.
+        npu = str(device).startswith("npu") and torch_npu is not None
+        self.fused_quant = False
+        self.fused_swiglu = False
+        self._fused_available = npu and _FUSED_QUANT
 
     @contextmanager
     def phase(self, name: str):
@@ -1148,9 +1199,8 @@ class Dsv41:
 
     # -- the experts ----------------------------------------------------------------------------
     def swiglu(self, x: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor) -> torch.Tensor:
-        g = self.mm(x, w1).clamp(max=self.lim)
-        u = self.mm(x, w3).clamp(-self.lim, self.lim)
-        return F.silu(g) * u
+        """The expert gate; `_swiglu_torch` is also what the fused operator was measured against."""
+        return _swiglu_torch(self.mm(x, w1), self.mm(x, w3), self.lim)
 
     def expert_mm_q(self, xq: torch.Tensor, xs: torch.Tensor, q: torch.Tensor, scale: torch.Tensor,
                     offset: torch.Tensor) -> torch.Tensor:
@@ -1174,7 +1224,8 @@ class Dsv41:
         was quantized for, and its dequant scale multiplies the result.
         """
         if self.int8_experts and torch_npu is not None:
-            xq, xs = per_token_int8(x)
+            # fused=False: this is the prompt-chunk (T > 1) path, whose arithmetic stays the torch one
+            xq, xs = per_token_int8(x, fused=False)
             got = torch_npu.npu_quant_matmul(xq, q[0].T, scale.view(-1), output_dtype=torch.bfloat16)
             return got.float() * xs
         return self.mm(x, self.dequant(q, scale, offset)[0])
@@ -1261,7 +1312,8 @@ class Dsv41:
         ids = [int(e) for e in idx[0].tolist()]          # one small sync per layer, as `unique` also was
         weights = wts[0]
         y = torch.zeros(1, self.cfg.hidden_size, device=x.device, dtype=torch.float32)
-        xq, xs = per_token_int8(x) if (self.int8_experts and torch_npu is not None) else (None, None)
+        xq, xs = (per_token_int8(x, fused=self.fused_quant)
+                  if (self.int8_experts and torch_npu is not None) else (None, None))
         for start in range(0, len(ids), self.expert_batch):
             batch = ids[start:start + self.expert_batch]
             with self.phase("moe_fetch"):
@@ -1271,7 +1323,8 @@ class Dsv41:
                     g = self.expert_mm_q(xq, xs, *blocks[i]["w1"]).clamp(max=self.lim)
                     u = self.expert_mm_q(xq, xs, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
                     h = F.silu(g) * u
-                    y = y + self.expert_mm_q(*per_token_int8(h), *blocks[i]["w2"]) * weights[start + i]
+                    y = y + self.expert_mm_q(*per_token_int8(h, fused=self.fused_quant),
+                                             *blocks[i]["w2"]) * weights[start + i]
                 else:
                     g = self.expert_mm(x, *blocks[i]["w1"]).clamp(max=self.lim)
                     u = self.expert_mm(x, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
@@ -1385,10 +1438,14 @@ class Dsv41:
         return "\n".join(lines)
 
     def release_graphs(self) -> None:
-        """Drop the captured graphs and their buffers (the graph domain is per State)."""
+        """Drop the captured graphs and their buffers (the graph domain is per State).
+
+        A failed teardown is raised *after* the reference is dropped, so the caller sees the leak and a
+        later ``release_graphs`` cannot try to tear the same half-dead domain down twice.
+        """
         if self._decode_graphs is not None:
-            self._decode_graphs.close()
-            self._decode_graphs = None
+            graphs, self._decode_graphs = self._decode_graphs, None
+            graphs.close()
 
     def _graph_unusable_reason(self) -> str | None:
         """Why this model cannot run the captured decode, or None if it can."""
@@ -1430,7 +1487,13 @@ class Dsv41:
         g = self._decode_graphs
         if g is None or g.state is not state or g.state.kv is not state.kv:
             if g is not None:
-                g.close()
+                try:
+                    g.close()
+                except GraphTeardownError as teardown:
+                    # the old conversation's graphs could not all be destroyed: name it and capture the
+                    # new domain anyway - a leak must not stop the next conversation from being served
+                    print(f"graphs: teardown of the previous State's graphs failed ({teardown})",
+                          flush=True)
             g = self._decode_graphs = _DecodeGraphs(self, state, verify=self.graph_verify,
                                                    cards=self.expert_cards)
             print(g.describe(), flush=True)
@@ -1468,7 +1531,12 @@ class Dsv41:
                 # expert card's registers, so take it and carry on from the *next* layer
                 b.h.copy_(g.regs_for(li).h)
                 start = li + 1
-            g.close()
+            try:
+                g.close()
+            except GraphTeardownError as teardown:
+                # A leaked graph model must not turn a recoverable replay failure into a failed request:
+                # report it, finish the step eagerly, and let the next State capture its own graphs.
+                print(f"graphs: teardown of the failed capture also failed ({teardown})", flush=True)
             self._decode_graphs = None
             # layer `start`'s own input pre-mix is still in its parity (g_pre writes the other one)
             return self._eager_layers(b.h, b.pres[start % 2], state, state.pos, [], engram_rows,
@@ -1550,7 +1618,7 @@ class Dsv41:
         z1, z2, z3 = regs.zeros
         xq = xs = None
         if self.int8_experts and torch_npu is not None:
-            xq, xs = per_token_int8(x)
+            xq, xs = per_token_int8(x, fused=self.fused_quant)
         inter, hidden = cfg.moe_intermediate_size, cfg.hidden_size
         for i in range(K):
             w1 = slab[i, 0].view(inter, hidden)
@@ -1559,7 +1627,9 @@ class Dsv41:
             if xq is not None:
                 g_ = self.expert_mm_q(xq, xs, w1[None], sc1[i], z1[i]).clamp(max=self.lim)
                 u_ = self.expert_mm_q(xq, xs, w3[None], sc3[i], z3[i]).clamp(-self.lim, self.lim)
-                y.add_(self.expert_mm_q(*per_token_int8(F.silu(g_) * u_), w2[None], sc2[i], z2[i]) * regs.wts[i])
+                h_ = F.silu(g_) * u_
+                y.add_(self.expert_mm_q(*per_token_int8(h_, fused=self.fused_quant),
+                                        w2[None], sc2[i], z2[i]) * regs.wts[i])
             else:
                 g_ = self.mm(x, self.dequant(w1, sc1[i], z1[i])).clamp(max=self.lim)
                 u_ = self.mm(x, self.dequant(w3, sc3[i], z3[i])).clamp(-self.lim, self.lim)
@@ -1863,11 +1933,22 @@ class _DecodeGraphs:
 
     # -- teardown -------------------------------------------------------------------------------
     def close(self) -> None:
+        """Tear down every card's runner, then raise if any graph could not be destroyed.
+
+        Each ``GraphRunner.close`` re-selects the card it captured on (a captured model can only be
+        destroyed from its own context), so the normal path leaves nothing behind.  A failure is
+        collected rather than raised per card, so one bad card cannot skip tearing down the others,
+        and then reported once - a leak that is not named is the failure this method exists to stop.
+        """
         if self.closed:
             return
         self.closed = True
-        for runner in self.runners.values():
-            runner.close()
+        failures: list[tuple[str, str]] = []
+        for key, runner in list(self.runners.items()):
+            try:
+                runner.close()
+            except GraphTeardownError as exc:
+                failures.append((key, str(exc)))
         self.runners.clear()
         self.runner = None
         self._events.clear()
@@ -1877,6 +1958,8 @@ class _DecodeGraphs:
         # the buffers are the state's addresses, not the runner's: drop them so a re-capture cannot
         # accidentally keep reading a slab nobody writes
         self.buffers = None
+        if failures:
+            raise GraphTeardownError(", ".join(key for key, _ in failures), failures)
 
 
 class _CardRegisters:

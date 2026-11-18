@@ -18,6 +18,8 @@ from ascend.dsv41.graph_runner import (
     CaptureVerificationError,
     GraphInputContractError,
     GraphRunner,
+    GraphTeardownError,
+    _Entry,
 )
 
 
@@ -169,6 +171,58 @@ class TheLifecycle(unittest.TestCase):
             runner.replay("g")
 
 
+class _FakeGraph:
+    """A graph whose destroy fails the way a wrong-context ``rtModelDestroy`` does - by returning."""
+
+    def __init__(self, name: str, log: list[str], fail: bool = True):
+        self.name, self.log, self.fail = name, log, fail
+
+    def reset(self) -> None:
+        self.log.append(self.name)
+        if self.fail:
+            raise RuntimeError("rtModelDestroy execution failed: model not in current ctx")
+
+
+class TheTeardownReport(unittest.TestCase):
+    """A destroy that fails must be named, not swallowed: a silent leak is the one failure this
+    wrapper exists to make impossible.  The stack itself reports a wrong-context destroy as an NPU
+    *warning* and returns normally, so ``close`` re-selects the capturing card first (that is the fix,
+    exercised on hardware by `OnAnNpu.test_close_from_another_card_...`) and reports what still raises.
+    """
+
+    def _runner_with(self, names, fail):
+        runner = GraphRunner("cpu")
+        log: list[str] = []
+        for name in names:
+            runner._graphs[name] = _Entry(name, lambda: None, (), graph=_FakeGraph(name, log, fail),
+                                          outputs=None, report=None)
+        return runner, log
+
+    def test_close_names_every_graph_it_could_not_destroy(self):
+        names = ("g_pre.0.64", "g_post.0", "g_post.1")
+        runner, log = self._runner_with(names, fail=True)
+        with self.assertRaises(GraphTeardownError) as caught:
+            runner.close()
+        message = str(caught.exception)
+        for name in names:
+            self.assertIn(name, message)
+        self.assertEqual(log, list(names), "every graph must be attempted, not just the first")
+        self.assertEqual(len(caught.exception.failures), len(names))
+        self.assertIn("could not be destroyed", message)
+        self.assertIn("current ctx", message, "the runtime's own reason must survive into the report")
+        self.assertTrue(runner.closed)
+        self.assertEqual(runner.names, [], "a reported failure must still drop the entries")
+        self.assertIsNone(runner.pool)
+        runner.close()                                     # idempotent: the report is not raised twice
+
+    def test_a_clean_close_still_raises_nothing(self):
+        runner, log = self._runner_with(("g_pre.0.64",), fail=False)
+        runner.close()
+        self.assertEqual(log, ["g_pre.0.64"])
+        self.assertTrue(runner.closed)
+        self.assertEqual(runner.names, [])
+
+
 @unittest.skipUnless(NPU_DEVICE is not None,
                      "set DSV41_RUN_NPU_TESTS=1 with a free card for the NPU test")
 class OnAnNpu(unittest.TestCase):
@@ -201,3 +255,30 @@ class OnAnNpu(unittest.TestCase):
         self.runner.replay("npu_scale", sync=True)
         want = self.x * 2.0 + 1.0
         torch.testing.assert_close(self.out, want, rtol=0, atol=0)
+
+    def test_close_from_another_card_destroys_the_graphs_and_restores_the_card(self):
+        """The leak: a graph belongs to the context of the card that captured it.
+
+        `rtModelDestroy` from another card's context prints a warning, returns, and leaves the model
+        alive - so a capture on npu:1 that is closed while npu:0 is current leaked.  `close` now
+        selects the capturing card for the teardown and restores the caller's card afterwards.  This
+        test needs a second card, because the failure only exists across contexts.
+        """
+        if torch.npu.device_count() < 2:
+            raise unittest.SkipTest("needs two cards: the failure is a cross-context destroy")
+        index = (int(NPU_DEVICE.split(":")[-1]) + 1) % torch.npu.device_count()
+        other = f"npu:{index}"
+        runner = GraphRunner(other)
+        x = torch.arange(8, dtype=torch.float32).reshape(2, 4).to(other)
+        out = torch.zeros_like(x)
+
+        def fn():
+            out.copy_(x * 4.0)
+            return out
+
+        runner.capture("away", fn, inputs={"x": x})
+        torch.npu.set_device(int(NPU_DEVICE.split(":")[-1]))
+        before = torch.npu.current_device()
+        runner.close()                                  # must not raise, and must not leak
+        self.assertEqual(torch.npu.current_device(), before,
+                         "close must put the caller back on the card it was called on")
