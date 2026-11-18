@@ -24,7 +24,7 @@ can see what is in flight, who owns it and what "done" means. The analysis behin
 |---|---|---|---|---|
 | 0c | the step's RoPE tables, built once per layer | lead | **done** (`6966609`) | Cos/Sin counts halved in `op_summary`; decode-equals-chunk test green |
 | 0a | device-side state addressing (the KV planes) | `kv-device` built it, lead integrated | **done** (`a61bf27`) | `KvPlanes` is a drop-in: 18 CPU tests against today's slicing (positions 0..300, wrap, rewind, `-1` padding); `State` delegates to it; the write is one `index_copy_`, the read a fixed `sliding_window` gather plus a mask; the real-model probe still says `" dog"` |
-| 0b | mHC on the device path, the two mixes batched | lead | queued | one `[2, 4d] x [4d, 24]` matmul replacing two; equal to the current result to 2e-5 |
+| 0b | mHC on the device path, the two mixes batched | lead | **batching ruled out** | the two mixes take *different* inputs (`h` before and after the attention block), so one `[2, 4d] x [4d, 24]` matmul cannot serve both; what 0b actually needs is only `host_mixes=False`, which is already the general path |
 | P1 | capture one layer, verify the replay | `capture-harness` → lead ran the probe | **done** (evidence below) | a probe that captures this engine's own ops (`npu_quant_matmul`, `index_copy_`, `index_select`, softmax, topk, two-graph handoff) and gets **bit-identical** results |
 | P2 | 80 graphs + one fixed expert landing zone | lead | queued | interleaved A/B, 48 paired samples, median; greedy token ids identical; target 1 661 -> ~831 ms |
 | R4 | preload all 15 360 experts' scales and offsets (0.61 GB) | lead | queued | the 120 synchronous scale copies per step go away; no numerics change |
@@ -53,6 +53,22 @@ fails to capture, an in-place write captures, and a two-graph pipeline with a ho
 replays reproduces the eager result exactly**. `GraphRunner` (`ascend/dsv41/graph_runner.py`) wraps this with
 the input contract (shape, dtype, device, `data_ptr` checked on every replay) and a guard that proves the
 graph reads live tensors rather than a baked value.
+
+## Where the capture stands, after 0a
+
+The individual operators all capture and replay bit-identically (`probe_capture.py`, table above), and 0a
+removed the host integers and varying shapes from the layer's KV path. But **capturing the composed layer
+still fails**: `.ascend-work/probe_layer.py` captures layer 1 (window-only, so no compressor or indexer)
+and `GraphRunner.capture` raises
+
+    capture 'layer1' failed on npu:0: RuntimeError: ACL stream synchronize failed, error code:107027
+
+so something inside `Dsv41.attention` is still not capturable even though each of its operators is - an op
+that synchronises internally, or an allocation/in-place pattern ACL dislikes, not a host integer (those were
+the easy cases and are gone). The next diagnostic is a bisect, capturing progressively more of the layer in
+this order: `Rope.cos_sin` + `apply`; the q path (`wq_a`, `rms`, `wq_b`); the kv path and `write_window`; the
+window `read_window`; `sparse_attn` alone; `out_projection`; then the whole `attention`. Whichever step first
+raises names the operator to work around.
 
 ## Two bugs the work found
 
