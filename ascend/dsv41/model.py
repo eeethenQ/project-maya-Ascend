@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
+from time import perf_counter as _perf
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
@@ -38,6 +39,7 @@ except Exception:                                       # noqa: BLE001 - the hos
 
 from .checkpoint import Checkpoint
 from .config import FULL, REUSE, SWA_ONLY, LayerRole, TextConfig, Topology, build_layer_plan
+from .graph_runner import GraphRunner, GraphRunnerError
 from .kv_planes import INDEX as INDEX_PLANE
 
 
@@ -365,6 +367,17 @@ class ExpertSource:
         """
         raise NotImplementedError
 
+    def fetch_int8_into(self, layer: int, experts: list[int], slab: torch.Tensor,
+                        scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> None:
+        """The same fetch, written into a caller-owned slab at an address the caller already fixed.
+
+        A captured decode layer bakes the address it reads, so the 40 layers cannot each own a landing
+        zone: they all read the same device buffer, filled here.  ``slab`` is ``[n, 3, out*in]`` int8 in
+        w1/w2/w3 order and ``scales`` a matching 3-tuple of ``[n, out, 1]`` fp32 tensors (a slice of the
+        double buffer, so its address is fixed too).  The eager path keeps `fetch_int8`.
+        """
+        raise NotImplementedError
+
     def stats(self) -> dict[str, int]:
         return {}
 
@@ -425,7 +438,10 @@ class ExpertStreamer(ExpertSource):
         # recorded after its copy, and a slot is only reused once that copy has landed.
         self._ring = 3
         self._staging: dict[str, list[torch.Tensor]] = {}
-        self._events: list = []
+        # one event per staging slot per card, created where the bytes land: an event belongs to the
+        # device that was current when it was constructed, and this process may be running with another
+        # card current (a spread tier), so they are made on demand for the destination
+        self._events: dict[str, list] = {}
         self._slot = 0
         self._cap = 0
         self._fds: dict[str, int] = {}
@@ -459,8 +475,6 @@ class ExpertStreamer(ExpertSource):
                         self._pin_enabled = False
                 slots.append(t)
             self._staging[p] = slots
-        if not self._events and hasattr(torch, "npu") and str(self.device).startswith("npu"):
-            self._events = [torch.npu.Event() for _ in range(self._ring)]
         self._cap = cap
         self._staging_mib = sum(t.numel() for t in self._staging.values() for t in t) / (1 << 20)
 
@@ -500,45 +514,76 @@ class ExpertStreamer(ExpertSource):
             return self.device
         return self.layer_devices[layer % len(self.layer_devices)]
 
+    def _events_for(self, device: str) -> list:
+        """One event per staging slot, created on the card the copy lands on."""
+        if not (hasattr(torch, "npu") and str(device).startswith("npu")):
+            return []
+        key = str(device)
+        events = self._events.get(key)
+        if events is None:
+            events = self._events[key] = [torch.npu.Event() for _ in range(self._ring)]
+        return events
+
     def _read_many(self, layer: int, experts: list[int]) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         n = len(experts)
         device = self.device_for(layer)
         self._ensure_staging(n)
-        slot = self._slot
-        self._slot = (slot + 1) % self._ring
-        if self._events:
-            # waits only for this slot's own copy, not for the compute queued behind it (a no-op when
-            # that copy has already landed), so the host read still overlaps the device's work
-            self._events[slot].synchronize()
-        views = {p: self._staging[p][slot].numpy() for p in self._shapes}
-        list(self._pool.map(lambda i_e: self._read_one(layer, i_e[1], i_e[0], views), list(enumerate(experts))))
-        out = {}
-        for p in ("w1", "w2", "w3"):
-            # copy=True even when the device *is* the host: an expert that lands in the resident cache must
-            # own its bytes, or the next layer's read overwrites it (the slots are reused)
-            q = self._staging[p][slot][:n].to(device, non_blocking=True, copy=True)
-            scales = torch.empty((n, self._shapes[p][0], 1), dtype=torch.float32, device=device)
-            for i, e in enumerate(experts):
-                info = self.ckpt.info(f"layers.{layer}.ffn.experts.{e}.{p}.weight")
-                self.bytes_in += info.nbytes
-                cached = self._scale_cache.get((layer, e)) if self.scale_cache else None
-                if cached is None:
-                    # w1/w2/w3 have different output widths, so a tuple rather than one stacked tensor
-                    cached = tuple(
-                        torch.from_numpy(np.array(self.ckpt.numpy(
-                            f"layers.{layer}.ffn.experts.{e}.{q2}.weight_scale"))).to(device)
-                        for q2 in ("w1", "w2", "w3"))
-                    if self.scale_cache:
-                        self._scale_cache[(layer, e)] = cached
-                        self._scale_bytes += sum(t.numel() * t.element_size() for t in cached)
-                scales[i, :, 0] = cached[("w1", "w2", "w3").index(p)][:, 0]
-            out[p] = (q, scales, torch.zeros_like(scales))
-        if self._events:
-            self._events[slot].record()
-        return out
+        # the copy goes to `device`'s stream, and an Event belongs to the device that was current when it
+        # was made: make the destination current for the duration, or `record` fails (or, worse, records on
+        # another card's stream and the ring's reuse guard silently stops guarding)
+        previous = index = None
+        if hasattr(torch, "npu") and str(device).startswith("npu"):
+            previous = torch.npu.current_device()
+            index = int(str(device).split(":")[-1]) if ":" in str(device) else 0
+            if previous != index:
+                torch.npu.set_device(index)
+        try:
+            events = self._events_for(device)
+            slot = self._slot
+            self._slot = (slot + 1) % self._ring
+            if events:
+                # waits only for this slot's own copy, not for the compute queued behind it (a no-op when
+                # that copy has already landed), so the host read still overlaps the device's work
+                events[slot].synchronize()
+            views = {p: self._staging[p][slot].numpy() for p in self._shapes}
+            list(self._pool.map(lambda i_e: self._read_one(layer, i_e[1], i_e[0], views),
+                                list(enumerate(experts))))
+            out = {}
+            for p in ("w1", "w2", "w3"):
+                # copy=True even when the device *is* the host: an expert that lands in the resident cache
+                # must own its bytes, or the next layer's read overwrites it (the slots are reused)
+                q = self._staging[p][slot][:n].to(device, non_blocking=True, copy=True)
+                scales = torch.empty((n, self._shapes[p][0], 1), dtype=torch.float32, device=device)
+                for i, e in enumerate(experts):
+                    info = self.ckpt.info(f"layers.{layer}.ffn.experts.{e}.{p}.weight")
+                    self.bytes_in += info.nbytes
+                    cached = self._scale_cache.get((layer, e)) if self.scale_cache else None
+                    if cached is None:
+                        # w1/w2/w3 have different output widths, so a tuple rather than one stacked tensor
+                        cached = tuple(
+                            torch.from_numpy(np.array(self.ckpt.numpy(
+                                f"layers.{layer}.ffn.experts.{e}.{q2}.weight_scale"))).to(device)
+                            for q2 in ("w1", "w2", "w3"))
+                        if self.scale_cache:
+                            self._scale_cache[(layer, e)] = cached
+                            self._scale_bytes += sum(t.numel() * t.element_size() for t in cached)
+                    scales[i, :, 0] = cached[("w1", "w2", "w3").index(p)][:, 0]
+                out[p] = (q, scales, torch.zeros_like(scales))
+            if events:
+                # the destination device's stream is the one the copies were enqueued on
+                events[slot].record(torch.npu.current_stream(index))
+            return out
+        finally:
+            if previous is not None and previous != index:
+                torch.npu.set_device(previous)
 
     # -- the interface ------------------------------------------------------------------------
-    def fetch_int8(self, layer: int, experts: list[int]) -> list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+    def _blocks(self, layer: int, experts: list[int]) -> list[dict]:
+        """The requested experts' blocks, from the resident tier or streamed, with the tier's accounting.
+
+        Both fetch paths share this: where the bytes end up (fresh tensors or a fixed landing slab) is the
+        only difference, so the hit/miss counts, the LRU and the scale cache stay one piece of code.
+        """
         experts = [int(e) for e in experts]
         if not experts:
             return []
@@ -584,6 +629,29 @@ class ExpertStreamer(ExpertSource):
                     while len(order) > self._slots[dev]:
                         self._cache.pop(order.pop(0), None)
         return blocks
+
+    def fetch_int8(self, layer: int, experts: list[int]) -> list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+        return self._blocks(layer, experts)
+
+    def fetch_int8_into(self, layer: int, experts: list[int], slab: torch.Tensor,
+                        scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> None:
+        """Fetch into a fixed landing zone: ``slab[i, j]`` is expert ``i``'s w{j+1}, flattened int8.
+
+        The copy into the slab is a device-to-device move from the batch this fetch just landed (or from
+        the resident tier), so it adds 203 MB of on-card bandwidth per layer and no host work.  Every
+        expert must be on the card the layer runs on: a captured graph cannot contain a cross-device copy,
+        and `Dsv41` refuses to enable graphs when the tier is spread.
+        """
+        experts = [int(e) for e in experts]
+        if not experts:
+            return
+        if len(experts) > slab.shape[0]:
+            raise ValueError(f"{len(experts)} experts do not fit a landing zone of {slab.shape[0]} slots")
+        blocks = self._blocks(layer, experts)
+        for i, block in enumerate(blocks):
+            for j, p in enumerate(("w1", "w2", "w3")):
+                slab[i, j].copy_(block[p][0][0].reshape(-1))
+                scales[j][i].copy_(block[p][1][0])
 
     def staging_bytes(self) -> int:
         """What the pinned staging ring costs, for the budget that decides the expert tier."""
@@ -679,7 +747,8 @@ class Dsv41:
     """
 
     def __init__(self, cfg: TextConfig, weights: Weights, device, dtype=torch.bfloat16, engram=None,
-                 index_buckets: IndexerBucketPolicy | None = None):
+                 index_buckets: IndexerBucketPolicy | None = None, graphs: bool = False,
+                 graph_verify: bool = False):
         self.cfg = cfg
         self.engram = engram
         self.plan = build_layer_plan(cfg)
@@ -699,6 +768,14 @@ class Dsv41:
         # no `unique`/gather; both are measured against the general path by bench_step --ab-dense
         self.host_mixes = True
         self.fast_moe = True
+        # per-layer NPU graphs for a one-token step (opt-in; see `_DecodeGraphs`).  The host-side Sinkhorn
+        # cannot be captured, so enabling graphs forces the device mHC path.
+        self.graphs = bool(graphs)
+        self.graph_verify = bool(graph_verify)
+        if self.graphs:
+            self.host_mixes = False
+        self._decode_graphs: "_DecodeGraphs | None" = None
+        self._graph_reason_logged = False
         # where each layer's experts are computed; empty means "on the card the layer is on"
         self.expert_device_for = getattr(weights.experts, "device_for", None)
         # experts per MoE batch: the staging ring is sized for this many, so the two must agree
@@ -876,7 +953,9 @@ class Dsv41:
 
     def indexer(self, li: int, x: torch.Tensor, qr: torch.Tensor, latent: torch.Tensor | None,
                 group_pos, positions: torch.Tensor, host_positions: list[int],
-                state: State, entries_bucket: int | None = None) -> torch.Tensor:
+                state: State, entries_bucket: int | None = None,
+                topk_out: torch.Tensor | None = None,
+                candidates_out: torch.Tensor | None = None) -> torch.Tensor:
         """The compressed entries this query reads, as ``-1``-padded indices.
 
         ``entries = (pos + 1) // r`` entries are visible, but the score tensor's width must not move under a
@@ -885,6 +964,12 @@ class Dsv41:
         and masks everything from the live count to the bucket's end with ``-inf``.  ``lens``, the entry
         count and the index-K write are all device-side; the only host integers left are the bucket itself
         (a shape, on purpose) and the ``T > 1`` prompt path, which keeps today's arithmetic untouched.
+
+        ``topk_out`` / ``candidates_out`` are fixed-address registers for the graph path.  A captured
+        *consumer* layer bakes the address of the selection it reads, so a source layer must write its
+        selection to an address that does not change when the source is re-captured at a new bucket: when
+        given, the selection is copied into the register, padded with ``-1`` to its full width, and the
+        register is what the layer's attention (and every consumer) reads.
         """
         cfg, role = self.cfg, self.plan.layer(li)
         lw = self.weights.layers[li]
@@ -935,13 +1020,29 @@ class Dsv41:
         score = (dots * w[:, :, None, None]).sum(1)[:, 0, :]               # [T, E]
         score = score.masked_fill(torch.arange(entries, device=x.device)[None, :] >= lens, float("-inf"))
         if role.is_candidate_source:
-            state.candidates = self.candidate_blocks(score, lens)
+            cand = self.candidate_blocks(score, lens)
+            if candidates_out is not None:
+                # a fixed width, zeroed first: the region past the live source width must read as "not a
+                # candidate", and a consumer at a narrower bucket crops this register anyway
+                candidates_out.zero_()
+                candidates_out[..., :cand.shape[-1]].copy_(cand)
+                cand = candidates_out
+            state.candidates = cand
         elif role.uses_candidate_filter and state.candidates is not None:
             candidates = self._fit_candidates(state.candidates, entries)
             score = score.masked_fill(~candidates, float("-inf"))
         topk = min(cfg.index_topk, entries)
         idx = score.topk(topk, dim=-1, sorted=False).indices.sort(-1).values
-        return torch.where(idx < lens, idx, torch.full_like(idx, -1))
+        idx = torch.where(idx < lens, idx, torch.full_like(idx, -1))
+        if topk_out is not None:
+            # the register is wider than this bucket's selection: pad with -1 (masked by `cvalid`) so a
+            # consumer captured before the source moved bucket still reads a complete, valid selection.
+            # This layer's own attention reads only its exact width, so the source half of the split keeps
+            # today's arithmetic; a consumer reads the full register (the padded keys are masked).
+            topk_out.fill_(-1)
+            topk_out[..., :idx.shape[-1]].copy_(idx)
+            idx = topk_out[..., :topk]
+        return idx
 
     def candidate_blocks(self, logits: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
         """The 2048 blocks of 8 entries that later index sources may re-score (the oracle's rule)."""
@@ -969,7 +1070,9 @@ class Dsv41:
         return torch.einsum("thk,tkd->thd", p, keys) / den.unsqueeze(-1)
 
     def attention(self, li: int, x: torch.Tensor, positions: torch.Tensor, host_positions: list[int],
-                  state: State, entries_bucket: int | None = None) -> torch.Tensor:
+                  state: State, entries_bucket: int | None = None,
+                  topk_out: torch.Tensor | None = None,
+                  candidates_out: torch.Tensor | None = None) -> torch.Tensor:
         cfg, role = self.cfg, self.plan.layer(li)
         lw = self.weights.layers[li]
         T = x.shape[0]
@@ -991,7 +1094,8 @@ class Dsv41:
             latent, group_pos = self.compress(li, x, positions, host_positions, state)
         if role.is_index_source:
             state.topk = self.indexer(li, x, qr, latent, group_pos, positions, host_positions, state,
-                                      entries_bucket=entries_bucket)
+                                      entries_bucket=entries_bucket, topk_out=topk_out,
+                                      candidates_out=candidates_out)
         if latent is not None:
             # the compressed entry is stored rotated at its group's start position; group index and rows
             # both travel as device tensors, so a captured layer replays at any position
@@ -1081,6 +1185,21 @@ class Dsv41:
         dt = self.dtype
         return (q.to(dt) - offset.to(dt)) * scale.to(dt)
 
+    def router(self, li: int, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The routed selection: sqrtsoftplus scores, top-k by score+bias, weights renormalised.
+
+        Shared by the eager MoE and the captured `g_pre`, because the routing is the last thing before the
+        graph split and the two must select identically.  For ``T == 1`` `topk` cannot repeat an index, so
+        the six ids need no `unique`.
+        """
+        cfg = self.cfg
+        lw = self.weights.layers[li]
+        scores = F.softplus(x.float() @ lw.ffn["gate"].T).sqrt()      # sqrtsoftplus, unbiased
+        idx = (scores + lw.ffn["gate_bias"]).topk(cfg.num_experts_per_tok, dim=-1).indices
+        wts = scores.gather(1, idx)
+        wts = wts / (wts.sum(-1, keepdim=True) + 1e-20) * cfg.routed_scaling_factor
+        return idx, wts
+
     def moe(self, li: int, x: torch.Tensor) -> torch.Tensor:
         """The routed experts plus the shared one, for one layer.
 
@@ -1090,11 +1209,7 @@ class Dsv41:
         """
         cfg, lw = self.cfg, self.weights.layers[li]
         T = x.shape[0]
-        gw, bias = lw.ffn["gate"], lw.ffn["gate_bias"]
-        scores = F.softplus(x.float() @ gw.T).sqrt()                  # sqrtsoftplus, unbiased
-        idx = (scores + bias).topk(cfg.num_experts_per_tok, dim=-1).indices
-        wts = scores.gather(1, idx)
-        wts = wts / (wts.sum(-1, keepdim=True) + 1e-20) * cfg.routed_scaling_factor
+        idx, wts = self.router(li, x)
 
         if isinstance(self.weights.experts, NullExpertSource):
             # no expert source: the routed branch is skipped, which is what a shape or dense-only check wants
@@ -1159,6 +1274,40 @@ class Dsv41:
                     y = y + self.expert_mm(h, *blocks[i]["w2"]) * weights[start + i]
         return y
 
+    # -- one layer, eagerly ---------------------------------------------------------------------
+    def _layer_eager(self, li: int, h: torch.Tensor, pre: torch.Tensor, state: State,
+                     positions: torch.Tensor, host_positions: list[int], engram_rows,
+                     entries_bucket: int | None = None):
+        """Today's layer, expression for expression: the decode path and the graph fallback share it."""
+        lw = self.weights.layers[li]
+        if engram_rows is not None and self.engram is not None and li in self.engram.slot:
+            h = self.engram.apply(li, h, engram_rows[:, self.engram.slot[li]], self.mm)
+        res = h
+        with self.phase("hc"):
+            a_pre, a_post, a_comb = self.hc_mixes(h, lw.hc["attn_fn"], lw.hc["attn_scale"],
+                                                 lw.hc["attn_base"])
+            x = rms(self.hc_pre(h, pre), lw.norms["attn_norm"], self.eps)
+        with self.phase("attn"):
+            h = self.hc_post(self.attention(li, x, positions, host_positions, state,
+                                            entries_bucket=entries_bucket), res, a_post, a_comb)
+        res = h
+        with self.phase("hc"):
+            f_pre, f_post, f_comb = self.hc_mixes(h, lw.hc["ffn_fn"], lw.hc["ffn_scale"],
+                                                 lw.hc["ffn_base"])
+            x = rms(self.hc_pre(h, a_pre), lw.norms["ffn_norm"], self.eps)
+        with self.phase("moe"):
+            h = self.hc_post(self.moe(li, x), res, f_post, f_comb)
+        return h, f_pre
+
+    def _eager_layers(self, h: torch.Tensor, pre: torch.Tensor, state: State, positions: torch.Tensor,
+                      host_positions: list[int], engram_rows, start: int = 0,
+                      entries_bucket: int | None = None) -> torch.Tensor:
+        """Every layer from ``start`` eagerly, then the final norm: the graph-off prompt and decode path."""
+        for li in range(start, self.cfg.num_hidden_layers):
+            h, pre = self._layer_eager(li, h, pre, state, positions, host_positions, engram_rows,
+                                       entries_bucket=entries_bucket)
+        return rms(self.hc_pre(h, pre), self.weights.final_norm, self.eps)
+
     # -- the whole forward ----------------------------------------------------------------------
     @torch.inference_mode()
     def forward(self, ids: list[int] | torch.Tensor, state: State, logits_last_only: bool = True,
@@ -1169,6 +1318,11 @@ class Dsv41:
         ``entries_bucket`` is the indexer entry width a captured decode layer replays at (see
         :class:`IndexerBucketPolicy`); the eager caller leaves it None and the policy picks per position, a
         prompt chunk (``T > 1``) ignores it.
+
+        A one-token step with ``self.graphs`` on and a supported device runs the captured split: `g_pre`
+        writes the layer's expert input and routing to fixed registers, the host reads the six ids and
+        lands the experts in the double-buffered slab, and `g_post` finishes the layer.  A prompt chunk
+        (``T > 1``) and the graph-off path keep today's code untouched.
         """
         cfg = self.cfg
         dev = self.device
@@ -1188,28 +1342,12 @@ class Dsv41:
         pre = torch.zeros(T, self.hc, device=dev, dtype=torch.float32)
         pre[:, 0] = 1.0
 
-        for li in range(cfg.num_hidden_layers):
-            lw = self.weights.layers[li]
-            if engram_rows is not None and li in self.engram.slot:
-                h = self.engram.apply(li, h, engram_rows[:, self.engram.slot[li]], self.mm)
-            res = h
-            with self.phase("hc"):
-                a_pre, a_post, a_comb = self.hc_mixes(h, lw.hc["attn_fn"], lw.hc["attn_scale"],
-                                                     lw.hc["attn_base"])
-                x = rms(self.hc_pre(h, pre), lw.norms["attn_norm"], self.eps)
-            with self.phase("attn"):
-                h = self.hc_post(self.attention(li, x, positions, host_positions, state,
-                                                entries_bucket=entries_bucket), res, a_post, a_comb)
-            res = h
-            with self.phase("hc"):
-                f_pre, f_post, f_comb = self.hc_mixes(h, lw.hc["ffn_fn"], lw.hc["ffn_scale"],
-                                                     lw.hc["ffn_base"])
-                x = rms(self.hc_pre(h, a_pre), lw.norms["ffn_norm"], self.eps)
-            with self.phase("moe"):
-                h = self.hc_post(self.moe(li, x), res, f_post, f_comb)
-            pre = f_pre
+        if T == 1 and self.graphs and self._graphs_usable():
+            x = self._graph_decode(h, pre, state, engram_rows)
+        else:
+            x = self._eager_layers(h, pre, state, positions, host_positions, engram_rows,
+                                   entries_bucket=entries_bucket)
 
-        x = rms(self.hc_pre(h, pre), self.weights.final_norm, self.eps)
         state.token_ids.extend(int(t) for t in ids_t.tolist())
         state.pos += T
         state.next_pos += T
@@ -1219,3 +1357,377 @@ class Dsv41:
             return None
         rows = x[-1:] if logits_last_only else x
         return self.mm(rows, self.weights.head)
+
+    # -- the decode graphs ----------------------------------------------------------------------
+    def graph_summary(self, state: State) -> str:
+        """The capture table this state will use, one line per index source (`describe()` logged)."""
+        lines = [f"graphs: {'on' if self.graphs else 'off'} - 2 per layer (g_pre, g_post), one g_pre per "
+                 f"selection bucket per layer; the expert landing zone is "
+                 f"{2 * self.cfg.num_experts_per_tok * 3 * self.cfg.moe_intermediate_size * self.cfg.hidden_size / 1e6:.0f} MB"]
+        for li in self.plan.index_source_layer_ids:
+            capacity = state.kv.group_entries[self.plan.layer(li).kv_source_layer]
+            lines.append(f"  layer {li:2d}: {self.index_buckets.describe(capacity)}")
+        return "\n".join(lines)
+
+    def release_graphs(self) -> None:
+        """Drop the captured graphs and their buffers (the graph domain is per State)."""
+        if self._decode_graphs is not None:
+            self._decode_graphs.close()
+            self._decode_graphs = None
+
+    def _graph_unusable_reason(self) -> str | None:
+        """Why this model cannot run the captured decode, or None if it can."""
+        cfg = self.cfg
+        src = self.weights.experts
+        method = getattr(type(src), "fetch_int8_into", None)
+        if method is None or method is ExpertSource.fetch_int8_into:
+            return "the expert source has no fixed-slab fetch (the landing zone is what a captured g_post reads)"
+        if self.expert_batch < cfg.num_experts_per_tok:
+            return (f"the staging ring holds {self.expert_batch} experts but a decode step routes "
+                    f"{cfg.num_experts_per_tok}; raise --expert-batch")
+        device_for = getattr(src, "device_for", None)
+        if device_for is not None:
+            elsewhere = [li for li in range(cfg.num_hidden_layers) if str(device_for(li)) != str(self.device)]
+            if elsewhere:
+                # probe G: a cross-device copy cannot be captured, and g_post's math (experts + the shared
+                # expert on the layer's card) would straddle the two
+                return (f"the expert tier is spread over several cards (layer {elsewhere[0]}'s experts live "
+                        f"on {device_for(elsewhere[0])}, the layer on {self.device}); a captured layer "
+                        "cannot cross devices")
+        return None
+
+    def _graphs_usable(self) -> bool:
+        reason = self._graph_unusable_reason()
+        if reason is None:
+            return True
+        if not self._graph_reason_logged:
+            self._graph_reason_logged = True
+            print(f"graphs: not used - {reason}; the eager path runs", flush=True)
+        return False
+
+    def _graph_decode(self, h: torch.Tensor, pre: torch.Tensor, state: State, engram_rows) -> torch.Tensor:
+        """One decode token through 40 captured `g_pre` / `g_post` pairs, with the host seam between them.
+
+        Per layer: replay `g_pre` (engram, mHC, attention, compressor/indexer, router) which writes the
+        expert input and the six routing ids to fixed registers; read those ids with one ``cpu()``; fetch
+        the six experts into the parity's landing zone (host ``pread`` + async H2D, outside every graph);
+        replay `g_post` (six expert matmul triples, the shared expert, the post-mHC).  Anything that fails
+        to capture or replay disables graphs and finishes the step (and the request) on the eager path.
+        """
+        g = self._decode_graphs
+        if g is None or g.state is not state or g.state.kv is not state.kv:
+            if g is not None:
+                g.close()
+            g = self._decode_graphs = _DecodeGraphs(self, state, verify=self.graph_verify)
+            print(g.describe(), flush=True)
+        b = g.buffers
+        b.h.copy_(h)
+        b.pres[0].copy_(pre)                       # layer 0 reads the first parity; the rest ping-pong
+        li = 0
+        try:
+            for li in range(self.cfg.num_hidden_layers):
+                if self.engram is not None and li in self.engram.slot:
+                    # the lookup is host work keyed by the token history; it cannot be captured, so the
+                    # rows land in a fixed buffer here, between the replays
+                    g.engram[li].copy_(self.engram.embedding(li, engram_rows[:, self.engram.slot[li]]))
+                g.replay_pre(li)
+                ids = b.idx.cpu().tolist()              # the ONE host break: six ints, one sync
+                g.fetch(li, ids)                        # host pread + async H2D, outside the graphs
+                g.replay_post(li)
+        except (GraphRunnerError, RuntimeError) as exc:
+            # a capture the wrapper refused, or a replay the runtime refused: finish this step (and the
+            # request) eagerly rather than fail the conversation half-way through a layer
+            self._disable_graphs(f"layer {li}: {type(exc).__name__}: {exc}")
+            g.close()
+            self._decode_graphs = None
+            # layer `li`'s own input pre-mix is still in its parity (g_pre writes the other one)
+            return self._eager_layers(b.h, b.pres[li % 2], state, state.pos, [], engram_rows, start=li)
+        # the last layer wrote parity `num_layers % 2` (its input was the other one)
+        return rms(self.hc_pre(b.h, b.pres[self.cfg.num_hidden_layers % 2]), self.weights.final_norm,
+                   self.eps)
+
+    def _disable_graphs(self, reason: str) -> None:
+        """Fall back for the rest of the request, and say why (the graphs are not silently half-used)."""
+        self.graphs = False
+        print(f"graphs: disabled after a capture/replay failure ({reason}); the rest runs eagerly", flush=True)
+
+    def _layer_pre_body(self, li: int, g: "_DecodeGraphs", bucket: int):
+        """What `g_pre` captures: everything from the layer's input up to the routing ids.
+
+        It writes the layer's expert input, the router's ids and weights, the post-MHC's residual and
+        mixes and the next layer's pre-mix into fixed buffers, so `g_post` and the next `g_pre` read the
+        same addresses on every replay.
+        """
+        role = self.plan.layer(li)
+        lw = self.weights.layers[li]
+        b = g.buffers
+        h = b.h
+        if self.engram is not None and li in self.engram.slot:
+            h = self.engram.apply_device(li, h, g.engram[li], self.mm)
+        pre_in, pre_out = b.pres[li % 2], b.pres[(li + 1) % 2]
+        res = h
+        a_pre, a_post, a_comb = self.hc_mixes(h, lw.hc["attn_fn"], lw.hc["attn_scale"], lw.hc["attn_base"])
+        x = rms(self.hc_pre(h, pre_in), lw.norms["attn_norm"], self.eps)
+        src = role.index_source_layer
+        topk_out = g.topk[src] if role.is_index_source else None
+        if src is not None:
+            # a consumer reads the source's selection from the fixed register, sliced to *this graph's*
+            # width: never from a tensor the source's next capture might replace, and never padded wider
+            # than its own bucket (the padding is the same key set but not the same arithmetic)
+            width = min(self.cfg.index_topk, bucket)
+            g.state.topk = g.topk[src][..., :width]
+        out = self.attention(li, x, g.state.pos, [], g.state, entries_bucket=bucket,
+                             topk_out=topk_out,
+                             candidates_out=(g.candidates if role.is_candidate_source else None))
+        h2 = self.hc_post(out, res, a_post, a_comb)
+        f_pre, f_post, f_comb = self.hc_mixes(h2, lw.hc["ffn_fn"], lw.hc["ffn_scale"], lw.hc["ffn_base"])
+        x_li = rms(self.hc_pre(h2, a_pre), lw.norms["ffn_norm"], self.eps)
+        idx, wts = self.router(li, x_li)
+        b.x.copy_(x_li)
+        b.idx.copy_(idx[0])
+        b.wts.copy_(wts[0])
+        b.res.copy_(h2)
+        b.fpost.copy_(f_post)
+        b.fcomb.copy_(f_comb)
+        pre_out.copy_(f_pre)
+        return (b.x, b.idx, b.wts, b.res, b.fpost, b.fcomb, pre_out)
+
+    def _layer_post_body(self, li: int, g: "_DecodeGraphs"):
+        """What `g_post` captures: the six unrolled expert matmul triples and the shared expert.
+
+        Same arithmetic as `_routed_one`, on the same per-token activation quantisation, but the expert
+        weights are read from this layer's parity of the landing zone (a fixed address, filled by the host
+        between the replays) and their scales from the matching fixed slab.
+        """
+        cfg, lw = self.cfg, self.weights.layers[li]
+        K = cfg.num_experts_per_tok
+        b = g.buffers
+        x = b.x
+        y = b.y
+        y.zero_()
+        slab = b.slab[g.parity(li)]
+        sc1, sc2, sc3 = b.scales
+        z1, z2, z3 = b.zeros
+        xq = xs = None
+        if self.int8_experts and torch_npu is not None:
+            xq, xs = per_token_int8(x)
+        inter, hidden = cfg.moe_intermediate_size, cfg.hidden_size
+        for i in range(K):
+            w1 = slab[i, 0].view(inter, hidden)
+            w2 = slab[i, 1].view(hidden, inter)
+            w3 = slab[i, 2].view(inter, hidden)
+            if xq is not None:
+                g_ = self.expert_mm_q(xq, xs, w1[None], sc1[i], z1[i]).clamp(max=self.lim)
+                u_ = self.expert_mm_q(xq, xs, w3[None], sc3[i], z3[i]).clamp(-self.lim, self.lim)
+                y.add_(self.expert_mm_q(*per_token_int8(F.silu(g_) * u_), w2[None], sc2[i], z2[i]) * b.wts[i])
+            else:
+                g_ = self.mm(x, self.dequant(w1, sc1[i], z1[i])).clamp(max=self.lim)
+                u_ = self.mm(x, self.dequant(w3, sc3[i], z3[i])).clamp(-self.lim, self.lim)
+                y.add_(self.mm(F.silu(g_) * u_, self.dequant(w2, sc2[i], z2[i])) * b.wts[i])
+        shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
+        y.add_(self.mm(shared, lw.ffn["shared_w2"]))
+        b.h.copy_(self.hc_post(y, b.res, b.fpost, b.fcomb))
+        return (b.h, b.y)
+
+
+class _DecodeGraphs:
+    """One State's captured decode: a `g_pre`/`g_post` pair per layer, one `g_pre` per selection bucket.
+
+    The bucket is a *shape*: the indexer's score width and the width of the top-k selection a layer reads.
+    A window-only layer has neither and gets one graph; every other layer bakes the width it runs at, so a
+    bucket crossing re-captures that layer's `g_pre` (and only that layer's).
+
+    The graph domain is a State, not a model: a captured body bakes the addresses of the KV planes it
+    writes and reads, so a second conversation gets its own capture (and the first one's is dropped).  That
+    is a log line, not a silent reuse - `GraphRunner`'s input contract would refuse the replay anyway.
+
+    The buffers below are the fixed registers the split needs:
+
+    * ``h``/``pre`` - the residual stream and the lagged pre-mix, read by `g_pre`, written by `g_post`
+      (``h``) and the next `g_pre` (``pre``);
+    * ``x``/``idx``/``wts`` - this layer's expert input, its six routing ids and weights: `g_pre` writes
+      them, the host reads the ids, `g_post` reads the other two;
+    * ``res``/``fpost``/``fcomb`` - what the post-MHC needs from the attention half;
+    * ``slab`` - the expert landing zone, ``[2, top_k, 3, inter*hidden]`` int8 (405 MB at the real
+      geometry), double-buffered so the host can fill one parity while the other is still being read.  A
+      layer uses parity ``li % 2``; `g_post[li]` bakes that address, and that is why every layer can read
+      the same pair of buffers instead of owning 33.8 MB x 6 of HBM;
+    * ``scales``/``zeros`` - the experts' per-output-channel scales, in the same w1/w2/w3 order, at fixed
+      addresses (`fetch_int8_into` fills them);
+    * ``topk``/``candidates`` - the selection registers: one per index source, one for the candidate
+      source.  A source re-captured at a new bucket still writes the same address, so the consumer graphs
+      that read it stay valid.  They are padded (``-1`` / False) to their full width, which the attention
+      masks: the valid set is the same as eager, the softmax just sums a few hundred exact zeros.
+    """
+
+    def __init__(self, model: "Dsv41", state: State, verify: bool = False):
+        self.model = model
+        self.state = state                      # held: id() stays unique, and the graphs belong to it
+        self.verify = bool(verify)
+        cfg = model.cfg
+        D, hc, K = cfg.hidden_size, cfg.hc_mult, cfg.num_experts_per_tok
+        dev = model.device
+        f32 = torch.float32
+
+        def zeros(*shape, dtype=f32):
+            return torch.zeros(*shape, dtype=dtype, device=dev)
+
+        b = self.buffers = _GraphBuffers()
+        b.h = zeros(1, hc, D)
+        # The pre-mix is a *lagged* register: layer `li` reads the mix layer `li-1` wrote.  A g_pre both
+        # reads and writes it, and `capture(warmup=True)` runs the body once eagerly - so a single buffer
+        # would hand the first replay the warmup's output instead of its input.  Two buffers, ping-ponged
+        # by layer parity, are also what keeps every graph's addresses fixed.
+        b.pres = (zeros(1, hc), zeros(1, hc))
+        b.x = zeros(1, D)
+        b.y = zeros(1, D)
+        b.idx = zeros(K, dtype=torch.long)
+        b.wts = zeros(K)
+        b.res = zeros(1, hc, D)
+        b.fpost = zeros(1, hc)
+        b.fcomb = zeros(1, hc, hc)
+        per = cfg.moe_intermediate_size * D
+        b.slab = torch.empty(2, K, 3, per, dtype=torch.int8, device=dev)
+        # [K, out, 1]: `.view(-1)` is the quant matmul's per-channel scale, and the same shape broadcasts
+        # over a [out, in] weight in the dequantising fallback
+        b.scales = (zeros(K, cfg.moe_intermediate_size, 1), zeros(K, D, 1),
+                    zeros(K, cfg.moe_intermediate_size, 1))
+        b.zeros = tuple(torch.zeros_like(s) for s in b.scales)
+        self.topk: dict[int, torch.Tensor] = {}
+        for src in model.plan.index_source_layer_ids:
+            capacity = state.kv.group_entries[model.plan.layer(src).kv_source_layer]
+            width = min(cfg.index_topk, capacity)
+            self.topk[src] = torch.full((1, width), -1, dtype=torch.long, device=dev)
+        cand = model.plan.layer(model.plan.candidate_source_layer_id).kv_source_layer
+        self.candidates = torch.zeros(1, state.kv.group_entries[cand], dtype=torch.bool, device=dev)
+        self.engram: dict[int, torch.Tensor] = {}
+        if model.engram is not None:
+            model.engram.warm(model.device)     # the rotation block's first use is a host copy
+            cols = model.engram.cols * model.engram.head_dim
+            for li in cfg.engram_layer_ids:
+                self.engram[li] = zeros(1, cols)
+        self.runner = GraphRunner(dev, capture_error_mode="relaxed")
+        self.pre: dict[tuple[int, int], str] = {}
+        self.post: dict[int, str] = {}
+        self.buckets: set[int] = set()
+        self.captured = 0
+        self.capture_s = 0.0
+        self.closed = False
+
+    # -- selection ------------------------------------------------------------------------------
+    def bucket_for(self, li: int) -> int:
+        """The selection width this layer's graph must have been captured at, from the host cursor.
+
+        Every layer of the compressed branch reads the source's top-k *at its own width* - the index source
+        runs the indexer, and the consumers after it read the source's selection - so every one of them
+        bakes a width and needs a graph per bucket.  That is deliberate: reading a wider, ``-1``-padded
+        selection is the same *set* of keys but not the same arithmetic (the softmax sums hundreds of exact
+        zeros, and on this stack that is a ~1e-3 difference that survives into the bf16 KV and breaks greedy
+        parity).  A window-only layer (``compress_ratio 0``) has no width to choose and needs one graph.
+
+        The width follows the entry count the host already knows from ``state.next_pos``, so choosing a
+        graph needs no device sync.
+        """
+        role = self.model.plan.layer(li)
+        if role.index_source_layer is None:
+            return 0
+        capacity = self.state.kv.group_entries[role.kv_source_layer]
+        return self.model.index_buckets.bucket_for(self.state.entries(li, self.state.next_pos), capacity)
+
+    def describe(self) -> str:
+        """One line for the capture log: geometry, devices and the copy the landing zone costs."""
+        cfg = self.model.cfg
+        per = cfg.num_experts_per_tok * 3 * cfg.moe_intermediate_size * cfg.hidden_size
+        return (f"graphs: capturing on {self.model.device} - 2 per layer, one g_pre per selection bucket "
+                f"per layer; landing zone {2 * per / 1e6:.0f} MB ({per / 1e6:.0f} MB x 2 parities), "
+                f"top-{cfg.num_experts_per_tok} experts unrolled")
+
+    def parity(self, li: int) -> int:
+        return li % 2
+
+    # -- capture and replay ---------------------------------------------------------------------
+    def replay_pre(self, li: int) -> None:
+        bucket = self.bucket_for(li)
+        name = self.pre.get((li, bucket))
+        if name is None:
+            name = f"g_pre.{li}.{bucket}"
+            self._capture(name, lambda: self.model._layer_pre_body(li, self, bucket),
+                          self._inputs_pre(li), self._perturb_pre)
+            self.pre[(li, bucket)] = name
+            if bucket and bucket not in self.buckets:
+                self.buckets.add(bucket)
+                if len(self.buckets) > 1:
+                    print(f"graphs: selection bucket {bucket} - capturing this rung's layer graphs "
+                          f"(one g_pre per layer per rung; the width is a shape)", flush=True)
+        self.runner.replay(name)
+
+    def replay_post(self, li: int) -> None:
+        name = self.post.get(li)
+        if name is None:
+            name = f"g_post.{li}"
+            self._capture(name, lambda: self.model._layer_post_body(li, self), self._inputs_post(li),
+                          None)
+            self.post[li] = name
+        self.runner.replay(name)
+
+    def fetch(self, li: int, ids: list[int]) -> None:
+        """Land the routed experts in this layer's parity, outside every graph."""
+        self.model.weights.experts.fetch_int8_into(li, ids, self.buffers.slab[self.parity(li)],
+                                                   self.buffers.scales)
+
+    def _inputs_pre(self, li: int) -> dict:
+        b = self.buffers
+        inputs = {"h": b.h, "pre": b.pres[li % 2], "pos": self.state.pos}
+        if li in self.engram:
+            inputs["engram"] = self.engram[li]
+        return inputs
+
+    def _inputs_post(self, li: int) -> dict:
+        b = self.buffers
+        return {"x": b.x, "wts": b.wts, "slab": b.slab[self.parity(li)], "res": b.res,
+                "fpost": b.fpost, "fcomb": b.fcomb, "scale1": b.scales[0], "scale2": b.scales[1],
+                "scale3": b.scales[2]}
+
+    @staticmethod
+    def _perturb_pre(inputs) -> None:
+        """The guard's value change for `g_pre`: everything moves, and the position moves *forward* by two.
+
+        The default ``xor 1`` would step an odd position *back* by one, which closes a group a previous
+        token already wrote; two forward always lands past every group the step at ``p`` reads.
+        """
+        for label, t in inputs.items():
+            if label == "pos":
+                t.add_(2)
+            elif t.is_floating_point():
+                t.mul_(-0.5).add_(0.125)
+            else:
+                t.bitwise_xor_(1)
+
+    def _capture(self, name: str, fn, inputs: dict, perturb) -> None:
+        saved, self.model.timers = self.model.timers, None   # phase() synchronises, which capture refuses
+        t0 = _perf()
+        try:
+            self.runner.capture(name, fn, inputs=inputs, verify=self.verify, perturb=perturb)
+        finally:
+            self.model.timers = saved
+            self.capture_s += _perf() - t0
+        self.captured += 1
+        report = self.runner.report(name)
+        if self.verify and report is not None and not report.ok:
+            raise GraphRunnerError(f"capture guard failed for {name}: {report}")
+
+    # -- teardown -------------------------------------------------------------------------------
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.runner.close()
+        self.pre.clear()
+        self.post.clear()
+        # the buffers are the state's addresses, not the runner's: drop them so a re-capture cannot
+        # accidentally keep reading a slab nobody writes
+        self.buffers = None
+
+
+class _GraphBuffers:
+    """The fixed-address registers of one State's captured decode (see `_DecodeGraphs`)."""

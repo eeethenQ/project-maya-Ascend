@@ -62,6 +62,14 @@ def main() -> int:
     ap.add_argument("--engram-tokenizer", default="",
                     help="enables Engram (hash n-grams through this Hugging Face tokenizer.json)")
     ap.add_argument("--no-experts", action="store_true", help="skip the routed branch (a shape check)")
+    ap.add_argument("--graphs", action="store_true",
+                    help="capture the one-token path as per-layer NPU graphs: g_pre (attention, router), one "
+                         "host read of the six ids, the expert fetch into a fixed double-buffered landing "
+                         "zone, g_post (the six experts).  Off by default; prompt chunks stay eager.  Needs "
+                         "the expert tier on the layers' own card")
+    ap.add_argument("--graph-verify", action="store_true",
+                    help="run the did-it-capture guard on every graph (slow: 4 eager runs per graph at "
+                         "start-up, then bit-equality at two input values)")
     a = ap.parse_args()
 
     from tokenizers import Tokenizer
@@ -83,7 +91,7 @@ def main() -> int:
                    expert_slots=a.expert_slots,
                    expert_devices=[d for d in a.expert_devices.split(",") if d] or None,
                    engram_tokenizer=a.engram_tokenizer or None,
-                   no_experts=a.no_experts)
+                   no_experts=a.no_experts, graphs=a.graphs, graph_verify=a.graph_verify)
     weights, net, src = run.weights, run.model, run.experts
     load_s = time.time() - t0
     resident = weights.resident_bytes()
@@ -97,6 +105,8 @@ def main() -> int:
     print(f"engram: {'on' if run.engram else 'off'}", flush=True)
 
     state = run.state(a.max_context)
+    if a.graphs:
+        print(net.graph_summary(state), flush=True)
 
     if a.ids:
         ids = [int(x) for x in a.ids.split(",")]

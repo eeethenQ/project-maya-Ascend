@@ -33,7 +33,7 @@ def build_and_run(a, steps: int, timed: bool) -> None:
     """Load, prefill, then `steps` decode steps - the workload both modes measure."""
     run = rt.build(model=a.model, device=a.device, dtype="bfloat16",
                    expert_devices=[d for d in a.expert_devices.split(",") if d] or None,
-                   engram_tokenizer=a.engram_tokenizer or None)
+                   engram_tokenizer=a.engram_tokenizer or None, graphs=a.graphs)
     model = run.model
     if timed:
         print(f"engine: {run.device}, engram {'on' if run.engram else 'off'}, "
@@ -98,6 +98,8 @@ def run_msprof(a) -> int:
         inner += ["--expert-devices", a.expert_devices]
     if a.engram_tokenizer:
         inner += ["--engram-tokenizer", a.engram_tokenizer]
+    if a.graphs:
+        inner += ["--graphs"]
     command = ["msprof", f"--output={out}", "--task-time=on", "--ai-core=on", "--runtime-api=on",
                "--application=" + " ".join(inner)]
     print("running:", " ".join(command[:5]), "... (the profiler makes it several times slower)")
@@ -141,6 +143,8 @@ def main() -> int:
     ap.add_argument("--max-context", type=int, default=1024)
     ap.add_argument("--engram-tokenizer", default="")
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--graphs", action="store_true",
+                    help="run the decode steps as captured per-layer graphs (see ascend/run_dsv41.py)")
     ap.add_argument("--msprof", action="store_true", help="profile with msprof and report per-operator time")
     ap.add_argument("--under-msprof", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()

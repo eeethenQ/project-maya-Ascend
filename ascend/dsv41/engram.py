@@ -185,15 +185,32 @@ class Engram:
     def embedding(self, layer: int, gathered: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(gathered).to(self.device, dtype=torch.float32).to(self.dtype)
 
+    def warm(self, device) -> None:
+        """Materialise the rotation block on ``device`` before a capture: its first use is a host copy.
+
+        ``apply`` builds ``_block_on[dev]`` lazily from the numpy block; doing that inside a capture is a
+        pageable host->device transfer, which the Ascend runtime refuses during a graph.  Nothing else here
+        is lazy.
+        """
+        dev = str(device)
+        if self.block is not None and dev not in self._block_on:
+            self._block_on[dev] = torch.from_numpy(self.block).to(device)
+
     def apply(self, layer: int, h: torch.Tensor, gathered: np.ndarray, mm) -> torch.Tensor:
         """The residual update: `h [T, hc, d]` plus the gated value the lookup produces."""
+        # `lookup` returns one row per hash (T x cols of them); a token's embedding is its cols rows
+        # concatenated, which is the layout wkv's input expects
+        e = self.embedding(layer, gathered)
+        return self.apply_device(layer, h, e, mm)
+
+    def apply_device(self, layer: int, h: torch.Tensor, e: torch.Tensor, mm) -> torch.Tensor:
+        """The same update with the gathered rows already on the device (the graph path keeps them in a
+        fixed buffer, because the host->device copy of `embedding` cannot be captured)."""
         cfg = self.cfg
         proj = self.projections[layer]
         hc, d = cfg.hc_mult, cfg.hidden_size
         T = h.shape[0]
-        # `lookup` returns one row per hash (T x cols of them); a token's embedding is its cols rows
-        # concatenated, which is the layout wkv's input expects
-        e = self.embedding(layer, gathered).view(T, self.cols * self.head_dim).float()
+        e = e.view(T, self.cols * self.head_dim).float()
         kv = mm(e, proj["wkv"])                                 # [T, (hc + 1) * d]
         key = kv[:, :hc * d].view(T, hc, d)
         value = kv[:, hc * d:]

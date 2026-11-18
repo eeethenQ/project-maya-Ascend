@@ -46,6 +46,7 @@ class Runtime:
                      max_context=max_context, batch=batch)
 
     def close(self) -> None:
+        self.model.release_graphs()
         self.experts.close()
         self.ckpt.close()
 
@@ -91,13 +92,17 @@ def free_hbm_bytes(device: str) -> int:
 def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_share: float = 0.5,
           expert_slots: int | None = None, io_threads: int = 6, expert_batch: int = 8,
           expert_reserve_gib: float = 6.0, expert_devices: "list[str] | None" = None,
-          engram_tokenizer: str | None = None, no_experts: bool = False, verbose: bool = False) -> Runtime:
+          engram_tokenizer: str | None = None, no_experts: bool = False, graphs: bool = False,
+          graph_verify: bool = False, verbose: bool = False) -> Runtime:
     """Load the checkpoint's resident weights and size the expert tier to what is left of the cards.
 
     `expert_devices` spreads the routed experts' tier over several cards, a contiguous block of layers per
     card.  The layers themselves stay on `device`: the tier is what needs room (a decode step routes 240
     experts, 8.5 GB, and the ones a token routes change from token to token, so the set a conversation
     touches is many times that), while the attention state and the resident weights need very little.
+
+    `graphs` captures the one-token path as per-layer NPU graphs (see ``Dsv41``); it is off by default and
+    needs the expert tier on the layers' own card, because a captured layer cannot cross devices.
     """
     model_dir = Path(model)
     cfg = TextConfig.from_json(model_dir / "config.json")
@@ -124,8 +129,10 @@ def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_sha
             # The reserve is for the activations and temporaries of the card the layers run on; a card that
             # only holds experts needs room for little else.  The staging ring is *host* pinned memory and
             # does not come out of HBM at all.  Sized per card, so no card can be pushed past its share by
-            # the others - the tier is HBM, and the cap is per card.
-            reserve = int(expert_reserve_gib * GIB)
+            # the others - the tier is HBM, and the cap is per card.  Capturing the decode adds the expert
+            # landing zone (406 MB) plus the graph pools, which are not allocated yet when the tier is
+            # sized, so they are taken out of the reserve rather than out of whatever is left.
+            reserve = int((expert_reserve_gib + (1.0 if graphs else 0.0)) * GIB)
             if dev == "cpu":
                 per_card = {dev: 8 * GIB}
             else:
@@ -153,6 +160,6 @@ def build(*, model: str, device: str = "npu:0", dtype: str = "bfloat16", hbm_sha
                   f"{engram.cols} rows per token, tables mapped not loaded", flush=True)
     elif engram_tokenizer:
         print("  engram: the checkpoint has no tables for this config; disabled", flush=True)
-    model_obj = Dsv41(cfg, weights, dev, dt, engram=engram)
+    model_obj = Dsv41(cfg, weights, dev, dt, engram=engram, graphs=graphs, graph_verify=graph_verify)
     return Runtime(cfg=cfg, ckpt=ckpt, weights=weights, model=model_obj, device=dev, dtype=dt, experts=src,
                    engram=engram)

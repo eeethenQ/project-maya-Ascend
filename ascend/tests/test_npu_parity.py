@@ -154,6 +154,72 @@ class Parity(unittest.TestCase):
         # and the ranking a greedy engine acts on must not change
         self.assertEqual(int(got.argmax()), int(want.argmax()))
 
+    def greedy(self, net, state, prompt, steps):
+        """Greedy decode `steps` tokens, returning the ids and every step's logits.
+
+        The logits are kept per step, not just the last one: a captured layer whose first replay reads the
+        buffer its own eager warm-up wrote shows up at step 1 and *only* there, and comparing the last step
+        alone let that through once.
+        """
+        logits = net.forward(list(prompt), state)
+        ids, rows = [], []
+        for _ in range(steps):
+            nxt = int(logits[0].argmax())
+            ids.append(nxt)
+            logits = net.forward([nxt], state)
+            rows.append(logits.clone())
+        return ids, rows
+
+    def test_the_captured_decode_matches_the_eager_decode(self):
+        """The whole split on a card: 80 graphs on the real model, 8 on this one, same answer.
+
+        This is the small-scale form of the acceptance gate: the same weights decode the same prompt with
+        `graphs` on (g_pre/g_post, fixed landing zone, the host routing read between them) and off, and the
+        greedy ids must be identical.  It also asserts the graphs were really captured (mode "graph"), so a
+        silent fall back to eager cannot make this pass.
+        """
+        npu = self.build(self.dev, torch.bfloat16)
+        npu.graphs, npu.host_mixes = True, False
+        prompt = [3, 5, 7, 11]
+        on_ids, on_rows = self.greedy(npu, self.state(self.dev, torch.bfloat16), prompt, 5)
+        g = npu._decode_graphs
+        self.assertIsNotNone(g, "graphs were requested but no decode graph was captured")
+        self.assertEqual(g.captured, 2 * self.cfg.num_hidden_layers)
+        for name in list(g.pre.values()) + list(g.post.values()):
+            report = g.runner.report(name)
+            self.assertEqual(report.mode, "graph", f"{name} fell back instead of capturing")
+        # the same mHC branch on both sides: a captured layer contains the device Sinkhorn (the host one
+        # cannot be captured at all), so the like-for-like baseline is host_mixes=False.  The shipped
+        # default (host_mixes=True) is a *different* implementation of the same 24 scalars - on the real
+        # model it agrees to 1e-10 and can still flip a router top-k, which is not this test's subject.
+        npu.graphs, npu.host_mixes = False, False
+        off_ids, off_rows = self.greedy(npu, self.state(self.dev, torch.bfloat16), prompt, 5)
+        npu.release_graphs()
+        self.assertEqual(on_ids, off_ids, f"greedy ids differ: captured {on_ids}, eager {off_ids}")
+        for step, (on, off) in enumerate(zip(on_rows, off_rows)):
+            rel = (on - off).abs().max() / off.abs().max().clamp_min(1e-6)
+            self.assertLess(rel.item(), 2e-3,
+                            f"captured step {step} logits: max rel err {rel.item():.2e}")
+
+    def test_the_capture_guard_proves_the_split_reads_live_inputs(self):
+        """`graph_verify=True` runs the did-it-capture guard on every graph of the split.
+
+        The guard replays at two input values (the position moves *forward* by two, so it lands past the
+        groups the real step reads) and requires bit-equality with a fresh eager run at each.  A baked
+        position, index or address fails it, which is the failure mode this stack does not raise by itself.
+        """
+        npu = self.build(self.dev, torch.bfloat16)
+        npu.graphs, npu.host_mixes, npu.graph_verify = True, False, True
+        ids, _rows = self.greedy(npu, self.state(self.dev, torch.bfloat16), [3, 5, 7], 2)
+        g = npu._decode_graphs
+        self.assertIsNotNone(g)
+        for name in list(g.pre.values()) + list(g.post.values()):
+            report = g.runner.report(name)
+            self.assertTrue(report.verified, f"{name} was not verified: {report}")
+            self.assertTrue(report.ok, f"{name} failed the guard: {report}")
+        npu.release_graphs()
+        self.assertEqual(len(ids), 2)
+
     def test_the_share_is_respected_while_the_model_runs(self):
         """mem_get_info reports the card; what matters is that this process never allocates past its share."""
         npu = self.build(self.dev, torch.bfloat16)
