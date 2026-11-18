@@ -65,8 +65,9 @@ def main() -> int:
     ap.add_argument("--graphs", action="store_true",
                     help="capture the one-token path as per-layer NPU graphs: g_pre (attention, router), one "
                          "host read of the six ids, the expert fetch into a fixed double-buffered landing "
-                         "zone, g_post (the six experts).  Off by default; prompt chunks stay eager.  Needs "
-                         "the expert tier on the layers' own card")
+                         "zone, g_post (the six experts).  Off by default; prompt chunks stay eager.  The "
+                         "expert tier may be spread over several cards - each card captures its own g_post "
+                         "-- but the landing zone costs 203 MB of every card that holds experts")
     ap.add_argument("--graph-verify", action="store_true",
                     help="run the did-it-capture guard on every graph (slow: 4 eager runs per graph at "
                          "start-up, then bit-equality at two input values)")

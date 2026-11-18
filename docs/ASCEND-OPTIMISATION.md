@@ -7,7 +7,9 @@ obvious ideas are *measurably wrong*.
 
 ## The measurement everything starts from
 
-One decode step, four 910B3 cards, each process capped at 32 GiB, Engram off:
+One decode step, four 910B3 cards, each process capped at 32 GiB, Engram off. These are the pre-graph
+numbers the plan was written against; the current step is 409.6 ms with 80 graphs and a 90.9%-hit four-card
+tier, and the last section is how it got there:
 
 | | |
 |---|---:|
@@ -28,8 +30,9 @@ Measurements that were corrected while doing this, because they had been wrong:
 * the page cache **does not retain** the expert reads on this shared node - the same 40 experts read twice
   gave 3.2 GB/s the second time against 2.8 the first, with 1.25 TB of cache belonging to other tenants.
   Warming the model is therefore not a lever.
-* the "12.7 GB/s" figure that the expert tier was sized against is a **six-stream** number, not a warm-cache
-  number. One `preadv` thread reaches 2.3-3.2 GB/s.
+* the "12.7 GB/s" figure that the expert tier was sized against is **not reproduced cold**: 120 experts
+  (1.42 GB) ran at 1.4 GB/s on one `preadv` thread, 2.3 on six, 2.5 on twelve or twenty-four, so the array
+  saturates at ~2.5 GB/s.
 
 ## The four directions, and what each found
 
@@ -62,11 +65,12 @@ be a loss under a graph), and hoist the RoPE angles.
 
 2.62 GB of misses per step at 4.32 GB/s. The decisive fact is in the code, not the machine: `_read_many`
 reads **one layer's** misses, and a layer averages 1.85 of them - so about **two streams are in flight**,
-while the 12.7 GB/s the tier was sized against needs six.
+while the 12.7 GB/s the tier was sized against needs six - a rate R2 later failed to reproduce; the array
+saturates at ~2.5 GB/s.
 
 * **R1 - split each expert's three projections onto three pool tasks.** The expert's `w1|w2|w3` are
   byte-contiguous in the file (gaps 0 and 0, verified from the header), so this is three lines of code and
-  turns 1.85 streams into 5.5. **80-410 ms**, near-zero risk. Do this first.
+  turns 1.85 streams into 5.5. **80-410 ms**, near-zero risk. This was the first item; R2 killed it (below).
 * **R3 - issue the miss read in the background** so it hides under the resident experts' matmuls and the
   shared expert. **330-560 ms** together with R1. This also moves host I/O out of the region a graph would
   capture, which the previous section needs anyway.
@@ -85,7 +89,8 @@ And four ideas that are **measurably wrong**, which is why they were analysed in
 
 The floor this leaves: 8.5 GB/step over PCIe is **425 ms of unavoidable H2D** if nothing is resident, so the
 fetch cannot go below that without card hits - but if R1+R3 hide it under compute, the fetch stops being on
-the critical path at all.
+the critical path at all. R1+R3 did not survive R2, and the four-card tier later made the cold case moot:
+at 90.9% hit the step reads 0.774 GB, not 8.5.
 
 ### 3. Attention - 356 ms for one token
 
@@ -141,13 +146,14 @@ to hide behind; the only independent work in the window is the shared expert, 1-
 median (inside this machine's noise). It was reverted rather than kept.
 
 What survives, then, is a much shorter list, and the physics is simple: a token misses ~1/3 of its 240
-expert slots, each miss is 33.8 MB, and the array moves 2.5 GB/s. At 67% hits that is 2.8 GB and ~0.7-1.1 s
-of unavoidable read per token. **Only three things change that number**: a bigger tier (HBM, and the cap is
-32 GiB a card), fewer bytes per expert (4-bit - a different checkpoint, not a code change), or making the
-rest of the step overlap it. Graph capture attacks the third and the compute at once, which is why it is
-first below.
+expert slots, each miss is 33.8 MB, and the array moves 2.5 GB/s. At the then-measured 67% hits that is
+2.8 GB and ~0.7-1.1 s of unavoidable read per token. **Only three things change that number**: a bigger tier
+(HBM, and the cap is 32 GiB a card), fewer bytes per expert (4-bit - a different checkpoint, not a code
+change), or making the rest of the step overlap it. Graph capture attacks the third and the compute at once,
+which is why it came first; the four-card tier later reached 90.9% hit and 0.774 GB/step, which is the other
+half of the story.
 
-## What it came to: 3 250 -> 324.5 ms a token
+## What it came to: 3 250 -> ~410 ms a token
 
 Everything above was a plan. This is what it produced, on the real 40-layer model, four 910B3 cards, each
 process inside a 32 GiB share, measured with interleaved A/B in one process (never two runs - this machine
@@ -158,40 +164,61 @@ drifts by up to 50%):
 | where this started | 3 250 | the first working port |
 | an expert tier that was not empty | 1 926 | a units bug had sized it to zero |
 | the two dense fast paths | ~1 360 | host-side Sinkhorn and routing without `unique`/gather, 1.42x paired |
-| 80 captured graphs, single card | 595 | paired 0.660 [0.612, 0.738] |
-| 80 captured graphs, four cards | **324.5** | paired 0.481 [0.261, 0.652] = **2.08x** against four-card eager |
+| 80 captured graphs, single card | 595 | paired 0.660 [0.612, 0.738] against 998 |
+| 80 captured graphs, four cards | 324.5 | paired 0.481 [0.261, 0.652] = **2.08x** against 753.1 |
+| landing-zone copies, one per expert | **409.6** | paired 0.880 [0.773, 0.979] against 452.4, -42.8 ms |
+| the GSM8K re-check | not a speed step | 9/10 at 1.77 tok/s against 10/10 at 0.83; the control says the mHC branch, not capture |
+| Engram fixed; graphs with Engram on | not a speed step | 80 graphs, ids identical, logits bit-equal, probe `" dog"` p≈1.000 |
 
-The last step is the interesting one, and it is the same lesson as the first: **the tier, not the code.** The
-graphs refused a spread expert tier because a cross-card copy cannot be captured - until the landing zone
-moved off the compute card, so each expert card holds its own and `g_post[li]` is captured where its experts
-live. The tier went from 254 slots at 64.6% hit and 3.004 GB/step read, to 2 480 slots at **90.9%** and
-**0.774 GB/step**. The capture did not make the reads cheaper; it made the reads unnecessary.
+The four-card step is the interesting one, and it is the same lesson as the first: **the tier, not the
+code.** The graphs refused a spread expert tier because a cross-card copy cannot be captured - until the
+landing zone moved off the compute card, so each expert card holds its own and `g_post[li]` is captured
+where its experts live. The tier went from 254 slots at 64.6% hit and 3.004 GB/step read, to 2 480 slots at
+**90.9%** and **0.774 GB/step**. The capture did not make the reads cheaper; it made the reads unnecessary.
 
-What is left is different in kind: the step now spends **~90% of its non-captured time in the expert fetch**
-(the array's ~2.5 GB/s) and its floor is the **164 ms of device time**. Both of those are the next section's
-problem, not this one's.
+The copy work is a different lesson: the 8.1 GB still has to land at fixed addresses, and one copy per expert
+runs at 513 GB/s against 294 for three (1.78x; a single 212 MB copy would be 668, 2.22x). Landed as one
+`copy_` per expert plus a contiguous scale slab, it took TensorMove from 1 016.5 to 338.8 calls and 22.46 to
+19.65 ms a step; the full step 452.4 -> 409.6 ms, paired 0.880, -42.8 ms. Most of the gain is host dispatch,
+36 -> 7 ops a layer, which msprof's task durations do not count.
 
-## The order to do it in, and why
+**On the absolutes**: 324.5, 350.6 (the paired all-in run in `8cfdc55`) and 452.4 (the baseline the copy work
+was measured against) are the same capture at different times on the shared machine, and 409.6 is the latest
+paired absolute. The paired ratios are the comparable numbers; the 2.08x is 324.5 against 753.1 in one A/B,
+not 409.6 against 753.1.
 
-The analyses disagree about priority in an instructive way, and the disagreement resolves on one number:
+What is left is different in kind: the step still spends most of its time in the expert fetch (0.774 GB/step
+at the array's ~2.5 GB/s), its device time is **137.5 ms**, and the top device-time item is the landing-zone
+copy at 19.65 ms. Both are the next section's problem, not this one's.
+
+## The order it went in, and what that says
+
+The analyses disagreed about priority in an instructive way, and the disagreement resolved on one number:
 **after capture an operator call costs 1.88 us instead of 47 us.** So cutting calls saves ~25x less once a
-graph is in place - which demotes most of directions 3 and 4 from "worth 177 ms" to "worth ~17 ms" *if done
-second*, and promotes graph capture to first even though it is the largest single change.
+graph is in place - which demoted most of directions 3 and 4 from "worth 177 ms" to "worth ~17 ms if done
+second", and promoted graph capture even though it was the largest single change. That is what happened:
 
-1. ~~R2, then R1 + R3~~ - done: R2 says the array is the wall and R1 is worth nothing (above). Of the stream
-   work only **R4** (preload the 15 360 experts' scales and offsets, 0.61 GB) survives, worth 5-15 ms and,
-   more usefully, 120 synchronous copies a step that a graph would otherwise capture around.
-3. **The three capture prerequisites**, then **80 graphs**: 1 661 -> ~831 ms, the single biggest win.
-4. **Device-time cuts**, which a graph cannot remove: `npu_fusion_attention` with the sink (~35-45 ms of
-   device time), `npu_dynamic_quant` for the per-token activation, `npu_clipped_swiglu`.
-5. **The call-count work in directions 3 and 4**, re-measured after capture - it may then be worth skipping,
-   except where it also removes device time or syncs.
-6. **Sharding one layer's six experts across the four cards (~360 ms of the 492 ms MoE compute)** - the
-   largest remaining idea, but it conflicts with capture (a cross-card copy cannot be captured), so it has to
-   be decided *after* the graph work or designed as a separate graph per card.
+1. **R2 was run first, and it killed R1 and R3.** The array saturates at ~2.5 GB/s and the reads are cold;
+   splitting the projections over more threads buys nothing, and `hc_post` leaves nothing to overlap. R4
+   survived, was built, and measured 0.97x: it stays only as a capture enabler.
+2. **The three capture prerequisites, then 80 graphs.** The KV planes, the device RoPE tables and the
+   compressor/indexer buckets made every layer capturable. Single card: 595 against 998 ms, 0.660. Four
+   cards: 324.5 against 753.1 ms, 0.481 = 2.08x.
+3. **The device-time cuts were measured and rejected.** `npu_dynamic_quant` breaks the 2e-3 parity promise
+   (3.1e-2), `npu_clipped_swiglu` is +1.9 ms net, and `npu_fusion_attention` cannot be captured (107025).
+   Their net effect on the 324.5 ms step was none measurable (1.011 [0.974, 1.266] over 28 paired samples).
+4. **The call-count work in directions 3 and 4 was not done.** After capture it is worth at most ~17 ms by
+   the 1.88 us/call figure, and most of it would need a device-time or sync reason to be worth taking.
+5. **Sharding one layer's six experts across the cards was the largest remaining idea in the plan.** The
+   four-card tier already puts each layer's `g_post` on its expert card, and capture removed the dispatch it
+   was aimed at; it is not on the queue.
+
+What came after the plan is in the table above and in [`docs/ASCEND-DSV41.md`](ASCEND-DSV41.md) §14: the
+landing-zone copy work, the GSM8K re-check and the Engram fix.
 
 ## What is not in question
 
-The device is not the bottleneck: 246 TFLOP/s of bf16 against a 164 ms device time. Neither is HBM bandwidth.
-Both of the plausible "big machine" explanations for a slow step are wrong here, and the profile says so
-plainly: it is 32 242 small operations and 2.6 GB of expert bytes, in that order of addressability.
+The device is not the bottleneck: 246 TFLOP/s of bf16 against a 137.5 ms device time. Neither is HBM
+bandwidth. Both of the plausible "big machine" explanations for a slow step are wrong here, and the profile
+says so plainly: it was 32 242 small operations and 2.6 GB of expert bytes; after the graphs it is 80
+replays and 0.774 GB of expert bytes, and the bytes are the larger term.

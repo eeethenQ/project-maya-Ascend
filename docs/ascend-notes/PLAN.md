@@ -20,16 +20,36 @@ can see what is in flight, who owns it and what "done" means. The analysis behin
 
 ## The queue
 
-| # | item | owner | state | acceptance |
-|---|---|---|---|---|
-| 0c | the step's RoPE tables, built once per layer | lead | **done** (`6966609`) | Cos/Sin counts halved in `op_summary`; decode-equals-chunk test green |
-| 0a | device-side state addressing (the KV planes) | `kv-device` built it, lead integrated | **done** (`a61bf27`) | `KvPlanes` is a drop-in: 18 CPU tests against today's slicing (positions 0..300, wrap, rewind, `-1` padding); `State` delegates to it; the write is one `index_copy_`, the read a fixed `sliding_window` gather plus a mask; the real-model probe still says `" dog"` |
-| 0b | mHC on the device path, the two mixes batched | lead | **batching ruled out** | the two mixes take *different* inputs (`h` before and after the attention block), so one `[2, 4d] x [4d, 24]` matmul cannot serve both; what 0b actually needs is only `host_mixes=False`, which is already the general path |
-| P1 | capture one layer, verify the replay | `capture-harness` → lead ran the probe | **done** (evidence below) | a probe that captures this engine's own ops (`npu_quant_matmul`, `index_copy_`, `index_select`, softmax, topk, two-graph handoff) and gets **bit-identical** results |
-| P2a | capture every layer kind | `capture-compress` | **done** (`dafe6cb`) | layer 2 (compress_ratio 2, KV + index source) captures and replays bit-exactly, following positions that close a group and ones that do not: **7.90x** for that layer.  With the window-only layer at 5.53x, all 40 layers are capturable |
-| P2b | 80 graphs + one fixed expert landing zone | lead | **next** | layer 1 captures, replays bit-exactly and follows a live position (5.53x for that layer).  Still blocked on: the compressor/indexer of layers with `compress_ratio > 0` (host-derived group indices), and the MoE, which stays outside the graph |
-| R4 | an expert's scales read once and kept on the card | lead | **done** (`056d9ac`), measured **0.97x** | interleaved A/B: 1 158 ms cached against 1 125 ms fresh at the median, i.e. **no wall-clock gain**, at 56 MiB of measured tier in the run.  It stays for one reason only - it removes the *synchronous* device copies that a captured graph cannot contain - and on that basis it is an enabler, not a speed-up.  If capture of the 30 compress layers does not land, this is the first thing to take back out |
-| D1 | device-time cuts a graph cannot remove | unassigned | queued | `npu_fusion_attention` with the sink (~35-45 ms of device time), `npu_dynamic_quant`, `npu_clipped_swiglu` |
+Done, with the evidence that closed it:
+
+| # | item | evidence |
+|---|---|---|
+| 0c | the step's RoPE tables, built once per layer | `6966609`: Cos/Sin counts halved in `op_summary`; decode-equals-chunk green |
+| 0a | device-side state addressing (the KV planes) | `a61bf27`: `KvPlanes` is a drop-in (18 CPU tests over positions 0..300, wrap, rewind, `-1` padding); one `index_copy_` write, a fixed-width window gather plus mask; the real-model probe still says `" dog"` |
+| 0b | the two mHC mixes batched | ruled out: they take different inputs (`h` before and after attention), so one `[2, 4d] x [4d, 24]` matmul cannot serve both; what 0b needed is `host_mixes=False`, already the general path |
+| P1 | the capture probe | `67f39fa`: every operator in the forward captures and replays bit-identically; a two-graph `g_pre -> D2H -> g_post` reproduces eager |
+| P2a | every layer kind captures | `6dd8061`, `dafe6cb`: a window layer 3 351 -> 606 us (**5.53x for that layer**), a compress layer 8 687 -> 1 100 us (**7.90x for that layer**); all 40 layers capturable. Per-layer, not the step |
+| P2b | 80 graphs, single card | `615104c`: 595 against 998 ms/token, paired **0.660 [0.612, 0.738]**; 16 greedy ids identical and logits bit-equal; capture 1.9 s |
+| P3 | four-card graphs, a landing zone per expert card | `383ab69`: 324.5 against 753.1 ms, paired **0.481 [0.261, 0.652] = 2.08x**; tier 2 480 slots at **90.9%** and 0.774 GB/step against single-card 254 at 64.6% and 3.004; 80 graphs in 1.8 s; the silent per-card capture-stream bug fixed |
+| P4 | the landing-zone copy work | `aca9485`: 452.4 -> 409.6 ms, paired **0.880 [0.773, 0.979]**, -42.8 ms; TensorMove 1 016.5 -> 338.8 calls and 22.46 -> 19.65 ms a step |
+| P5 | the GSM8K re-check | `c3a6ac6`: 9/10 at 1.77 tok/s with graphs against 10/10 at 0.83 eager; a control with graphs off and `host_mixes=False` reproduces the graphs-on text token for token - the difference is the mHC branch, not capture |
+| P6 | Engram fixed, graphs with Engram on | `cc01d7d`: the contract is restored in `engram.py`; 80 graphs with Engram on, greedy ids identical, logits bit-equal, `" dog"` p≈1.000; 160 tests, 8 skipped |
+| R4 | an expert's scales read once and kept on the card | `8d3d9a4`: 1 158 ms cached against 1 125 fresh, **0.97x** - no wall-clock gain. It stays only as a capture enabler, because it removes the synchronous scale copies |
+| D1 | device-time cuts a graph cannot remove | `8cfdc55`: measured out, see "Ruled out" below; net effect on the step none measurable (1.011 [0.974, 1.266] over 28 paired samples) |
+
+What is genuinely left:
+
+| # | item | why it is left / acceptance |
+|---|---|---|
+| G1 | expose `--graphs` in `ascend/serve_engine.py` | `strata-ascend` builds the eager model today, so the server runs 816 ms, not 409.6; `run_dsv41 --graphs` is the only captured path |
+| G2 | the recapture cost | 80 graphs take 1.8-1.9 s and belong to a State; every new conversation recaptures, and crossing an indexer bucket costs another 1.8 s. The GSM8K run's last State captured 118 at 2 048 context |
+| G3 | make the tier the landing zone | at 90.9% hit the step still copies 8.1 GB device-to-device; `TensorMove` is 19.65 ms, the top device-time item |
+| G4 | prefill | `T > 1` is eager and array-bound: 421 s for 823 prompt tokens in the GSM8K re-check; capture does not apply to it |
+| G5 | multi-session | the serve engine holds one conversation (`READY ... multi=n` is absent) |
+
+The graph work landed in the six commits from `615104c` to `cc01d7d`: single card 0.660, four cards 0.481,
+the copy work 0.880, plus `8cfdc55`'s graph leak and device-time negatives. The re-check and the Engram fix
+were not speed steps; they changed what can be claimed about accuracy and correctness.
 
 ## The capture probe: every op this engine needs captures, bit-identically
 
@@ -74,9 +94,10 @@ With that one change, `.ascend-work/probe_layer.py` on layer 1 (window-only):
 | one layer, eager vs graph | **3 351 us -> 606 us (5.53x)** |
 
 So the two properties that could have sunk the direction both hold: the graph replays bit-exactly, and it
-reads the live position rather than a value baked at capture. Phase 1 is unblocked; what remains for the
-per-layer split is the compressor/indexer (layers with `compress_ratio > 0` still derive group indices from
-host ints) and the MoE, which must stay outside the graph because it reads the host.
+reads the live position rather than a value baked at capture. Phase 1 is unblocked; what remained for the
+per-layer split was the compressor/indexer (layers with `compress_ratio > 0` still derived group indices from
+host ints) and the MoE, which must stay outside the graph because it reads the host. Both landed: the
+compressor/indexer in `dafe6cb` (one graph per selection bucket), the MoE seam in `615104c`.
 
 ## Where the capture stood before this
 
@@ -92,7 +113,9 @@ that synchronises internally, or an allocation/in-place pattern ACL dislikes, no
 the easy cases and are gone). The next diagnostic is a bisect, capturing progressively more of the layer in
 this order: `Rope.cos_sin` + `apply`; the q path (`wq_a`, `rms`, `wq_b`); the kv path and `write_window`; the
 window `read_window`; `sparse_attn` alone; `out_projection`; then the whole `attention`. Whichever step first
-raises names the operator to work around.
+raises names the operator to work around. It was run and named **`Rope`**: its tables were built on the CPU,
+so every `Rope.angles` call did a host copy. `6dd8061` moved them to the device, and the composed layer then
+captured.
 
 ## Two bugs the work found
 
@@ -104,17 +127,24 @@ raises names the operator to work around.
 
 ## Measured facts the queue is built on
 
-- 32 242 operator calls a step, 164 ms of device time, ~1 661 ms of wall clock: **call-bound**.
+- the captured step is **409.6 ms/token** on four cards with 80 graphs: 324.5 against 753.1 (0.481, 2.08x),
+  and 816.5 ms eager. The copy work was 452.4 -> 409.6 (0.880). The absolutes drift; the ratios do not.
+- the four-card tier is **2 480 slots, 90.9% hit, 0.774 GB/step**; one card 254 slots, 64.6%, 3.004 GB/step.
+- the device time is **137.5 ms** at 29 744 operator calls after the graphs (pre-graph: 164.3 ms at
+  32 242); the top device-time item is the landing-zone `TensorMove`, 19.65 ms after the copy work.
 - R4's scale cache is worth **0.97x**, i.e. nothing, on wall clock: the analysis's "5-15 ms" did not appear.
 - the expert reads are **cold** (`read_bytes` 1.65 GB/step against `rchar` 1.47) and the array saturates at
   **~2.5 GB/s** - threads do not help, which is why R1 is dead and the stream is not on this queue.
 - `torch.npu.graph` captures and replays on this stack; 47.4 us a call eager becomes 1.88 us a call
-  captured. That ratio is why the call-cutting work (8 832 calls, ~177 ms) is queued *after* the graphs: it
-  would be worth ~17 ms once a graph is in place.
+  captured. That ratio is why the call-cutting work (8 832 calls, ~177 ms) was queued *after* the graphs,
+  not before: it would be worth ~17 ms once a graph is in place. It was not done.
 
 ## Ruled out, with the measurement that ruled it out
 
 A hit-count expert profile (-18-31 points of hit rate against LRU at 2 603 slots); speculative prefetch from
 the previous token's routing (3.24x read amplification, net slower); a pinned host arena (`ulimit -l` is
 64 MB, and pageable already copies at 20 GB/s); pooling the four cards' HBM over HCCS (0 hit-rate points -
-the per-layer capacity is what binds); the Engram prefetch (0.90x); the per-layer tier quota (neutral).
+the per-layer capacity is what binds); the Engram prefetch (0.90x); the per-layer tier quota (neutral, 1.07x);
+R1 and R3 (the array saturates at ~2.5 GB/s and `hc_post` leaves nothing to overlap); `npu_dynamic_quant`
+(-2 642 calls and ~3 ms of device time, but logits move 3.1e-2, outside the 2e-3 promise); `npu_clipped_swiglu`
+(+1.9 ms net); and `npu_fusion_attention` (cannot be captured - `AclmdlRICaptureEnd` 107025).

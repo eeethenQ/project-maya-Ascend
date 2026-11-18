@@ -88,8 +88,9 @@ def main() -> int:
     ap.add_argument("--engram-tokenizer", default="",
                     help="enables Engram; the same value as --tokenizer is right")
     ap.add_argument("--graphs", action="store_true",
-                    help="capture the one-token decode path as per-layer NPU graphs (the serve engine's "
-                         "fast path).  Every question gets a fresh State, and the graphs belong to the "
+                    help="capture the one-token decode path as per-layer NPU graphs (the fast path this "
+                         "harness measures; the serve engine does not use graphs yet).  Every question gets "
+                         "a fresh State, and the graphs belong to the "
                          "State, so this re-captures the 80 graphs per question; that capture time is "
                          "included in the decode seconds reported.")
     ap.add_argument("--graph-verify", action="store_true",

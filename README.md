@@ -320,43 +320,74 @@ Anthropic-compatible API, the tools, the thinking levels and the web UI drive it
 
 **The model.** DeepSeek-V4.1-Flash only, and only from the **Ascend ModelSlim W8A8** export
 (`quant_method: ascend`: int8 weights per output channel, int8 activations per token) - not Maya's 1.6-4 bit
-packs. That export is **578 GB**, so the 545 GB of routed experts stream from the host while about 15 GB of
-attention, embeddings, shared experts and norms stay resident on a card.
+packs. That export is **578 GB** before Engram's two 101 GB tables; the 545 GB of routed experts live on the
+host and are streamed on demand into an expert tier on the cards, while about 15 GB of attention,
+embeddings, shared experts and norms stay resident.
 
 **What is implemented.** The whole 40-layer text backbone: mHC residual streams, CSA2 attention (128-token
 window, four compressed KV caches with a two-level indexer and its candidate blocks), the sqrt-softplus
 router over 384 experts plus the shared expert, **Engram** at layers 1 and 14 (its two 101 GB tables are
 mapped, not loaded: a token reads 24 rows), the per-request state that makes one-token-at-a-time decoding
-match a whole-prompt pass, the W8A8 int8 expert path, and an expert tier spread across several cards with a
-per-card LRU. **Not** implemented: vision, DSpark speculative decoding, MTP, and more than one conversation at
-a time.
+match a whole-prompt pass, the W8A8 int8 expert path, an expert tier spread across several cards with a
+per-card LRU, and **the captured decode**: 80 NPU graphs for a one-token step (two per layer), with
+`g_pre` on the compute card and `g_post` on the card that holds the layer's experts, so the four-card tier
+is captured rather than fallen back from. Engram works on the captured path too. **Not** implemented:
+vision, DSpark speculative decoding, MTP, and more than one conversation at a time.
 
 **How fast, measured** on 4x 910B3 (64 GB each, shared; each process kept inside 32 GB):
 
 | | |
 | --- | --- |
-| decode, one token at a time | **0.47 tokens/s** (2.1 s/token) on the run below, before the single-token fast paths; those are worth **1.42x** on the step (`bench_step --ab-dense`) |
-| prompt reading | 0.9-1.1 s per prompt token - limited by the disk array, not the NPU |
-| decode with the routed experts switched off | 478-544 ms/token - the floor the 40 layers' small operations set |
-| one MoE layer, its experts resident | 12.5 ms |
-| expert stream | ~4 GB/s effective in the engine; 2.8-3.2 GB/s per `preadv` thread even on a second pass (the page cache does not keep them), 12.7 GB/s with six threads |
+| decode, 80 graphs, four cards | **409.6 ms/token** (about 2.4 tokens/s) in the latest paired run |
+| decode, four cards, eager | **816.5 ms/token** |
+| graphs against eager | **0.481** four-card (324.5 against 753.1 ms, **2.08x**) and **0.660** single-card (595 against 998 ms) |
+| landing-zone copy work (that change alone) | **0.880** (452.4 -> 409.6 ms, -42.8 ms over 48 paired samples) |
+| expert tier, four cards | **90.9% hit, 0.774 GB/step read**; one card 64.6%, 3.004 GB/step |
+| prompt reading | 421 s for 823 prompt tokens in the GSM8K re-check (about 0.5 s/token), limited by the array |
+| decode, routed branch off (eager) | 544 ms/token - the floor the 40 layers' small operations set |
+| one MoE layer, its experts resident (eager) | 12.5 ms |
 | the card itself | 246 TFLOP/s bf16, 20 GB/s host-to-HBM, 30.48 GiB per process |
+| the array | ~2.5 GB/s cold; the page cache does not retain the expert reads |
 
-**How right, measured.** Ten sampled GSM8K questions (seed 0, greedy, non-thinking), **9 correct**, 0.47 tokens/s
-decode and 56 s mean prompt reading; the one miss ran out of its 192-token budget rather than getting the
-arithmetic wrong. The report, with every answer, is
-[`ascend/results/gsm8k-10q-engram.json`](ascend/results/gsm8k-10q-engram.json). Two honest caveats: that is
-zero-shot with a short instruction, not the 8-shot protocol GSM8K is scored with, so it is not comparable
-with published numbers; and ten questions separate "wired correctly" from "broken", not much more.
+**What is measured and what is not.** The speed figures are one process on four 910B3s (64 GB each, shared;
+each process held to 32 GB), and every comparison is an interleaved A/B in one process. Absolute milliseconds
+move with the other tenant's load - the four-card step has measured 324.5, 350.6 and 409.6 ms at different
+points of the work - so the paired ratios are the signal. The GSM8K re-check is Engram off; the committed
+0.47 tok/s baseline is Engram on and pre-graph, so the two are not a like-for-like speed comparison.
+Nothing here is measured on another card, another checkpoint or another dtype.
+
+**How right, measured.** Ten sampled GSM8K questions, greedy, non-thinking, the same sample both ways: with
+80 graphs **9 correct at 1.77 tokens/s**; eager **10 correct at 0.83 tokens/s**. The difference is not
+capture - a control with graphs off and the device mHC branch forced (`host_mixes=False`) reproduces the
+graphs-on text token for token on all four questions that differ. The two mHC branches agree to 1e-10 on
+their 24 scalars, but a router top-k tie can take a different trajectory early; question 4 answers 60 where
+eager answers 15. On ten questions, 9 against 10 cannot separate the branches; what it does say is that the
+graphs replay what the device path computes. The reports are
+[`gsm8k-10q-graphs-on.json`](ascend/results/gsm8k-10q-graphs-on.json),
+[`gsm8k-10q-graphs-off.json`](ascend/results/gsm8k-10q-graphs-off.json) and the comparison
+[`gsm8k-10q-graphs-compare.json`](ascend/results/gsm8k-10q-graphs-compare.json); the pre-graph, Engram-on
+baseline is [`gsm8k-10q-engram.json`](ascend/results/gsm8k-10q-engram.json).
+
+**Engram** is fixed: the regression was a contract change in `Engram.apply`, and the fix restores the
+contract where the method owns the gather; `torch.copysign` had no NPU kernel and its CPU fallback was the
+copy that stopped `g_pre` capturing, now `where`. With Engram on, all 80 graphs capture, greedy ids are
+identical to eager and every step's logits are bit-equal, and the known probe `"The quick brown fox jumps
+over the lazy"` answers `" dog"` at p≈1.000.
+
+The GSM8K caveats stand: this is zero-shot with a short instruction rather than the 8-shot protocol GSM8K is
+usually scored on, so the number is not comparable with published ones; and ten questions can only tell
+"wired correctly" from "broken".
 
 Known-knowns from the port itself, in case they save someone a week: a CPU expert lane is **useless** on a
 Kunpeng 920 (PyTorch's aarch64 bf16 path runs at 0.12 GB/s, four times slower than the host link); the
 checkpoint's residual stream is in the **QuaRot rotated basis** while Engram's key and gate weights are in the
-original one, so the Engram gate's dot product needs one explicit un-rotation; and at 8.5 GB of experts per
-token the storage array, not the NPU, is what sets the speed.
+original one, so the Engram gate's dot product needs one explicit un-rotation; and at 8.1 GB of experts per
+step if nothing is resident, a miss still goes to an array that saturates at ~2.5 GB/s: the four-card tier's
+90.9% hit is what cuts the read to 0.774 GB/step, and the hit rate, not the NPU, is what sets the speed.
 
-**Configuration.** Two files, both in the repository: [`ascend/setup_tokenizer.sh`](ascend/setup_tokenizer.sh)
-builds the tokenizer directory the server wants (the W8A8 export ships no tokenizer at all), then
+**Configuration and how to run it.** Two files, both in the repository:
+[`ascend/setup_tokenizer.sh`](ascend/setup_tokenizer.sh) builds the tokenizer directory the server wants (the
+W8A8 export ships no tokenizer at all), then
 [`ascend/serve-config.example.json`](ascend/serve-config.example.json) points the server at the engine:
 
 ```sh
@@ -366,16 +397,33 @@ python3 -m serve.server --engine strata --config ascend/serve-config.example.jso
 python3 -m ascend.eval_gsm8k --help # accuracy and speed on a GSM8K sample
 ```
 
-Add `--engram-tokenizer <the model's tokenizer.json>` to enable Engram; `--expert-devices npu:0,npu:1,npu:2,npu:3`
-spreads the expert tier over four cards. The engine sizes the tier from the HBM actually left after the resident
-weights, less a reserve; `--expert-slots` overrides it, and a card that runs out of room drops an expert from the
-tier instead of failing the request.
+The captured decode is run directly, on the real checkpoint:
 
-**What is next**, in the order the measurements argue for: per-layer graph capture (the 544 ms floor is 40 layers
-x about thirty small operations each, the problem this project already solved on CUDA with per-layer graphs);
-batched prompt reading; a profiled expert placement instead of the LRU, so the tier holds what a conversation
-actually routes; keeping the resident weights in int8 to free several GB for that tier; and multi-session
-(`READY ... multi=n`) for the `--parallel` the server already speaks.
+```sh
+python3 -m ascend.run_dsv41 --model /mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8 \
+    --tokenizer /mnt/weights/DeepSeek-V4-Flash-0731-w8a8/tokenizer.json \
+    --chat "The quick brown fox jumps over the lazy" --graphs \
+    --expert-devices npu:0,npu:1,npu:2,npu:3
+```
+
+`--graphs` is off by default and only the one-token step is captured; prompt chunks stay eager. It works
+with the spread tier, because each layer's `g_post` is captured on the card its experts live on. The serve
+engine (`ascend/strata-ascend`) has no `--graphs` flag yet, so the server runs the eager step; the captured
+numbers above come from `run_dsv41 --graphs`. Add `--engram-tokenizer <the model's tokenizer.json>` to
+enable Engram (it works on the captured path too); `--expert-devices npu:0,npu:1,npu:2,npu:3` spreads the
+tier. The engine sizes the tier from the HBM actually left after the resident weights, less a reserve;
+`--expert-slots` overrides it, and a card that runs out of room drops an expert from the tier instead of
+failing the request.
+
+**What is next**, in the order the measurements argue for: wire `--graphs` into the serve engine, which is
+the only way the server gets the 409.6 ms step rather than the 816 ms one; cut the recapture cost - 80 graphs
+take 1.8-1.9 s and belong to a State, so every new conversation pays it again, and so does crossing an
+indexer bucket; make the expert tier itself the landing zone, so the 8.1 GB/step device-to-device copy stops
+being the top device-time item; decide whether the 137.5 ms device floor is worth attacking, since the three
+obvious fused ops were measured and rejected; and note that prefill (`T > 1`) is still eager and array-bound
+(421 s for 823 prompt tokens in the GSM8K re-check), while capture does not apply to it. Multi-session
+(`READY ... multi=n`) is still absent. The queue with acceptance is
+[`docs/ascend-notes/PLAN.md`](docs/ascend-notes/PLAN.md).
 
 ## Something went wrong?
 

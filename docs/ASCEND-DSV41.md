@@ -6,7 +6,8 @@ Nothing in the CUDA/HIP builds imports it. This file is the record of what the m
 actually are, why the design looks the way it does, and what is measured rather than assumed.
 
 Scope, fixed by the task: only DeepSeek-V4.1-Flash, only its `w8a8` checkpoint, on four 910B3 cards each
-capped at 32 GB because the cards are shared. GLM, MiniMax, vision, DSpark and Engram are out.
+capped at 32 GB because the cards are shared. GLM, MiniMax, vision and DSpark are out; Engram is in, opt-in
+through `--engram-tokenizer`, and it works on the captured path.
 
 ## 1. The hardware and what it forces
 
@@ -18,7 +19,7 @@ cores, 8 NUMA nodes). Each number below is a test in `ascend/tests/test_env.py`.
 | this process's HBM | `set_per_process_memory_fraction(0.5)` → **30.48 GiB allowed** of 60.96 | a request past it OOMs instead of taking a neighbour's HBM — the 32 GB cap is enforced, not hoped for |
 | bf16 Cube | **246–259 TFLOP/s** at 1024x5120x5120 | the dense part of the model is free; nothing here is compute-bound |
 | host → HBM | **20 GB/s**, pageable or pinned (no faster pinned path) | the expert stream is the whole design problem |
-| storage (RAID6, `/mnt/weights`) | **1.1 GB/s** direct; one `preadv` thread reaches 2.3-3.2 GB/s, six reach 12.7 GB/s | the expert stream is storage-and-copy bound, and reads are *not* retained: a second pass over the same 40 experts was 3.2 GB/s against 2.8 GB/s the first time |
+| storage (RAID6, `/mnt/weights`) | **1.1 GB/s** direct; a cold pass of 120 experts (1.42 GB) runs at **1.4 GB/s on one `preadv` thread, 2.3 on six, 2.5 on twelve or twenty-four** - the array saturates at ~2.5 GB/s, and the page cache does not retain the expert reads | the expert stream is storage-and-copy bound, and reads are *not* retained: a second pass over the same 40 experts was 3.2 GB/s against 2.8 GB/s the first time |
 | int8 w8a8 matmul | `npu_quant_matmul`, `npu_quant_grouped_matmul_dequant`, … exist | the checkpoint's int8 weights can be multiplied natively, no dequantization needed on the fast path |
 | torch CPU bf16 GEMV | **0.12 GB/s** (100 ms for one 11.8 MB expert matrix, at any thread count) | the CPU expert lane this project uses on GPUs is *useless* here |
 | torch CPU fp16 GEMV | 3.7 GB/s (3.2 ms for the same matrix) | a CPU lane would still cost ~2.2 s/token — slower than streaming to the NPU |
@@ -30,15 +31,15 @@ slower than the PCIe link. **The expert lane is the NPU, fed from host RAM.** Th
 
 ## 2. The checkpoint
 
-140 shards, **577.9 GB** of tensors, no tokenizer, and (from an index the loader builds itself) this
-breakdown:
+140 shards and **577.9 GB** of tensors before the Engram shards, no tokenizer, and (from an index the
+loader builds itself) this breakdown. The two Engram tables are 188.8 GiB and are mapped, never loaded:
 
 | category | bytes | resident? |
 |---|---|---|
-| routed experts, 40 x 384 x 3 x 2304 x 5120 int8 | **520 GiB** | never — 8.1 GB per decode step is streamed |
+| routed experts, 40 x 384 x 3 x 2304 x 5120 int8 | **520 GiB** | 8.1 GB if nothing is resident; the four-card tier reads **0.774 GB/step** at 90.9% hit |
 | attention, embeddings, head, shared experts, norms, mHC | **12.6 GiB** | yes, dequantized once onto the card |
 | `mtp.*` (DSpark drafter) + `vision.*` + `aligner.*` | ~5.6 GiB | not loaded (out of scope) |
-| Engram tables, 2 x ~94 GiB | 188.8 GiB | not loaded — still downloading, and vLLM treats Engram as opt-in |
+| Engram tables, 2 x ~94 GiB | 188.8 GiB | mapped, not loaded; opt-in through `--engram-tokenizer`, and not included in the 577.9 GB above |
 
 Verified by reading the safetensors headers, not the docs: 40 layers x 384 experts (my first count said
 34/368/336 because the shards were still downloading — the loader now reports a shard that is `.incomplete`
@@ -57,7 +58,7 @@ Structural facts the code depends on, all asserted in `ascend/tests/test_checkpo
 The `optional/quarot.safetensors` rotation is **already fused into the exported weights** — every
 residual-feeding RMSNorm gain is exactly 1.0 because the gains were folded into the next linear's columns.
 A loader must therefore consume the weights verbatim and apply no rotation. (The one exception, the Engram
-gate, is out of scope.)
+gate, needs the un-rotation described in §3 and `ascend/dsv41/engram.py`.)
 
 ## 3. The model, and where the specification came from
 
@@ -93,7 +94,16 @@ The pieces that are easy to get silently wrong, and what the code does:
 
 ## 4. Result
 
-`python -m ascend.run_dsv41 --chat "…"` runs the real 40-layer model on one card:
+`python -m ascend.run_dsv41 ... --graphs` runs the real 40-layer model on one card, with the expert tier
+over four. The captured decode is the current measured path: 80 graphs for 40 layers (118 at 2 048 context,
+where the indexer needs one graph per selection bucket per layer), 16 greedy tokens identical to eager and
+every step's logits bit-equal, and 1.8-1.9 s to capture. The step is **409.6 ms/token** in the latest paired
+run; four-card capture against eager was **324.5 against 753.1 ms, paired ratio 0.481 = 2.08x**, and
+single-card 595 against 998 ms, 0.660. In a later paired A/B, the landing-zone copy work took 452.4 to
+409.6 ms, paired 0.880. The absolute figures come from different paired runs on the shared machine and
+drift with the other tenant's load; the paired ratios are the signal.
+
+The first run, on one card and without graphs, printed:
 
 ```
 model: 40 layers, hidden 5120, 384 experts x top-6
@@ -104,18 +114,22 @@ next: [('The', -0.043), ('Paris', -3.166), ('**', -9.965), (' Paris', -13.501), 
 ```
 
 The model is reading the prompt and producing a sane next-token distribution — "Paris" is second and
-"London" fifth. Latency at this stage is ~5.7 s/token, which is the honest number for the design as it
-stands: 8.1 GB per decode step, and the read path still does a redundant host copy (`np.stack` of
-page-cache views) before the H2D. `ascend/bench_experts.py` measures the alternatives.
+"London" fifth. That run measured ~5.7 s/token, which is the starting point, not the current number: it read
+8.1 GB per decode step, and its read path still did a redundant host copy (`np.stack` of page-cache views)
+before the H2D. `ascend/bench_experts.py` measures the alternatives.
 
-What is **not** done yet: the routed experts are read one layer at a time with no overlap, the expert tier
-is a small LRU rather than a profiled placement, only one card is used (so 3 of the 4 available cards sit
-idle), prefill is per-token rather than batched, and the engine does not yet speak the `--serve` line
-protocol that `serve/server.py` drives.
+What is **not** done yet: `--graphs` is only in `run_dsv41`, not in `ascend/serve_engine.py`, so `strata-ascend`
+serves the eager step; the graphs belong to a State and a conversation recaptures them (1.8-1.9 s), and
+crossing an indexer bucket costs another capture; the landing zone still copies the six experts
+device-to-device every step; prefill (`T > 1`) is eager and array-bound; and only one conversation is served
+at a time. The four-card tier is 2 480 slots at 90.9% hit, and the analysis put a hit-count profile 18-31
+points behind the LRU at 2 603 slots (`f8e9010`).
 
 ## 5. Testing
 
-Everything runs as `python -m unittest discover -s ascend -p "test_*.py" -t .`.
+Everything runs as `python -m unittest discover -s ascend -p "test_*.py" -t .`. The suite is **160 tests**;
+8 of them skip when the NPU tests are not opted in (`DSV41_RUN_NPU_TESTS=1`) or when no card is present,
+and the CPU tests run in CI.
 
 * `test_config.py` — the 40-row layer plan against the reference's own table, and configs that must fail.
 * `test_checkpoint.py` — the shard reader on a synthetic two-shard file (offsets, duplicates, bf16
@@ -127,6 +141,18 @@ Everything runs as `python -m unittest discover -s ascend -p "test_*.py" -t .`.
   open compressor groups and the shared TopK live. Plus mHC ranges and Sinkhorn column sums, the router's
   select-on-bias/weight-on-score split, the sink, the group reshape, partial interleaved RoPE and its
   inverse, and the compressor's per-channel softmax.
+* `test_decode_graphs.py` — the captured split against the eager path: token-for-token parity, chunk
+  parity with graphs on, the registers an indexer bucket recapture must not invalidate, the landing
+  zone's parity, `fetch_int8_into`'s equivalence, opt-in-ness and release/re-capture.
+* `test_graph_runner.py` — the capture wrapper's contract: the CPU fallback equals eager, a changed input
+  shape or `data_ptr` is refused by name, `close` is idempotent, and the did-it-capture guard reports
+  `mode="fallback"` rather than pretending a graph was captured.
+* `test_kv_planes.py` — `KvPlanes` against today's host slicing for every position 0..300, wrap-around,
+  rewind and `-1` padding in the compressed gather, plus the fixed-width window and its mask.
+* `test_engram.py`, `test_engram_path.py` — the table format, the E8M0 scales and the rotation block
+  directly, then Engram through `Dsv41.forward`: a fresh State repeats exactly, decode equals chunk, and
+  the old `Engram.apply` contract fails with the exact shape error.
+* `test_eval_gsm8k.py` — the answer and gold regexes the harness's verdict rests on.
 * `test_npu_parity.py` — the same model on `npu:0` and on the CPU must agree to 5%, with the same argmax;
   and the NPU's own decode must match its own chunked pass. Also: the process never allocates past its
   32 GB share.
@@ -149,17 +175,24 @@ OpenAI/Anthropic APIs, SSE, tools and the web UI over this engine:
 ```json
 {"exe": "<repo>/ascend/strata-ascend",
  "args": ["--model", "/mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8",
-          "--max-context", "4096", "--expert-slots", "256"],
+          "--max-context", "4096",
+          "--expert-devices", "npu:0,npu:1,npu:2,npu:3"],
  "tokenizer": "<repo>/.ascend-tokenizer", "model_name": "DeepSeek-V4.1-Flash"}
 ```
+
+The repository's own copy is [`ascend/serve-config.example.json`](../ascend/serve-config.example.json). The
+serve engine builds the **eager** model: `ascend/serve_engine.py` calls `rt.build` without `graphs` and has
+no `--graphs` argument, so `strata-ascend` serves the eager step. The captured step is
+`run_dsv41 --graphs` (§4); wiring the flag into the serve engine is the first item in §7.
 
 `ascend/setup_tokenizer.sh` builds that tokenizer directory: the export ships no tokenizer, V4.1 and V4
 share the vocabulary, `serve/` reads its own pack layout rather than Hugging Face's `tokenizer.json`, and
 it decides a model is DeepSeek's by finding `｜DSML｜` in the chat template. The conversion is checked by
 encoding ten texts (digits, contractions, CJK, code, the special tokens) with both tokenizers: 0 mismatches.
 
-`ascend/run-e2e.sh` runs the whole stack and is the result this port was aiming at — the real
-`serve/server.py`, the real 578 GB checkpoint, one HTTP request:
+`ascend/run-e2e.sh` runs the whole stack — the real `serve/server.py`, the real 578 GB checkpoint, one HTTP
+request. This is the first end-to-end run, before the graphs, and it has not been re-run since; the serve
+path is still eager:
 
 ```
 $ ./ascend/run-e2e.sh           # prompt: "The quick brown fox jumps over the lazy"
@@ -176,31 +209,34 @@ The answer is the right one for the prompt it was given, which is the strongest 
 whole pipeline — mHC, CSA2, the router, the tokenizer, the conversation state — is wired correctly: there
 is no 578 GB reference to diff against, so coherent generation is the test. `run_dsv41` shows the same model
 completing `"1, 2, 3, 4, 5, 6, 7,"` with `" 8,"` (p=0.977) and `"The quick brown fox jumps over the lazy"`
-with `" dog"` (p=0.999).
+with `" dog"` (p=0.999 in that run; the fixed Engram + graphs probe answers at p≈1.000, §14).
 
 ## 7. What is next, in order
 
-> Four optimisation directions were analysed in parallel against the profile in §10 and reconciled into
-> [`docs/ASCEND-OPTIMISATION.md`](ASCEND-OPTIMISATION.md) - read that for the plan and the four ideas that
-> measurement ruled out. The list below is the earlier, pre-analysis version kept for the record.
+The first plan's five items were done or measured dead: the storage array is the floor (R2: ~2.5 GB/s cold);
+the four cards own the tier (2 480 slots, 90.9% hit, 0.774 GB/step); the analysis put a profiled placement
+18-31 points behind the LRU; prefill is chunked and still eager; and the serve surface exists. What is left
+is below, and the queue with acceptance is [`docs/ascend-notes/PLAN.md`](ascend-notes/PLAN.md).
 
-1. **Storage, not the code, is the floor.** A decode step streams 8.1 GB; the array gives 1.1 GB/s, so a
-   cold step cannot beat ~3 s however the read path is written. Waking the page cache is **not** a reliable
-   lever on this node, which measurement corrected: the same 40 experts read twice gave 3.2 GB/s the second
-   time against 2.8 the first - the file's pages are not being retained, with 1.25 TB of cache belonging to
-   other tenants and churning. What did scale was **parallelism**: one `preadv` thread reaches ~3 GB/s and
-   six reach 12.7 GB/s, so the lever is threads per miss and fewer misses, not warmth.
-2. **Use all four cards.** The non-expert weights need 15.1 GiB, so three cards are idle: split the layers
-   across them (a token's activations are 80 KiB, so a layer split is nearly free) and let each card own an
-   expert tier — 30 GiB becomes ~105 GiB, or 3 100 of 15 360 experts.
-3. **A profiled expert placement** instead of the LRU — the project's own `ExpertCache` does this for the
-   GPU path with a hit-count profile, and its `STRP` format can be reused as is.
-4. **Batched prefill**, so a prompt costs one pass over its experts instead of one per token; and the
-   int8 `npu_quant_matmul` path, which halves the HBM traffic of the dequantized bf16 matmuls.
-5. **The rest of the serve surface**: multi-session (`READY ... multi=n`), the vision refusal is already
-   worded, and `--bench`.
+1. **Expose the captured decode through the serve engine.** `--graphs` is only in `run_dsv41`;
+   `strata-ascend` builds the eager model, so the server gets the 816 ms step, not the 409.6 ms one. This is
+   the largest gap between the measured engine and the engine a user starts.
+2. **Cut the recapture cost.** 80 graphs take 1.8-1.9 s and belong to a State: every new conversation
+   recaptures, and crossing an indexer bucket costs another 1.8 s. The GSM8K run's last State captured 118
+   graphs at 2 048 context.
+3. **Make the tier the landing zone.** At 90.9% hit the step still copies 8.1 GB device-to-device into the
+   fixed slab, 19.65 ms of `TensorMove`; a resident tier that is itself the slab is the profile's next lever.
+4. **The device-time floor.** 137.5 ms at 29 744 operator calls. The three obvious fused ops were measured and
+   rejected: `npu_dynamic_quant` moves the logits 3.1e-2 (outside the 2e-3 promise), `npu_clipped_swiglu` is
+   +1.9 ms net, and `npu_fusion_attention` cannot be captured (error 107025).
+5. **Prefill and multi-session.** Prefill (`T > 1`) is eager and array-bound - 421 s for 823 prompt tokens in
+   the GSM8K re-check; capture does not apply to it. The serve engine still holds one conversation.
 
 ## 8. Where the 3.25 s/token went
+
+This section and §9-§11 are the **pre-graph history**: they are how the port got from 3.25 s to the
+dense fast paths and the four-card tier, and their absolute numbers are not the current step. §4 has the
+current 409.6 ms; §14 has the graph work that came after.
 
 Measured with `ascend/bench_step.py`, which times the same model with and without the routed branch and
 attributes the rest by phase.  The first run of it exposed more of the port's own bugs than the model's:
@@ -236,10 +272,12 @@ interleaved in one process (`--ab`, because this shared machine drifts by 50% be
 at 0.92x the dequant path.  The matmul was never the bulk of the per-expert cost; whatever else is in that
 loop is, and it is the next thing to measure rather than guess at.
 
-**On the numbers in this document**: they were taken on a card shared with other tenants, and the same
+**On the numbers in this section**: they were taken on a card shared with other tenants, and the same
 configuration measured 1 926 ms/token in a quiet window and 3 247 ms/token in a busy one.  The
 before/after figures above come from interleaved or back-to-back runs for that reason; treat absolute
-tok/s as a range and comparisons as the signal.
+tok/s as a range and comparisons as the signal. The current step is 409.6 ms with 80 graphs, and the same
+drift applies to it: 324.5, 350.6 and 409.6 are the same work at different times, not a sequence of one
+machine holding still.
 
 ## 9. The other three cards: the expert tier, not the layers
 
@@ -254,18 +292,29 @@ router and the shared expert stay with the layer, and each card keeps its **own*
 would put more expert bytes on one card than its share allows, which is exactly what the 32 GB cap forbids.
 The two-card case is checked against the one-card case by a test (same logits, same argmax).
 
-| decode, 8-token prompt | one card | four cards |
+| pre-graph four-card tier (8-token prompt) | one card | four cards |
 |---|---:|---:|
 | expert tier | 284 slots (9.4 GiB) | **2 967 slots (98 GiB)** |
 | decode hit rate | 46-54% | **74%** |
 | read per 20 steps | 94 GB | **52 GB** |
 | ms/token (same window) | 2 656 | **2 241** |
 
-The hit rate and the bytes read are the real result; the wall clock moves less than they do because the
-remaining 26% of misses still go to a 1.1 GB/s array, and because this shared machine's noise (±50%) is the
-same size as the improvement.  What the tier cannot fix is the shape of the traffic: a token routes 6 of 384
-experts per layer and the next token routes a partly different set, so the set a conversation touches grows
-with every token - which is why 240 experts of a decode step need thousands of slots, not hundreds.
+| with the captured decode | one card | four cards |
+|---|---:|---:|
+| expert tier | 254 slots | **2 480 slots** |
+| decode hit rate | 64.6% | **90.9%** |
+| read per decode step | 3.004 GB | **0.774 GB** |
+| graphs against eager | 595 vs 998 ms (0.660) | **324.5 vs 753.1 ms (0.481, 2.08x)** |
+
+The first table is the pre-graph measurement (`69bfe75`); the second is the captured tier (`383ab69`). The
+captured tier has **fewer** slots (2 480 against 2 967) because each card now keeps a 425 MB landing zone,
+~1 MB of registers and a 1 GiB graph reserve; the 90.9% hit rate comes from a different run and a different
+window, so it is not a consequence of the slot count alone. The hit rate and the bytes read are still the real
+result. At 90.9% hit the step reads 0.774 GB, and at the array's ~2.5 GB/s that read is most of the captured
+step's 409.6 ms; the remaining 9.1% of misses are what set it. What the tier cannot fix is the shape of the
+traffic: a token routes 6 of 384 experts per layer and the next token routes a partly different set, so the
+set a conversation touches grows with every token - which is why 240 experts of a decode step need thousands
+of slots, not hundreds.
 
 ## 10. Profiling: 46 000 operator calls a step, and what came of counting them
 
@@ -302,6 +351,11 @@ Two fixes, both single-token paths:
 Measured interleaved in one process (`bench_step --ab-dense`, because this machine drifts by 50%):
 **1.42x on the median step**, 2 258 -> 1 588 ms/token.
 
+After the graphs the profile is smaller again: **29 744 operator calls and 137.5 ms of device time a step**,
+with the landing-zone `TensorMove` as the top item at 23.3 ms; the copy work later took that to 19.65 ms
+(`8cfdc55`, `aca9485`). The call-bound diagnosis is what the graph work was built on; the captured step is
+in §14.
+
 **And one optimisation that did not work, kept out of the code**: Engram's row indices depend only on the
 token ids, so the next layer's 24 rows can be prefetched while earlier layers compute - the model document
 says so explicitly.  It was implemented and measured: **0.90x, slower.**  The gather is 6 KB, the page cache
@@ -310,45 +364,138 @@ hides.  The comment in `engram.py` records it so the next reader does not try ag
 
 ## 11. Where the remaining time goes
 
-After the dense fast paths the split is: ~478 ms the dense floor, the rest the routed experts.  Of those, the
-fetch is ~100 ms and the rest is per-expert work on single-row tensors - the launch/op-count problem this
-project solved on CUDA with per-layer graph capture (`include/strata/core/session.hpp:108-112`: 43 nodes
-replayed 1.51x faster than dispatched), plus the dequantization that int8 matmul removes outright.  Prefill
-at 0.9 s/token against a cold array stays storage-bound, as expected.
+With the graphs in place the split is different: the 80 replays plus dispatch are ~105 ms, embed and head
+~4 ms, and the rest is the expert fetch (`615104c`). The fetch is 0.774 GB/step on the four-card tier, read
+at the array's ~2.5 GB/s. The device time is 137.5 ms a step; its top item is the landing-zone copy,
+`TensorMove`, 19.65 ms after the copy work (`8cfdc55`, `aca9485`). The eager dense floor (~478-544 ms) is the
+number the graphs replaced. Prefill at ~0.5 s/token against a cold array stays storage-bound.
 
-## 12. Accuracy: 9 of 10 GSM8K questions, and speed
+## 12. Accuracy: the baseline, the graph re-check, and what the difference is
 
 `ascend/eval_gsm8k.py` samples questions from a GSM8K jsonl, renders each with the repository's own
-DeepSeek-V4.1 encoder, decodes greedily (non-thinking) and reads the final number.  Ten questions, seed 0,
-Engram on, all four cards - the report is `ascend/results/gsm8k-10q-engram.json`:
+DeepSeek-V4.1 encoder, decodes greedily (non-thinking) and reads the final number. Ten questions, seed 0.
 
-| # | gold | got | | # | gold | got | |
-|---:|---:|---:|---|---:|---:|---:|---|
-| 1 | 16 | 16 | ok | 6 | 22 | 22 | ok |
-| 2 | 240 | 240 | ok | 7 | 8 | 8 | ok |
-| 3 | 80 | 80 | ok | 8 | 11 | 11 | ok |
-| 4 | 15 | 5 | **no** | 9 | 25 | 25 | ok |
-| 5 | 91 | 91 | ok | 10 | 482 | 482 | ok |
+The committed baseline is Engram on, pre-graph, on all four cards: **9/10 at 0.47 tok/s** decode and 56 s
+mean prefill (`ascend/results/gsm8k-10q-engram.json`). The one miss used its whole 192-token budget, so its
+reasoning was cut off before the arithmetic finished.
 
-**9/10**, at **0.47 tok/s** decode and 56 s mean prefill.  The one failure is the 192-token budget: it was
-the only question that used the whole budget (192 tokens, 417 s), so its reasoning was cut off before the
-arithmetic finished - a length artifact of running at this speed, not a wrong answer.
+The graph re-check used the same sample - seed 0 reproduces the question texts and prompt token counts - with
+Engram off (the configuration `serve-config.example.json` ships) and a 384-token budget:
 
-Two caveats worth stating: this is zero-shot with a short instruction rather than the 8-shot protocol GSM8K
-is usually scored on, so the number is not comparable with published ones; and ten questions can only tell
-"wired correctly" from "broken", not a percentage with any confidence.
+| run | graphs | Engram | correct | decode | notes |
+|---|---|---:|---:|---:|---|
+| `gsm8k-10q-engram.json` | off | on | 9/10 | 0.47 tok/s | baseline, pre-graph; Q4 cut at 192 tokens |
+| `gsm8k-10q-graphs-on.json` | 80 | off | 9/10 | **1.77 tok/s** | Q4 answers 60; 384 tokens |
+| `gsm8k-10q-graphs-off.json` | off | off | **10/10** | 0.83 tok/s | the same sample, eager |
+
+**Capture is not the difference.** `--graphs` also has to set `host_mixes=False`, because the host Sinkhorn
+cannot be captured, so it switches the 24 mHC scalars from the numpy path to the device path. A control with
+graphs off and `host_mixes=False` reproduces the graphs-on text **token for token on all four questions that
+differ** (677 generated tokens, the failing one included). The two branches agree to 1e-10 on the 24
+scalars, but a router top-k tie can take a different trajectory early; Q4 emits no final line and the
+fallback reads the last number, 60, where eager answers 15. Ten questions cannot separate the branches; what
+they do say is that the graph replay is faithful and that the device branch is the one the captured path is
+stuck with.
+
+The baseline and the re-check are not like-for-like in speed: the baseline is Engram on and pre-graph, the
+re-check is Engram off, and the graphs-on number includes a per-question graph capture (118 graphs live at
+the end of the run; a one-State warm probe measured 1.67 tok/s, 599 ms/token). The caveats still stand:
+zero-shot with a short instruction rather than the 8-shot protocol GSM8K is scored with, so not comparable
+with published numbers; and ten questions can only tell "wired correctly" from "broken".
 
 ## 13. Reflecting on the numbers
 
-The measured chain per decode step is: 8.1 GB of routed experts if nothing is resident, read at ~3 GB/s per
-`preadv` thread (12.7 GB/s across six), copied at 20 GB/s, then multiplied. The page cache is not a lever
-here - the same bytes read twice were not faster - so what counts is how few misses the tier leaves and how
-many threads read them. An HBM
-expert tier of 30 GiB covers ~5% of the 15 360 experts on one card and ~20% on four, so it shortens the
-stream but does not remove it; and the 15.1 GiB of resident non-expert weights leave no room to keep more.
+The measured chain per decode step is: 8.1 GB of routed experts if nothing is resident, cut to **0.774
+GB/step** at 90.9% hit on the four-card tier; the misses are read from an array that saturates at ~2.5 GB/s
+and copied at 20 GB/s, then multiplied. The page cache is not a lever here - the same bytes read twice were
+not faster - so what counts is how few misses the tier leaves. An HBM expert tier of 30 GiB covers ~6% of
+the 15,360 experts on one card; the four-card tier measured 2,480 slots, 16.1% of them, at 90.9% hit,
+because the per-card reserve and the graph landing zones take part of the 32 GiB. It shortens the stream but
+does not remove it; the 15.1 GiB of resident non-expert weights leave no room to keep more.
 
 That is the honest trade of a **W8A8** checkpoint on 128 GB of HBM and a 1.1 GB/s array. The same model at
 1.6–4 bits is 73 GB and fits entirely on two cards, which is what this project's Maya-XS packs are for; at
-w8a8 the port is correct and usable, and tokens per second are set by the quantisation and the storage, not
-by the kernels. Worth saying plainly, because it is the opposite of the intuition that the NPU is the
+w8a8 the port is correct and usable. The graphs, the tier and the copy work moved the step from 1,661 to
+409.6 ms, but tokens per second are still set by how many expert bytes miss and by the storage, not by the
+kernels. Worth saying plainly, because it is the opposite of the intuition that the NPU is the
 bottleneck: bf16 Cube measured 246 TFLOP/s and the host link 20 GB/s, and neither is what binds.
+
+## 14. After the profile: the graph split, the four-card tier, and what was ruled out
+
+The profile said the step was call-bound; capture was the answer, but it took three prerequisites and two
+measurements to make it pay. The full A/Bs and the reasoning are in
+[`docs/ASCEND-OPTIMISATION.md`](ASCEND-OPTIMISATION.md); this is the sequence and the numbers it ended on.
+
+**The split.** A layer splits at the routing read into `g_pre` (engram, mHC, attention, compressor/indexer,
+router, shared expert) and `g_post` (the six expert matmuls, post-mHC). A captured graph cannot branch on a
+host integer or hold a copy between two cards, so the KV state moved to device-side `index_copy_` writes and
+fixed-width window gathers (`KvPlanes`), the RoPE tables moved from the CPU to the device (one host copy
+inside capture was what stopped a composed layer capturing), the compressor/indexer got one graph per
+selection bucket, and R4's scale cache removed the synchronous scale copies. A window-only layer then
+captured and replayed bit-exactly at a live position, 3 351 -> 606 us, **5.53x for that layer**; a compress
+layer 8 687 -> 1 100 us, **7.90x for that layer**. Those are per-layer figures, not the step's.
+
+**Single card.** 80 graphs, 16 greedy ids identical to eager and every step's logits bit-equal, 595 against
+998 ms, paired **0.660 [0.612, 0.738]** = 1.52x; capture 1.9 s (`615104c`). The captured step was already
+~90% expert fetch, which is why it was 1.5x and not the 2.0x the call-count arithmetic projected.
+
+**Four cards.** The single-card restriction was the biggest loss left: a cross-card copy cannot be captured,
+so the four-card 74%-hit tier fell back to eager. Each expert card now has its own registers and its own
+landing zone, `g_post[li]` is captured on the card its experts live on, `g_pre` stays on the compute card,
+and only the layer's small register pack crosses a card boundary, outside every graph. 80 graphs, 1.8 s
+capture; **324.5 against 753.1 ms, paired 0.481 [0.261, 0.652] = 2.08x**; tier 2,480 slots at 90.9% and
+0.774 GB/step against single-card 254 at 64.6% and 3.004 (`383ab69`). A silent runtime bug had to be fixed
+first: `torch.npu.graph` captures on a process-global stream created by the first capturing device, so
+graphs built for another card were silently empty; `GraphRunner` now passes its own per-card stream.
+
+A teardown leak went with it: a captured model belongs to its card's ACL context, and the 30 `g_post` graphs
+on npu:1-3 failed to destroy from whatever context was current - 30 warnings a teardown, with the models and
+their pool left alive. `GraphRunner.close` now re-selects its own card and restores the caller's; 10
+recaptures of 80 graphs in one process leave 0 warnings (`8cfdc55`).
+
+**The copy work.** At 90.9% hit the top device-time item was still `TensorMove`: the six experts' 8.1 GB
+copied into the landing zone in 1,053 copies of 7.7 MB. One copy per expert (its `[3, per]` block is
+contiguous) instead of three, plus a contiguous scale slab, took `TensorMove` from 1,016.5 to 338.8 calls and
+22.46 to 19.65 ms a step; the full step 452.4 -> 409.6 ms, paired **0.880 [0.773, 0.979]**, -42.8 ms over 48
+ABBA samples (`aca9485`). The micro-benchmark behind it: 294 GB/s for 18 copies of 11.8 MB, 513 for 6 of
+35.4 MB (1.78x), 668 for one 212 MB copy (2.22x). Most of the gain is host dispatch, 36 -> 7 ops a layer,
+which msprof's task durations do not count. `_foreach_copy_` was slower (1.10x all-pairs, 1.45x per-expert)
+and a single 18-input `cat` was 0.965x, so neither was kept.
+
+**The accuracy re-check.** §12 has it: 9/10 at 1.77 tok/s with graphs against 10/10 at 0.83 eager, and the
+control that reproduces the graphs-on text token for token with graphs off and `host_mixes=False`. The replay
+is faithful; the 9-vs-10 is the mHC branch.
+
+**The Engram fix.** The regression was a contract change: `Engram.apply` was handed the hasher's row
+*indices* while its signature promised gathered rows. The fix restores the contract in `engram.py` itself -
+the method owns the gather - rather than patching a call site. The graph path was broken twice on top: it
+still passed indices, then copied a `[24, 256]` result into a `[1, 6144]` buffer. And `torch.copysign` has
+no NPU kernel, so its CPU fallback's copy was the `copy_between_host_and_device_opapi` stream sync inside
+`g_pre`; it is `where` now (the same value for finite inputs, only -0.0 differs). With Engram on: all 80
+graphs capture, greedy ids identical to eager, logits bit-equal at every step, and the known probe `" dog"`
+at p≈1.000 (`cc01d7d`). 160 tests, 8 skipped.
+
+**Ruled out, each with the measurement that ruled it out:**
+
+* **R4, the per-expert scale cache:** 1,158 ms cached against 1,125 ms fresh, **0.97x** - nothing on wall
+  clock. It stays only as a capture enabler, because it removes the synchronous scale copies.
+* **A hit-count expert profile:** at 2,603 slots, 18-31 points of hit rate *behind* the LRU (`f8e9010`).
+* **Speculative prefetch from the previous token's routing:** 3.24x read amplification, ~1,309 against
+  1,101 ms - net slower.
+* **A pinned host arena:** `ulimit -l` is 64 MB, and pageable and pinned both copy at 20 GB/s - worth 0.
+* **Pooling the four cards' capacity over HCCS:** 0 hit-rate points; per-layer capacity, not total, binds.
+* **The Engram prefetch:** 0.90x, slower.
+* **A per-layer tier quota:** 64-67% hit either way, 1.07x on the median - inside the noise, reverted.
+* **`npu_dynamic_quant`:** -2,642 operator calls and ~3 ms of device time, but it pre-rounds the activation:
+  logits move 3.1e-2 and greedy ids diverge, outside the 2e-3 the engine promises. Off by default.
+* **`npu_clipped_swiglu`:** bit-identical in fp32, but the `g|u` concat costs +4.1 ms against -4.2 ms saved,
+  **+1.9 ms net**. Removed.
+* **`npu_fusion_attention`:** matches the model's sink, and **cannot be captured** - `AclmdlRICaptureEnd`
+  107025 - under every mode and stream arrangement tried, and a failed capture poisons the session.
+* **R1 and R3 (split reads, background overlap):** the array saturates at ~2.5 GB/s and threads do not help;
+  the reads are cold (`read_bytes` 1.65 GB/step against `rchar` 1.47); and `hc_post` makes layer L+1 depend
+  on L's experts, so there is nothing to hide the read behind.
+
+This is the ordering story the "what it came to" table in the optimisation document ends with: the graphs
+were worth 2.08x on four cards, the landing-zone work another 42.8 ms, and the re-check and the Engram fix
+changed what can be claimed about accuracy and correctness, not the step time.
