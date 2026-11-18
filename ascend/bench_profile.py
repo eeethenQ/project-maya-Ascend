@@ -111,16 +111,21 @@ def run_msprof(a) -> int:
         return 1
     total = sum(r["us"] for r in rows)
     launches = sum(r["count"] for r in rows)
-    steps = max(1, a.steps)
-    print(f"\n{'operator':44s} {'calls/step':>10s} {'ms/step':>9s} {'share':>7s} {'us/call':>9s}")
+    # The profile covers the prompt read *and* the decode steps, so a "per step" figure counted the
+    # prompt's operators as if they belonged to one decode step - it made a change look like an 18%
+    # regression when its own signature (half the Cos/Sin) was right.  Divide by tokens processed instead.
+    tokens = max(1, a.prompt_tokens + a.steps)
+    steps = tokens
+    print(f"\n1 prompt of {a.prompt_tokens} tokens + {a.steps} decode steps = {tokens} tokens profiled")
+    print(f"{'operator':44s} {'calls/tok':>10s} {'ms/tok':>9s} {'share':>7s} {'us/call':>9s}")
     for r in rows[: a.top]:
         print(f"{r['op'][:44]:44s} {r['count'] / steps:10.1f} {r['us'] / 1e3 / steps:9.2f} "
               f"{100 * r['us'] / max(total, 1e-9):6.1f}% {r['us'] / max(1, r['count']):9.1f}")
-    print(f"\n{launches / steps:.0f} operator calls per step over {len(rows)} distinct operators; "
-          f"{total / 1e3 / steps:.1f} ms of device time per step (column {column!r})")
+    print(f"\n{launches / steps:.0f} operator calls per token over {len(rows)} distinct operators; "
+          f"{total / 1e3 / steps:.1f} ms of device time per token (column {column!r})")
     tiny = [r for r in rows if r["us"] / max(1, r["count"]) < 100]
-    print(f"under 100 us per call: {sum(r['count'] for r in tiny) / steps:.0f} calls/step, "
-          f"{sum(r['us'] for r in tiny) / 1e3 / steps:.1f} ms/step "
+    print(f"under 100 us per call: {sum(r['count'] for r in tiny) / steps:.0f} calls/token, "
+          f"{sum(r['us'] for r in tiny) / 1e3 / steps:.1f} ms/token "
           f"({100 * sum(r['us'] for r in tiny) / max(total, 1e-9):.0f}% of device time)")
     print(f"trace and CSVs: {out}")
     return 0

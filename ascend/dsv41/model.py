@@ -99,22 +99,33 @@ class Rope:
         """``[n_pos, dim/2]`` phases for the given absolute positions."""
         return torch.outer(positions.float(), freqs.to(positions.device).float())
 
+    def cos_sin(self, freqs: torch.Tensor, positions: torch.Tensor,
+                inverse: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """The step's rotation tables, computed once and shared by every rope call that uses them.
+
+        `angles` builds a `[n_pos, dim/2]` outer product, and the layer calls this four times (q, kv, the
+        compressed latent, and the inverse on the output) with the same positions - so the outer product,
+        cos and sin were rebuilt 160 times a step for one token.
+        """
+        phase = self.angles(freqs, positions)
+        c = torch.cos(phase)
+        s = torch.sin(phase)
+        return c, (-s if inverse else s)
+
     def apply(self, x: torch.Tensor, freqs: torch.Tensor, positions: torch.Tensor,
-              inverse: bool = False) -> torch.Tensor:
+              inverse: bool = False, cs: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
         """Rotate the last ``dim`` channels of ``x`` by adjacent pairs (GPT-J), as the oracle's complex form.
 
         Written as cos/sin on even/odd lanes rather than through ``torch.polar``/``view_as_complex``: the
         Ascend runtime has no complex dtype, and this is the same arithmetic on every backend.
         """
-        phase = self.angles(freqs, positions)                     # [n_pos, dim/2]
-        c = torch.cos(phase)
-        s = -torch.sin(phase) if inverse else torch.sin(phase)
-        if x.ndim == 3:
+        c, s = cs if cs is not None else self.cos_sin(freqs, positions, inverse)
+        if x.ndim == 3 and c.dim() == 2:
             c, s = c[:, None, :], s[:, None, :]
         xf = x.float().reshape(*x.shape[:-1], -1, 2)
         even, odd = xf[..., 0], xf[..., 1]
         # the last `dim` channels start at x.shape[-1] - dim; everything before them is untouched
-        span = phase.shape[-1] * 2
+        span = c.shape[-1] * 2
         if x.shape[-1] != span:
             raise ValueError(f"rope expects a width-{span} tail, got a width-{x.shape[-1]} tensor")
         y0 = even * c - odd * s
@@ -808,11 +819,13 @@ class Dsv41:
         r = role.compress_ratio
         freqs = self.rope.freqs_comp if r else self.rope.freqs_window
 
+        cos_sin = self.rope.cos_sin(freqs, positions, inverse=False)
+        cos_sin_inv = self.rope.cos_sin(freqs, positions, inverse=True)
         qr = rms(self.mm(x, lw.attn["wq_a"]), lw.attn["q_norm"], self.eps)
         q = self.mm(qr, lw.attn["wq_b"]).view(T, H, D)
-        q = torch.cat([q[..., :-rd], self.rope.apply(q[..., -rd:], freqs, positions)], -1)
+        q = torch.cat([q[..., :-rd], self.rope.apply(q[..., -rd:], freqs, positions, cs=cos_sin)], -1)
         kv = rms(self.mm(x, lw.attn["wkv"]), lw.attn["kv_norm"], self.eps)
-        kv = torch.cat([kv[:, :-rd], self.rope.apply(kv[:, -rd:], freqs, positions)], -1)
+        kv = torch.cat([kv[:, :-rd], self.rope.apply(kv[:, -rd:], freqs, positions, cs=cos_sin)], -1)
 
         latent, group_pos = (None, None)
         if r and role.is_kv_source:
@@ -823,7 +836,8 @@ class Dsv41:
         if latent is not None:
             # the compressed entry is stored rotated at its group's start position
             gp = torch.tensor(group_pos, device=positions.device, dtype=positions.dtype)
-            lat = torch.cat([latent[:, :-rd], self.rope.apply(latent[:, -rd:], freqs, gp)], -1)
+            lat = torch.cat([latent[:, :-rd], self.rope.apply(latent[:, -rd:], freqs, gp,
+                                                             cs=self.rope.cos_sin(freqs, gp))], -1)
             g0 = group_pos[0] // r
             state.long_kv[li][:, g0:g0 + lat.shape[0]] = lat.to(state.dtype)
 
@@ -850,7 +864,8 @@ class Dsv41:
             out[t] = self.sparse_attn(q[t:t + 1], keys[None], valid[None], lw.attn["attn_sink"],
                                       float(D) ** -0.5)[0]
 
-        out = torch.cat([out[..., :-rd], self.rope.apply(out[..., -rd:], freqs, positions, inverse=True)], -1)
+        out = torch.cat([out[..., :-rd],
+                         self.rope.apply(out[..., -rd:], freqs, positions, inverse=True, cs=cos_sin_inv)], -1)
         return self.out_projection(li, out)
 
     def out_projection(self, li: int, o: torch.Tensor) -> torch.Tensor:
