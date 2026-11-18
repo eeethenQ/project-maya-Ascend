@@ -16,7 +16,9 @@ from ascend.tests.synthetic import TinyModel
 
 try:                                                    # torch is only installed where the engine runs
     import torch
-    from ascend.dsv41.model import Dsv41, ExpertStreamer, Rope, State, Weights, rms
+    from ascend.dsv41.kv_planes import KvPlanes
+    from ascend.dsv41.model import (Dsv41, ExpertStreamer, IndexerBucketPolicy, Rope, State, Weights,
+                                    rms)
     HAVE_TORCH = True
 except Exception:                                       # noqa: BLE001 - the CI job has no torch: skip
     torch = None
@@ -101,6 +103,108 @@ class TheForward(unittest.TestCase):
         state2 = new_state(self.model)
         b = self.net.forward([17], state2)
         self.assertFalse(torch.allclose(a, b))
+
+    def kv_source(self) -> int:
+        """A layer with a compressor and a gate: the only kind whose decode path pools a group."""
+        return next(i for i in range(self.model.cfg.num_hidden_layers)
+                    if self.net.plan.layer(i).compress_ratio == 2
+                    and self.net.plan.layer(i).is_kv_source)
+
+    def test_a_single_token_compressor_rewrites_a_closed_group_unchanged(self):
+        """The single-token compressor has no host branch: it always pools the group ``(pos+1)//r - 1``.
+
+        When the position closes that group it is the new entry; when it does not, it is the previous
+        (already closed) entry and the write must be exactly the value already there.  That is what makes
+        both positions one fixed-shape graph, so it is asserted bit for bit rather than with a tolerance.
+        """
+        li = self.kv_source()
+        r = self.net.plan.layer(li).compress_ratio
+        self.assertGreater(r, 1, "a compressor with a gate is what this test needs")
+        state = new_state(self.model)
+        self.net.forward([3, 5], state)                        # positions 0, 1: group 0 closes
+        closed = state.long_kv[li][0, 0].clone()
+        # position 2 does not close group 1: the rewrite must leave group 0 alone
+        self.net.forward([7], state)
+        self.assertTrue(torch.equal(state.long_kv[li][0, 0], closed),
+                        "a non-closing token changed the entry the previous token closed")
+        # position 3 does close group 1
+        self.net.forward([11], state)
+        self.assertFalse(torch.equal(state.long_kv[li][0, 1], closed))
+
+    def test_the_single_token_indexer_matches_the_chunked_indexer(self):
+        """The two indexer paths on one state: bucketed/device-side vs host-counted, same selection.
+
+        Twelve tokens put the last position at six entries on this model, past its TopK of four, so the
+        comparison is over a real ranking and not just "all entries fit".  Both calls see the same state
+        and the same query rows - only the entry-width path differs - so this isolates the rewrite from
+        the (legitimately different) activations a chunked and a stepped forward produce.
+        """
+        li = next(i for i in self.net.plan.index_source_layer_ids)
+        state = new_state(self.model)
+        self.net.forward([(i * 5 + 3) % 32 for i in range(12)], state)   # index-K entries 0..5 written
+        torch.manual_seed(0)
+        x = torch.randn(2, self.model.cfg.hidden_size)
+        qr = torch.randn(2, self.model.cfg.q_lora_rank)
+        chunk = self.net.indexer(li, x, qr, None, None, torch.tensor([10, 11]), [10, 11], state)
+        single = self.net.indexer(li, x[-1:], qr[-1:], None, None, torch.tensor([11]), [11], state,
+                                  entries_bucket=16)
+        self.assertTrue(chunk[-1].ge(0).all(), "the chunked path selected a padded entry")
+        self.assertTrue(torch.equal(chunk[-1], single[single.ge(0)]),
+                        f"bucketed selected {single.tolist()} where the chunk selected {chunk[-1].tolist()}")
+
+    def test_the_single_token_compressor_refuses_a_raw_ring_it_cannot_reach_back_into(self):
+        """A non-closing token reads the previous group, up to 2r-2 positions back: it must still be there."""
+        li = self.kv_source()
+        cfg = self.model.cfg
+        state = new_state(self.model)
+        state.kv = KvPlanes(cfg, self.net.plan, "cpu", DTYPE, max_context=2, window=2)   # r=2 fills it
+        x = torch.randn(1, cfg.hidden_size)
+        with self.assertRaises(ValueError):
+            self.net.compress(li, x, torch.tensor([3]), [], state)
+
+    def test_the_indexer_bucket_is_a_shape_the_caller_can_pick(self):
+        """Explicit buckets are what the engine captures against: the same selection, more -1 padding."""
+        li = next(i for i in self.net.plan.index_source_layer_ids)
+        state = new_state(self.model)
+        for i in [3, 5, 7, 11, 13]:                            # position 4, entries = 2 on layer 1
+            self.net.forward([i], state)
+        x = torch.randn(1, self.model.cfg.hidden_size)
+        qr = torch.randn(1, self.model.cfg.q_lora_rank)
+        pos, host = torch.tensor([4]), [4]              # position 4: two entries closed, neither pending
+        base = self.net.indexer(li, x, qr, None, None, pos, host, state)
+        big = self.net.indexer(li, x, qr, None, None, pos, host, state, entries_bucket=16)
+        self.assertEqual(len(base), 1)
+        self.assertTrue(torch.equal(big[big.ge(0)], base[base.ge(0)]),
+                        "a wider bucket changed which entries survive the mask")
+        # and a bucket smaller than the live entry count is refused, not silently truncated
+        with self.assertRaises(ValueError):
+            self.net.indexer(li, x, qr, None, None, pos, host, state, entries_bucket=1)
+
+
+@NEEDS_TORCH
+class TheIndexerBuckets(unittest.TestCase):
+    """The policy is the capture table: no torch, and visible in a log."""
+
+    def test_buckets_round_up_cap_at_the_plane_and_are_loggable(self):
+        policy = IndexerBucketPolicy()                          # floor 64, powers of two
+        self.assertEqual(policy.bucket_for(4, 513), 64)
+        self.assertEqual(policy.bucket_for(64, 513), 64)
+        self.assertEqual(policy.bucket_for(65, 513), 128)
+        self.assertEqual(policy.bucket_for(400, 513), 512)
+        self.assertEqual(policy.bucket_for(512, 513), 512)
+        self.assertEqual(policy.buckets(513), (64, 128, 256, 512))
+        # a plane narrower than the floor is captured at its own width, not a bucket it cannot hold
+        self.assertEqual(policy.bucket_for(10, 33), 33)
+        self.assertEqual(policy.buckets(33), (33,))
+        self.assertIn("indexer buckets", policy.describe(513))
+        self.assertIn("512", policy.describe(513))
+
+    def test_an_explicit_ladder_is_used_when_it_is_given(self):
+        ladder = IndexerBucketPolicy(floor=1, ladder=(8, 32, 128))
+        self.assertEqual(ladder.bucket_for(9, 256), 32)
+        self.assertEqual(ladder.bucket_for(200, 256), 256)      # past every rung: the plane's width
+        self.assertEqual(ladder.bucket_for(9, 16), 16)          # a rung is capped by the plane
+        self.assertEqual(ladder.buckets(256), (8, 32, 128))
 
 
 @NEEDS_TORCH

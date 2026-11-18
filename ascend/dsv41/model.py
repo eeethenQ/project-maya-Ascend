@@ -38,6 +38,7 @@ except Exception:                                       # noqa: BLE001 - the hos
 
 from .checkpoint import Checkpoint
 from .config import FULL, REUSE, SWA_ONLY, LayerRole, TextConfig, Topology, build_layer_plan
+from .kv_planes import INDEX as INDEX_PLANE
 
 
 # --------------------------------------------------------------------------- quantization
@@ -166,6 +167,60 @@ def rms(x: torch.Tensor, w: torch.Tensor | None, eps: float) -> torch.Tensor:
     xf = x.float()
     y = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
     return (y * w.float()) if w is not None else y
+
+
+# --------------------------------------------------------------------------- indexer buckets
+@dataclass(frozen=True)
+class IndexerBucketPolicy:
+    """The fixed set of compressed-entry widths an indexer graph may be captured at.
+
+    ``Dsv41.indexer`` scores the entries a query can see, ``entries = (pos + 1) // r``, so the width of its
+    score tensor grows with the conversation.  A captured graph bakes every shape it sees (probe F in
+    ``docs/ascend-notes/opt-4-graph.md`` §5 replayed an old shape without an error), so the width is rounded
+    up to a *bucket* and everything past the live ``entries`` is masked instead of dropped.  The bucket is a
+    shape, fixed per graph; the position stays a device tensor and only moves the mask.
+
+    One graph per bucket per layer is what the engine captures; this object is the table it enumerates them
+    from, and ``describe`` puts the table in the log.  It is deliberately torch-free so the engine can size
+    its capture set - or a test can check it - before any card is touched.
+
+    ``floor`` is the smallest width worth a capture: below it the shapes are so cheap that a fresh context
+    is one graph.  ``ladder`` is an optional explicit rung list; empty means powers of two, the scheme the
+    notes recommend (11 buckets over an 8192-token context).  ``bucket_for`` never returns more than the
+    plane holds, so ``torch.arange(bucket)`` can never index out of bounds.
+    """
+
+    floor: int = 64
+    ladder: tuple[int, ...] = ()
+
+    def buckets(self, capacity: int) -> tuple[int, ...]:
+        """Every width this policy can produce for a plane of ``capacity`` rows, ascending."""
+        capacity = max(int(capacity), 1)
+        if self.ladder:
+            out = {min(int(b), capacity) for b in self.ladder if int(b) >= max(int(self.floor), 1)}
+            return tuple(sorted(out)) or (capacity,)
+        out, b = [], max(int(self.floor), 1)
+        while b < capacity:
+            out.append(b)
+            b *= 2
+        # a small plane (a unit test's context, say) is always captured at its own full width
+        return tuple(sorted(set(out))) or (capacity,)
+
+    def bucket_for(self, entries: int, capacity: int) -> int:
+        """The bucket an indexer that can see ``entries`` entries is run at on this plane."""
+        capacity = max(int(capacity), 1)
+        for b in self.buckets(capacity):
+            if b >= max(int(entries), 1):
+                return b
+        # entries past every rung: the plane's own width, which `Dsv41.indexer` then accepts only when the
+        # host-known entry count fits it - the call must not quietly run a graph narrower than its context
+        return capacity
+
+    def describe(self, capacity: int) -> str:
+        """One line naming the table, for the capture log."""
+        kind = f"ladder {tuple(self.ladder)}" if self.ladder else "powers of two"
+        return (f"indexer buckets: {self.buckets(capacity)} entries "
+                f"({kind}, floor {self.floor}, plane capacity {capacity})")
 
 
 # --------------------------------------------------------------------------- weights
@@ -623,13 +678,17 @@ class Dsv41:
     (a prompt, or a single decode step) and extends the :class:`State` it is given.
     """
 
-    def __init__(self, cfg: TextConfig, weights: Weights, device, dtype=torch.bfloat16, engram=None):
+    def __init__(self, cfg: TextConfig, weights: Weights, device, dtype=torch.bfloat16, engram=None,
+                 index_buckets: IndexerBucketPolicy | None = None):
         self.cfg = cfg
         self.engram = engram
         self.plan = build_layer_plan(cfg)
         self.weights = weights
         self.device = device
         self.dtype = dtype
+        # the entry-width table a captured indexer is bucketed at (`IndexerBucketPolicy`); loggable, and the
+        # engine enumerates one graph per bucket per layer from it
+        self.index_buckets = index_buckets or IndexerBucketPolicy()
         self.rope = Rope(cfg, device)
         self.eps = cfg.rms_norm_eps
         self.hc = cfg.hc_mult
@@ -720,6 +779,17 @@ class Dsv41:
 
         The oracle pools a whole sequence at once; here each group closes at its last token, which is what
         lets a decode step (one token) produce the entry its position completes.
+
+        ``T == 1`` takes a graph-capturable path (``T > 1`` stays the chunked one a prompt uses): the group
+        close is ``((pos + 1) % r) == 0`` as a *tensor*, so the host integer is gone, and the pooled value is
+        computed unconditionally over the group ``g = (pos + 1) // r - 1``.  That group is the one this token
+        closes when the group closed, and the *previous* (already closed) group otherwise - recomputing it
+        from the raw rows it still holds gives the value it already has, so the `write_group` that follows
+        rewrites it bit for bit and is a no-op.  That is the `torch.where(closed, pooled, previous)` the
+        capture needs without a second latent plane: the tensor decides both the value and the target group,
+        so both a closing and a non-closing position write the same fixed shapes.  The one case with no
+        previous group is position 0 (``g == -1``); it clamps onto group 0, which is written again when it
+        closes at ``r - 1`` before any query can read it.
         """
         role = self.plan.layer(li)
         r = role.compress_ratio
@@ -734,9 +804,30 @@ class Dsv41:
             return None, None
         kv = self.mm(x, lw.compressor["wkv"]).float()
         score = self.mm(x, lw.compressor["wgate"]).float()
-        state.comp_kv_raw[li][:, positions] = kv
-        state.comp_score_raw[li][:, positions] = score
-        # every group this chunk completes: (group id g, its r rows, the group-start position)
+        # position-addressed, device-indexed: a host slice here is what a replay would bake
+        state.kv.write_raw(li, positions, kv, score)
+        if T == 1:
+            # The rewrite of a previous group reads rows up to 2r-2 positions behind the query, which is
+            # exact only while they are still in the raw ring; r <= 2 on the real model makes this a
+            # non-issue, and refusing the config is cheaper than a silently truncated group.
+            if 2 * r - 2 >= state.kv.max_context:
+                raise ValueError(
+                    f"layer {li} pools groups of {r} over a {state.kv.max_context}-token raw ring: a "
+                    "non-closing token recomputes the previous group, whose rows are up to 2r-2 positions "
+                    "behind it, and they must still be in the ring")
+            # the group whose last token this position *would* be; device arithmetic throughout
+            p = positions.reshape(-1)                                  # [1]
+            g = (p + 1) // r - 1                                       # [1], -1 before any group closes
+            # the r raw rows of that group: the current token's row included when it closes the group, the
+            # previous group's rows entirely when it does not (all of them still live in the ring)
+            js = g.clamp_min(0) * r + torch.arange(r, device=positions.device, dtype=torch.long)
+            kvc, sc = state.kv.read_raw(li, js)                        # [r, D] each, fp32
+            # the same expression as the chunked path above, on the same [1, r, D] shape, so a rewrite of an
+            # entry the chunk wrote is bit-for-bit the value already there
+            pooled = (kvc[None] * sc[None].softmax(1)).sum(1)          # per-dim softmax over the group
+            latent = rms(pooled, lw.compressor["norm"], self.eps)
+            return latent, g.clamp_min(0) * r                          # [1] group-start positions
+        # T > 1: a prompt chunk, not captured; unchanged (single host pass over the tokens it closes)
         out_lat, out_pos = [], []
         for t in range(T):
             p = host_positions[t]
@@ -755,9 +846,46 @@ class Dsv41:
         return latent, out_pos
 
     # -- the indexer: which compressed entries a query reads -------------------------------------
+    @staticmethod
+    def _group_positions(group_pos, like: torch.Tensor) -> torch.Tensor:
+        """Group-start positions as one device int64 tensor, from the chunk's list or the decode tensor.
+
+        A prompt chunk builds a list of host ints; the single-token path returns the device tensor it
+        computed from `positions`.  Both become indexes a captured layer can replay: nothing downstream
+        may slice with the int, and this is the only place the two representations differ.
+        """
+        if isinstance(group_pos, torch.Tensor):
+            return group_pos.to(device=like.device, dtype=torch.long).reshape(-1)
+        return torch.tensor(list(group_pos), device=like.device, dtype=torch.long)
+
+    @staticmethod
+    def _fit_candidates(candidates: torch.Tensor, width: int) -> torch.Tensor:
+        """A stored candidate mask cropped or padded to another graph's bucket.
+
+        Two indexer graphs may have been captured at different entry widths (the candidate source is layer
+        20, its consumers 24 and later).  Their runs share the query position, so the region past either
+        width is beyond the live ``lens`` and already masked; padding it with False is therefore exact, and
+        keeping the two masks independent of each other's bucket is what lets each layer hold its own graph.
+        """
+        have = candidates.size(-1)
+        if have == width:
+            return candidates
+        if have > width:
+            return candidates[..., :width]
+        return torch.cat([candidates, candidates.new_zeros(*candidates.shape[:-1], width - have)], -1)
+
     def indexer(self, li: int, x: torch.Tensor, qr: torch.Tensor, latent: torch.Tensor | None,
-                group_pos: list[int] | None, positions: torch.Tensor, host_positions: list[int],
-                state: State) -> torch.Tensor:
+                group_pos, positions: torch.Tensor, host_positions: list[int],
+                state: State, entries_bucket: int | None = None) -> torch.Tensor:
+        """The compressed entries this query reads, as ``-1``-padded indices.
+
+        ``entries = (pos + 1) // r`` entries are visible, but the score tensor's width must not move under a
+        graph.  ``T == 1`` therefore runs at a bucket from :class:`IndexerBucketPolicy` - chosen by the
+        caller when the engine replays a captured layer, or derived from the host cursor in eager code -
+        and masks everything from the live count to the bucket's end with ``-inf``.  ``lens``, the entry
+        count and the index-K write are all device-side; the only host integers left are the bucket itself
+        (a shape, on purpose) and the ``T > 1`` prompt path, which keeps today's arithmetic untouched.
+        """
         cfg, role = self.cfg, self.plan.layer(li)
         lw = self.weights.layers[li]
         r = role.compress_ratio
@@ -765,28 +893,52 @@ class Dsv41:
         freqs = self.rope.freqs_comp
         T = x.shape[0]
         if role.is_kv_source and latent is not None:
-            gp = torch.tensor(group_pos, device=positions.device, dtype=positions.dtype)
+            gp = self._group_positions(group_pos, positions)
             k = rms(self.mm(latent, lw.indexer["wk"]), lw.indexer["k_norm"], self.eps)
             k = torch.cat([k[:, :-rd], self.rope.apply(k[:, -rd:], freqs, gp)], -1)
-            g0 = group_pos[0] // r
-            state.index_k[li][:, g0:g0 + k.shape[0]] = k.to(state.dtype)
+            # group index -> device tensor; the host slice `index_k[:, g0:g0+n]` is what a replay would bake
+            state.kv.write_group(li, gp // r, k.to(state.dtype), plane=INDEX_PLANE)
         q = (self.mm(qr, lw.indexer["wq_b"])).view(T, nh, hd)
         q = torch.cat([q[..., :-rd], self.rope.apply(q[..., -rd:], freqs, positions)], -1)
         w = self.mm(x, lw.indexer["weights_proj"]) * (hd ** -0.5 * nh ** -0.5)
-        # a query at position p sees entries [0, (p+1)//r): the group it is itself closing counts
-        entries = (host_positions[-1] + 1) // r
-        if entries <= 0:
-            return torch.full((T, 1), -1, dtype=torch.long, device=x.device)
-        ik = state.index_k[role.kv_source_layer][:, :entries].float()      # [1, E, hd]
+        # a query at position p sees entries [0, (p+1)//r): the group it is itself closing counts.  The
+        # count is a device tensor, so the mask follows a live position; only its *width* is fixed.
+        lens = ((positions + 1) // r).reshape(-1, 1)
+        if T == 1:
+            capacity = state.kv.group_entries[role.kv_source_layer]
+            if entries_bucket is None:
+                entries = self.index_buckets.bucket_for(int(state.entries(li, state.next_pos)), capacity)
+            else:
+                entries = int(entries_bucket)
+                # a bucket is a promise from the caller that the graph serves this many entries; breaking
+                # it would drop live entries *silently* once replayed, so refuse it loudly here instead
+                known = host_positions[-1] if host_positions else state.next_pos
+                need = (int(known) + 1) // r
+                if need > entries:
+                    raise ValueError(
+                        f"indexer bucket {entries} on layer {li} is too small: position {known} sees "
+                        f"{need} entries; capture this layer at "
+                        f"{self.index_buckets.bucket_for(need, capacity)} instead")
+            if not 1 <= entries <= capacity:
+                raise ValueError(f"indexer bucket {entries} is outside [1, {capacity}] on layer {li}")
+        else:
+            # prompt chunks are not captured; keep the exact chunked arithmetic
+            entries = (host_positions[-1] + 1) // r
+            if entries <= 0:
+                return torch.full((T, 1), -1, dtype=torch.long, device=x.device)
+        # [1, E, hd]: `read_groups` drops the plane's batch axis, the einsum below keeps it as its `e`
+        ik = state.kv.read_groups(role.kv_source_layer,
+                                  torch.arange(entries, device=positions.device),
+                                  plane=INDEX_PLANE).float()[None]
         # score[t, j] = sum_h w[t, h] * relu(q[t, h] . ik[j])
         dots = torch.einsum("thd,ejd->thej", q.float(), ik).relu_()        # [T, nh, 1, E]
         score = (dots * w[:, :, None, None]).sum(1)[:, 0, :]               # [T, E]
-        lens = ((torch.tensor(host_positions, device=positions.device) + 1) // r).unsqueeze(-1)
         score = score.masked_fill(torch.arange(entries, device=x.device)[None, :] >= lens, float("-inf"))
         if role.is_candidate_source:
             state.candidates = self.candidate_blocks(score, lens)
         elif role.uses_candidate_filter and state.candidates is not None:
-            score = score.masked_fill(~state.candidates, float("-inf"))
+            candidates = self._fit_candidates(state.candidates, entries)
+            score = score.masked_fill(~candidates, float("-inf"))
         topk = min(cfg.index_topk, entries)
         idx = score.topk(topk, dim=-1, sorted=False).indices.sort(-1).values
         return torch.where(idx < lens, idx, torch.full_like(idx, -1))
@@ -817,7 +969,7 @@ class Dsv41:
         return torch.einsum("thk,tkd->thd", p, keys) / den.unsqueeze(-1)
 
     def attention(self, li: int, x: torch.Tensor, positions: torch.Tensor, host_positions: list[int],
-                  state: State) -> torch.Tensor:
+                  state: State, entries_bucket: int | None = None) -> torch.Tensor:
         cfg, role = self.cfg, self.plan.layer(li)
         lw = self.weights.layers[li]
         T = x.shape[0]
@@ -838,14 +990,15 @@ class Dsv41:
             # only the four KV sources run a compressor; a consumer reads the cache it produced
             latent, group_pos = self.compress(li, x, positions, host_positions, state)
         if role.is_index_source:
-            state.topk = self.indexer(li, x, qr, latent, group_pos, positions, host_positions, state)
+            state.topk = self.indexer(li, x, qr, latent, group_pos, positions, host_positions, state,
+                                      entries_bucket=entries_bucket)
         if latent is not None:
-            # the compressed entry is stored rotated at its group's start position
-            gp = torch.tensor(group_pos, device=positions.device, dtype=positions.dtype)
+            # the compressed entry is stored rotated at its group's start position; group index and rows
+            # both travel as device tensors, so a captured layer replays at any position
+            gp = self._group_positions(group_pos, positions)
             lat = torch.cat([latent[:, :-rd], self.rope.apply(latent[:, -rd:], freqs, gp,
                                                              cs=self.rope.cos_sin(freqs, gp))], -1)
-            g0 = group_pos[0] // r
-            state.long_kv[li][:, g0:g0 + lat.shape[0]] = lat.to(state.dtype)
+            state.kv.write_group(li, gp // r, lat.to(state.dtype))
 
         # the window rows for this chunk, written before any of them is read: one index_copy_ with
         # device-side indices instead of a host slice per token
@@ -859,10 +1012,11 @@ class Dsv41:
             wkeys = wkeys.float()                                          # [win, D]
             if r:
                 j = topk[t]
-                kj = j.clamp_min(0)
-                ckeys = state.long_kv[role.kv_source_layer][:, kj].float()
+                # the indexer's -1 padding gathers entry 0 and is masked by `cvalid`, exactly as the host
+                # `long_kv[:, j.clamp_min(0)]` slice did, but with no host index in the graph
+                ckeys = state.kv.read_groups(role.kv_source_layer, j).float()
                 cvalid = j >= 0
-                keys = torch.cat([wkeys, ckeys[0]], 0)
+                keys = torch.cat([wkeys, ckeys], 0)
                 valid = torch.cat([wvalid, cvalid])
             else:
                 keys, valid = wkeys, wvalid
@@ -1008,10 +1162,13 @@ class Dsv41:
     # -- the whole forward ----------------------------------------------------------------------
     @torch.inference_mode()
     def forward(self, ids: list[int] | torch.Tensor, state: State, logits_last_only: bool = True,
-                compute_logits: bool = True):
+                compute_logits: bool = True, entries_bucket: int | None = None):
         """Run a chunk of tokens through the 40 layers; returns the logits (or just the last row's).
 
         ``compute_logits=False`` skips the head for a prompt chunk whose logits nothing will read.
+        ``entries_bucket`` is the indexer entry width a captured decode layer replays at (see
+        :class:`IndexerBucketPolicy`); the eager caller leaves it None and the policy picks per position, a
+        prompt chunk (``T > 1``) ignores it.
         """
         cfg = self.cfg
         dev = self.device
@@ -1041,7 +1198,8 @@ class Dsv41:
                                                      lw.hc["attn_base"])
                 x = rms(self.hc_pre(h, pre), lw.norms["attn_norm"], self.eps)
             with self.phase("attn"):
-                h = self.hc_post(self.attention(li, x, positions, host_positions, state), res, a_post, a_comb)
+                h = self.hc_post(self.attention(li, x, positions, host_positions, state,
+                                                entries_bucket=entries_bucket), res, a_post, a_comb)
             res = h
             with self.phase("hc"):
                 f_pre, f_post, f_comb = self.hc_mixes(h, lw.hc["ffn_fn"], lw.hc["ffn_scale"],
