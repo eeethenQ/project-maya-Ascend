@@ -1,0 +1,534 @@
+{
+ "summary": {
+  "run_s": 2212.4,
+  "cards": [
+   "npu:0",
+   "npu:1",
+   "npu:2"
+  ],
+  "visible": "1,2,3",
+  "device": "npu:0",
+  "hbm_share": 0.5,
+  "expert_reserve_gib": 8.0,
+  "max_context": 2048,
+  "prompt_tokens": 2000,
+  "gen": 32,
+  "only": [
+   "concurrent",
+   "control",
+   "graphs",
+   "phases",
+   "single",
+   "thrash"
+  ],
+  "scenarios": 7,
+  "graph": true
+ },
+ "records": [
+  {
+   "scenario": "single",
+   "prompt_tokens": 2000,
+   "max_context": 2048,
+   "ttft_s": 393.49,
+   "wall_s": 393.49,
+   "first_token": 64528,
+   "timers": false,
+   "tier": {
+    "hits": 0,
+    "misses": 11970,
+    "hit_rate": 0.0,
+    "gb_read": 423.61,
+    "gb_read_per_request": 423.61,
+    "slots": 1769
+   },
+   "peak_gib": {
+    "npu:0": 24.79,
+    "npu:1": 27.99,
+    "npu:2": 27.98
+   },
+   "allocated_gib": {
+    "npu:0": 23.19,
+    "npu:1": 27.34,
+    "npu:2": 27.33
+   },
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2"
+   ],
+   "device": "npu:0",
+   "note": "first request, tier cold",
+   "tier_slots": 1769,
+   "at": "2026-11-19T10:26:00"
+  },
+  {
+   "scenario": "single",
+   "prompt_tokens": 2000,
+   "max_context": 2048,
+   "ttft_s": 343.65,
+   "wall_s": 343.65,
+   "first_token": 64528,
+   "timers": false,
+   "tier": {
+    "hits": 0,
+    "misses": 11970,
+    "hit_rate": 0.0,
+    "gb_read": 423.61,
+    "gb_read_per_request": 423.61,
+    "slots": 1769
+   },
+   "peak_gib": {
+    "npu:0": 24.79,
+    "npu:1": 28.01,
+    "npu:2": 28.04
+   },
+   "allocated_gib": {
+    "npu:0": 23.19,
+    "npu:1": 27.34,
+    "npu:2": 27.33
+   },
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2"
+   ],
+   "device": "npu:0",
+   "tier_slots": 1769,
+   "note": "second request, tier warm after the first request filled it",
+   "at": "2026-11-19T10:31:44"
+  },
+  {
+   "scenario": "single-phases",
+   "prompt_tokens": 2000,
+   "max_context": 2048,
+   "ttft_s": 352.64,
+   "wall_s": 352.64,
+   "first_token": 64528,
+   "timers": true,
+   "tier": {
+    "hits": 0,
+    "misses": 11970,
+    "hit_rate": 0.0,
+    "gb_read": 423.61,
+    "gb_read_per_request": 423.61,
+    "slots": 1769
+   },
+   "peak_gib": {
+    "npu:0": 24.91,
+    "npu:1": 28.01,
+    "npu:2": 28.04
+   },
+   "allocated_gib": {
+    "npu:0": 23.31,
+    "npu:1": 27.34,
+    "npu:2": 27.33
+   },
+   "phases_s": {
+    "attn": 207.01,
+    "moe": 145.03,
+    "moe_fetch": 89.18,
+    "hc": 0.58
+   },
+   "phases_share": {
+    "attn": 0.587,
+    "moe": 0.4113,
+    "moe_fetch": 0.2529,
+    "hc": 0.0016
+   },
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2"
+   ],
+   "device": "npu:0",
+   "tier_slots": 1769,
+   "note": "timers synchronise between sections: TTFT is perturbed, shares are not",
+   "at": "2026-11-19T10:37:37",
+   "phases_note": "share of the timers-on TTFT; moe_fetch is nested inside moe, so attn + moe + hc = TTFT and moe_fetch must not be added again. The timers synchronise between sections, so this TTFT is perturbed and is not the plain one."
+  },
+  {
+   "scenario": "concurrent-2k",
+   "prompt_tokens": 2000,
+   "max_context": 2048,
+   "requests": 4,
+   "gen_tokens": 32,
+   "succeeded": 4,
+   "errors": [],
+   "wall_s": 722.08,
+   "ttft_s": 609.93,
+   "ttft_s_list": [
+    609.93,
+    609.93,
+    609.93,
+    609.93
+   ],
+   "ttft_median_s": 609.93,
+   "ttft_spread_s": 0.0,
+   "ttft_sum_over_wall": 3.38,
+   "ttft_slowest_over_fastest": 1.0,
+   "first_token_spread_s": 0.0,
+   "decode_tok_s": 1.14,
+   "decode_steps_total": 128,
+   "decode_tok_s_per_request": [
+    0.29,
+    0.29,
+    0.29,
+    0.29
+   ],
+   "decode_ms_median_per_request": [
+    3480.6,
+    3489.8,
+    3491.5,
+    3489.2
+   ],
+   "tokens_identical": true,
+   "per_request": [
+    {
+     "ttft_s": 609.932,
+     "first_token": 64528,
+     "decode_steps": 32,
+     "decode_s": 112.146,
+     "decode_tok_s": 0.285,
+     "decode_ms_median": 3480.578,
+     "end_s": 722.078
+    },
+    {
+     "ttft_s": 609.932,
+     "first_token": 64528,
+     "decode_steps": 32,
+     "decode_s": 112.142,
+     "decode_tok_s": 0.285,
+     "decode_ms_median": 3489.843,
+     "end_s": 722.074
+    },
+    {
+     "ttft_s": 609.93,
+     "first_token": 64528,
+     "decode_steps": 32,
+     "decode_s": 112.149,
+     "decode_tok_s": 0.285,
+     "decode_ms_median": 3491.516,
+     "end_s": 722.079
+    },
+    {
+     "ttft_s": 609.929,
+     "first_token": 64528,
+     "decode_steps": 32,
+     "decode_s": 112.126,
+     "decode_tok_s": 0.285,
+     "decode_ms_median": 3489.246,
+     "end_s": 722.054
+    }
+   ],
+   "tier": {
+    "hits": 20767,
+    "misses": 57833,
+    "hit_rate": 0.2642,
+    "gb_read": 2046.68,
+    "gb_read_per_request": 511.67,
+    "slots": 676
+   },
+   "peak_gib": {
+    "npu:0": 26.89,
+    "npu:1": 28.78,
+    "npu:2": 29.04
+   },
+   "allocated_gib": {
+    "npu:0": 18.55,
+    "npu:1": 10.01,
+    "npu:2": 11.39
+   },
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2"
+   ],
+   "device": "npu:0",
+   "tier_slots": 1769,
+   "at": "2026-11-19T10:49:39"
+  },
+  {
+   "scenario": "control-short",
+   "prompt_tokens": 8,
+   "max_context": 2048,
+   "requests": 4,
+   "gen_tokens": 32,
+   "succeeded": 4,
+   "errors": [],
+   "wall_s": 114.24,
+   "ttft_s": 20.09,
+   "ttft_s_list": [
+    20.1,
+    20.1,
+    20.09,
+    20.09
+   ],
+   "ttft_median_s": 20.09,
+   "ttft_spread_s": 0.01,
+   "ttft_sum_over_wall": 0.7,
+   "ttft_slowest_over_fastest": 1.0,
+   "first_token_spread_s": 0.01,
+   "decode_tok_s": 1.36,
+   "decode_steps_total": 128,
+   "decode_tok_s_per_request": [
+    0.34,
+    0.34,
+    0.34,
+    0.34
+   ],
+   "decode_ms_median_per_request": [
+    2902.4,
+    2903.8,
+    2906.1,
+    2913.6
+   ],
+   "tokens_identical": true,
+   "per_request": [
+    {
+     "ttft_s": 20.1,
+     "first_token": 67,
+     "decode_steps": 32,
+     "decode_s": 94.133,
+     "decode_tok_s": 0.34,
+     "decode_ms_median": 2902.37,
+     "end_s": 114.233
+    },
+    {
+     "ttft_s": 20.098,
+     "first_token": 67,
+     "decode_steps": 32,
+     "decode_s": 94.143,
+     "decode_tok_s": 0.34,
+     "decode_ms_median": 2903.776,
+     "end_s": 114.241
+    },
+    {
+     "ttft_s": 20.09,
+     "first_token": 67,
+     "decode_steps": 32,
+     "decode_s": 94.145,
+     "decode_tok_s": 0.34,
+     "decode_ms_median": 2906.098,
+     "end_s": 114.234
+    },
+    {
+     "ttft_s": 20.09,
+     "first_token": 67,
+     "decode_steps": 32,
+     "decode_s": 94.152,
+     "decode_tok_s": 0.34,
+     "decode_ms_median": 2913.64,
+     "end_s": 114.242
+    }
+   ],
+   "tier": {
+    "hits": 21244,
+    "misses": 13856,
+    "hit_rate": 0.6052,
+    "gb_read": 490.36,
+    "gb_read_per_request": 122.59,
+    "slots": 633
+   },
+   "peak_gib": {
+    "npu:0": 20.29,
+    "npu:1": 11.29,
+    "npu:2": 12.5
+   },
+   "allocated_gib": {
+    "npu:0": 18.7,
+    "npu:1": 9.94,
+    "npu:2": 9.8
+   },
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2"
+   ],
+   "device": "npu:0",
+   "tier_slots": 1769,
+   "at": "2026-11-19T10:51:33"
+  },
+  {
+   "scenario": "graphs",
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2"
+   ],
+   "device": "npu:0",
+   "context": 2000,
+   "tokens_measured": 12,
+   "arms": {
+    "eager": {
+     "arm": "eager",
+     "graphs": false,
+     "host_mixes": true,
+     "ms_per_token_median": 1639.2,
+     "ms_per_token_mean": 1919.3,
+     "ms_per_token_list": [
+      1674.4,
+      1625.7,
+      1643.0,
+      1622.2,
+      1635.4,
+      1605.5,
+      1604.4,
+      1549.1,
+      2406.3,
+      2369.9,
+      2809.0,
+      2487.0
+     ],
+     "capture_s": null,
+     "graphs_captured": 0,
+     "tier": {
+      "hits": 2124,
+      "misses": 756,
+      "hit_rate": 0.7375,
+      "gb_read": 26.75,
+      "gb_read_per_request": 26.75,
+      "slots": 1060
+     },
+     "peak_gib": {
+      "npu:0": 21.74,
+      "npu:1": 14.4,
+      "npu:2": 14.77
+     }
+    },
+    "eager-device": {
+     "arm": "eager-device",
+     "graphs": false,
+     "host_mixes": false,
+     "ms_per_token_median": 2581.5,
+     "ms_per_token_mean": 2577.6,
+     "ms_per_token_list": [
+      2590.0,
+      2473.0,
+      2522.8,
+      2534.9,
+      2575.9,
+      2620.5,
+      2654.7,
+      2509.6,
+      2626.6,
+      2584.8,
+      2578.1,
+      2659.9
+     ],
+     "capture_s": null,
+     "graphs_captured": 0,
+     "tier": {
+      "hits": 2328,
+      "misses": 552,
+      "hit_rate": 0.8083,
+      "gb_read": 19.53,
+      "gb_read_per_request": 19.53,
+      "slots": 1099
+     },
+     "peak_gib": {
+      "npu:0": 21.74,
+      "npu:1": 15.0,
+      "npu:2": 15.47
+     }
+    },
+    "graphs": {
+     "arm": "graphs",
+     "graphs": true,
+     "host_mixes": false,
+     "ms_per_token_median": 384.2,
+     "ms_per_token_mean": 388.1,
+     "ms_per_token_list": [
+      4610.4,
+      421.0,
+      443.4,
+      417.8,
+      400.3,
+      381.7,
+      374.9,
+      313.0,
+      386.1,
+      384.2,
+      363.2,
+      383.0
+     ],
+     "capture_s": 4.61,
+     "graphs_captured": 80,
+     "tier": {
+      "hits": 2367,
+      "misses": 513,
+      "hit_rate": 0.8219,
+      "gb_read": 18.15,
+      "gb_read_per_request": 18.15,
+      "slots": 1099
+     },
+     "peak_gib": {
+      "npu:0": 22.14,
+      "npu:1": 15.33,
+      "npu:2": 15.83
+     }
+    },
+    "graph_domain_bytes": 1276096824,
+    "graph_capture_s": 4.01
+   },
+   "state_graph_bytes": 1276096824,
+   "tier": {
+    "hits": 7745,
+    "misses": 2815,
+    "hit_rate": 0.7334,
+    "gb_read": 99.62,
+    "gb_read_per_request": 99.62,
+    "slots": 1099
+   },
+   "peak_gib": {
+    "npu:0": 22.14,
+    "npu:1": 15.33,
+    "npu:2": 15.83
+   },
+   "allocated_gib": {
+    "npu:0": 21.51,
+    "npu:1": 14.92,
+    "npu:2": 15.42
+   },
+   "note": "graphs force the device mHC branch; eager-device isolates that from capture",
+   "wall_s": 62.84,
+   "tier_slots": 1672,
+   "at": "2026-11-19T10:54:06"
+  },
+  {
+   "scenario": "thrash",
+   "states": 2,
+   "steps_per_pass": 3,
+   "single_state_ms": [
+    4995.5,
+    966.4,
+    952.6
+   ],
+   "single_state_median_ms": 959.5,
+   "alternating_ms": [
+    705.3,
+    5131.1,
+    4816.9,
+    4859.8,
+    4811.1,
+    4947.3
+   ],
+   "alternating_median_ms": 4838.4,
+   "alternating_total_s": 25.27,
+   "recaptures": 5,
+   "graphs_captured_per_domain": 80,
+   "wall_s": 32.19,
+   "peak_gib": {
+    "npu:0": 22.78,
+    "npu:1": 25.62,
+    "npu:2": 25.69
+   },
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2"
+   ],
+   "device": "npu:0",
+   "at": "2026-11-19T10:54:59"
+  }
+ ]
+}
