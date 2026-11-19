@@ -66,6 +66,37 @@ def _out(msg: str) -> None:
     sys.stdout.flush()
 
 
+def prompt_chunks(n_tokens: int, chunk: int, max_context: int) -> list[int]:
+    """The sizes of the eager `Dsv41.forward` calls that read `n_tokens` fresh prompt tokens.
+
+    A prompt is read in pieces of at most `chunk` (`--prompt-chunk`) tokens, and **the chunk size is a
+    multiplier on the prefill, not a detail of it.**  Each piece is its own eager forward, a piece of any
+    length routes ~377 of the 384 experts in every layer (a 512-token piece already draws 3 072 pairs),
+    and the expert tier holds only ~62 of them per layer.  So every extra piece re-reads almost the whole
+    expert set from the storage array: four 512-token pieces of a 2 000-token prompt cost about four
+    prefills, one piece costs one.  `docs/ascend-notes/prefill-analysis.md` §5 (O1) has the accounting;
+    measured TTFT and peak HBM at each size are in `docs/ASCEND-DSV41.md` §15.
+
+    Two bounds are applied, in order:
+
+    * `chunk <= 0` means the whole prompt in one forward (the one-chunk case, without having to know the
+      prompt's length first).
+    * a forward longer than `max_context` would write more rows into the KV planes' ring than the ring
+      has, overwriting rows of its own chunk before they are read, so the chunk is clamped to
+      `--max-context`.  That is a correctness bound, not a performance one; it is also why raising
+      `--max-context` is a prerequisite for reading a longer prompt in one forward.
+    """
+    n = max(0, int(n_tokens))
+    if n == 0:
+        return []
+    size = int(chunk)
+    size = n if size <= 0 else size
+    if int(max_context) > 0:
+        size = min(size, int(max_context))
+    size = max(1, size)
+    return [min(size, n - done) for done in range(0, n, size)]
+
+
 class Engine:
     """One conversation, held across requests: the state a reply left is where the next prompt starts."""
 
@@ -324,10 +355,16 @@ class Engine:
             to_read = [ids[-1]]
         logits = None
         if to_read:
-            chunk = max(1, self.args.prefill_chunk)
+            plan = prompt_chunks(len(to_read), self.args.prefill_chunk, self.args.max_context)
+            if len(plan) > 1:
+                # One PP line per forward, so a one-forward prompt reports progress only when it is done.
+                # The plan is in the log at the start, which is what a long silent prompt needs.
+                _log(f"dsv41 prompt: {len(to_read)} fresh tokens in {len(plan)} forward(s) of at most "
+                     f"{max(plan)} (--prompt-chunk {self.args.prefill_chunk}, --max-context "
+                     f"{self.args.max_context}); each forward re-reads the expert set, so fewer is faster")
             done = 0
-            while done < len(to_read):
-                piece = to_read[done:done + chunk]
+            for size in plan:
+                piece = to_read[done:done + size]
                 done += len(piece)
                 last = done >= len(to_read)
                 got = self.rt.model.forward(piece, self.state, logits_last_only=True, compute_logits=last)
@@ -500,12 +537,24 @@ def build_parser() -> argparse.ArgumentParser:
                          "npu:0,npu:1,npu:2,npu:3; the layers stay on --device")
     ap.add_argument("--expert-reserve-gib", type=float, default=6.0,
                     help="HBM kept free for activations and temporaries; the tier gets the rest")
-    ap.add_argument("--io-threads", type=int, default=6)
+    ap.add_argument("--io-threads", type=int, default=6,
+                    help="threads the expert fetch reads the checkpoint with (one preadv per thread per "
+                         "expert projection).  The array knee on this machine is 12-24: 1.4 GB/s at 1 "
+                         "thread, 2.3 at 6, 2.5 at 12 (docs/ASCEND-DSV41.md §1); a prefill is "
+                         "bandwidth-bound, so 12 is the measured-better value for a long prompt")
     ap.add_argument("--expert-batch", type=int, default=8,
                     help="experts fetched per MoE batch; sizes the pinned staging ring "
-                         "(2 x 3 x batch x 11.8 MiB)")
+                         "(2 x 3 x batch x 11.8 MiB) and the per-layer batching.  Also the model's "
+                         "read batch: a prefill reads ~318 experts a layer, so this is how many large "
+                         "preads each fetch issues (see docs/ASCEND-DSV41.md §15 for the measured effect)")
     ap.add_argument("--max-context", type=int, default=8192)
-    ap.add_argument("--prefill-chunk", type=int, default=512)
+    ap.add_argument("--prompt-chunk", "--prefill-chunk", dest="prefill_chunk", type=int, default=512,
+                    metavar="N",
+                    help="the most tokens one prompt forward reads (default 512; 0 = the whole prompt).  "
+                         "Each extra forward re-reads almost the whole expert set from the storage "
+                         "array, so this is the largest prefill lever: measured on a 2 000-token prompt, "
+                         "4 x 512 costs ~4x one forward in TTFT.  Clamped to --max-context (a longer "
+                         "forward would overwrite its own KV rows); docs/ASCEND-DSV41.md §15")
     ap.add_argument("--graphs", action="store_true",
                     help="capture the one-token decode path as per-layer NPU graphs, as --graphs in "
                          "ascend/run_dsv41.py: a g_pre/g_post pair per layer, one g_pre per indexer "

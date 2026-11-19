@@ -344,6 +344,7 @@ vision, DSpark speculative decoding, MTP, and more than one conversation at a ti
 | landing-zone copy work (that change alone) | **0.880** (452.4 -> 409.6 ms, -42.8 ms over 48 paired samples) |
 | expert tier, four cards | **90.9% hit, 0.774 GB/step read**; one card 64.6%, 3.004 GB/step |
 | prompt reading | 421 s for 823 prompt tokens in the GSM8K re-check (about 0.5 s/token), limited by the array |
+| prompt reading, one chunk | **233.5 s for 2 000 tokens** with `--prompt-chunk 2048` on `npu:0` (354 GB of expert bytes, peak 27.2 GiB) against **440.0 s** for the default four 512-token pieces; the chunk size, not the card, is the lever |
 | decode, routed branch off (eager) | 544 ms/token - the floor the 40 layers' small operations set |
 | one MoE layer, its experts resident (eager) | 12.5 ms |
 | the card itself | 246 TFLOP/s bf16, 20 GB/s host-to-HBM, 30.48 GiB per process |
@@ -419,12 +420,24 @@ tier. The engine sizes the tier from the HBM actually left after the resident we
 `--expert-slots` overrides it, and a card that runs out of room drops an expert from the tier instead of
 failing the request.
 
+`--prompt-chunk N` reads the prompt in pieces of at most N tokens (default 512, the old `--prefill-chunk`
+name still works; `0` is the whole prompt). Each piece is its own eager forward, and a piece of any length
+routes almost the whole expert set, so every extra piece re-reads it from the array: on `npu:0` a
+2 000-token prompt measured 233.5 s as one forward against 440.0 s as four, and the one-forward case was
+also the lower HBM risk (peak activations 2.7 GiB against 1.9 GiB, inside the `--expert-reserve-gib` 6 GiB).
+For a long prompt, raise it; the trade is that a one-forward prompt prints a single `PP` progress line at
+the end. `--io-threads` (default 6) is the expert fetch's thread count and `--expert-batch` (default 8) is
+the pinned ring's capacity and the model's read batch; 32 was measured to give no fetch gain and to cost
+1.6 GiB more peak HBM, so leave the batch at 8 (`docs/ASCEND-DSV41.md` §15).
+
 **What is next**, in the order the measurements argue for: cut the recapture cost - 80 graphs
 take 1.8-1.9 s and belong to a State, so every new conversation pays it again, and so does crossing an
 indexer bucket; make the expert tier itself the landing zone, so the 8.1 GB/step device-to-device copy stops
 being the top device-time item; decide whether the 137.5 ms device floor is worth attacking, since the three
 obvious fused ops were measured and rejected; and note that prefill (`T > 1`) is still eager and array-bound
-(421 s for 823 prompt tokens in the GSM8K re-check), while capture does not apply to it. Multi-session
+(421 s for 823 prompt tokens in the GSM8K re-check), while capture does not apply to it - the prompt chunk
+is the lever that is already there (one forward of 2 000 tokens measured 233.5 s against 440.0 s for the
+default four), and the rest is the array. Multi-session
 (`READY ... multi=n`) is still absent. The queue with acceptance is
 [`docs/ascend-notes/PLAN.md`](docs/ascend-notes/PLAN.md).
 

@@ -126,7 +126,7 @@ at a time (the serve engine does expose the captured decode now, §6). The four-
 
 ## 5. Testing
 
-Everything runs as `python -m unittest discover -s ascend -p "test_*.py" -t .`. The suite is **170 tests**;
+Everything runs as `python -m unittest discover -s ascend -p "test_*.py" -t .`. The suite is **177 tests**;
 10 of them skip in this checkout when the NPU tests are not opted in (`DSV41_RUN_NPU_TESTS=1`) or when no
 card is present, and the CPU tests run in CI.
 
@@ -165,7 +165,11 @@ card is present, and the CPU tests run in CI.
   captured decode's serve surface: `--graphs`/`--graph-verify`/`--graph-max-conversations` and their
   defaults, the flags reaching `runtime.build`, capture on a conversation's first decode, release when the
   conversation ends, release when a prompt is abandoned, and a teardown failure being logged, counted
-  against the bound, and served eagerly instead of taking the engine down.
+  against the bound, and served eagerly instead of taking the engine down. The prompt chunk too:
+  `--prompt-chunk` and its old `--prefill-chunk` name, the default still 512, `prompt_chunks()`'s split,
+  `0` meaning the whole prompt, the clamp to `--max-context`, and one PP line per forward over the real
+  protocol. And the two streaming flags: their CLI defaults, that they reach `runtime.build`, and that
+  `ExpertStreamer` ends up with that many read threads and the model with that read batch.
 * `test_env.py` — the four hardware facts the design rests on.
 
 ## 6. The engine behind the serve protocol
@@ -244,7 +248,9 @@ captured decode (§6). What is left is below, and the queue with acceptance is
    rejected: `npu_dynamic_quant` moves the logits 3.1e-2 (outside the 2e-3 promise), `npu_clipped_swiglu` is
    +1.9 ms net, and `npu_fusion_attention` cannot be captured (error 107025).
 4. **Prefill and multi-session.** Prefill (`T > 1`) is eager and array-bound - 421 s for 823 prompt tokens in
-   the GSM8K re-check; capture does not apply to it. The serve engine still holds one conversation.
+   the GSM8K re-check; capture does not apply to it. **Do not leave `--prompt-chunk` at 512**: one
+   2 000-token forward measured 233.5 s against 440.0 s for the default four, and it is also the safer side
+   of the HBM ledger (§15). The serve engine still holds one conversation.
 
 ## 8. Where the 3.25 s/token went
 
@@ -515,3 +521,98 @@ at p≈1.000 (`cc01d7d`). 160 tests, 8 skipped.
 This is the ordering story the "what it came to" table in the optimisation document ends with: the graphs
 were worth 2.08x on four cards, the landing-zone work another 42.8 ms, and the re-check and the Engram fix
 changed what can be claimed about accuracy and correctness, not the step time.
+
+## 15. Prefill on the serve path: one prompt chunk, and the two streaming flags
+
+Decode is captured and measured; prefill (`T > 1`) is eager and, on this machine, **the number of prompt
+forwards is the multiplier on its cost**. `serve_engine` reads a prompt in pieces of `--prompt-chunk`
+tokens and calls `Dsv41.forward` once per piece. A piece of *any* length routes ~180-250 of the 384 experts
+in every layer (512 tokens already draw 3 072 pairs), the expert tier holds 284 slots on one card (2 480 on
+four), and a cold prefill misses nearly all of them, so **every piece re-reads almost the whole expert set
+from the array**. `docs/ascend-notes/prefill-analysis.md` §5 (O1) is the accounting; this section is the
+measurement.
+
+### What bounded the chunk size
+
+Only the constant. Nothing clamped it against anything: `--prefill-chunk` defaulted to 512, and a piece
+longer than `--max-context` would write more rows into the KV planes' ring than the ring has, overwriting
+rows of its own piece before they are read. HBM was not the limit at 2 000 (see the table). The flag is now
+`--prompt-chunk` (`--prefill-chunk` kept as the old name), `0` means the whole prompt in one forward, the
+plan is the pure function `prompt_chunks()` in `serve_engine.py` (so it is tested without a card), and the
+chunk is clamped to `--max-context` for correctness.
+
+### Measured: one 2 000-token prompt, `npu:0` only
+
+`ASCEND_RT_VISIBLE_DEVICES=0`, `--max-context 4096`, one card so the tier is 284 slots (9.4 GiB) against
+the four-card 2 480, resident weights 15.09 GiB, 32 GiB share, io_threads 6, expert_batch 8, the eager
+per-token attention of this commit, 2 000 synthetic ids (`(i*7+3) % 40000`), through `Engine.generate`
+(the code `serve/server.py` drives):
+
+| `--prompt-chunk` | forwards | TTFT | expert bytes | peak HBM (allocated / reserved) | per-forward ms |
+|---|---:|---:|---:|---:|---|
+| 512 (default) | 4 | 440.0 s | 1 013.5 GB | 26.40 / 27.33 GiB | 107, 99, 119, 115 s |
+| 1 024 | 2 | 286.0 s | 605.0 GB | 26.54 / 27.87 GiB | 148, 138 s |
+| 2 048 | **1** | **233.5 s** | **354.2 GB** | 27.21 / 29.39 GiB | 233 s |
+
+**One forward is 206.5 s (-47 %) faster than the default four.** The bytes explain it: 1 013.5 GB for four
+pieces against 354.2 GB for one, i.e. 2.86x. It is not 4x because a 512-token piece routes fewer distinct
+experts per layer (~179, against ~250 at 2 000), so a piece is not a constant cost; that is also why the
+2-piece case (-52.5 s, 18 %) is much smaller than its byte count suggests.
+
+**HBM is the safe side.** The peak *activation* high-water above the resident weights and the tier is
+1.9 GiB at 512 and 2.7 GiB at one 2 000-token piece (+0.8 GiB; the indexer's `[T,32,1,T]` fp32 score tensor
+is the T² term, 512 MB at 2 000). `--expert-reserve-gib` reserves 6 GiB for exactly this, so the allocated
+peak rises 0.8 GiB and stays 4.8 GiB under the 32 GiB share. **One chunk at 2 000 is safe**; the reserve,
+not the chunk, is the cap, and a 4 096-token piece (the tensor's T² term doubling to ~1 GiB) is still inside
+it, while 8 192 is not.
+
+Two caveats on the absolute numbers. The array read at 3.4-4.8 GB/s in these runs (the phase timers and
+the byte deltas agree on that range), against the 2.5 GB/s cold ceiling of §1: either the array was faster
+that day or the page cache held part of the set from the run that preceded this one. The absolute TTFTs are
+therefore optimistic for a cold start; the *ratio* is the transferable number, and it grows when the array
+is cold because the non-byte term (attention and MoE dispatch) is then a smaller share.
+
+**Default.** `--prompt-chunk 2048` is the recommendation for long prompts (or `0`). The flag's default stays
+512, as it was introduced, because a one-forward prompt prints a single `PP` line at the end and the
+server's dashboard reads `PP` for progress; the engine now logs the plan on stderr at the start
+(`dsv41 prompt: 2000 fresh tokens in 1 forward(s) ...`), but a UI watching `PP` sees nothing until the
+prefill finishes. That is the trade, and it is the operator's to make.
+
+### The two streaming flags (O7)
+
+`--io-threads N` is the expert fetch's thread count (`ExpertStreamer._pool`; one `preadv` per thread per
+expert projection) and `--expert-batch N` is both the pinned staging ring's capacity and the model's read
+batch (`Dsv41.expert_batch`, how many experts one fetch issues; a prefill reads ~180-250 a layer, so at 8
+that is 20-30 fetches a layer). Both are on the serve CLI and reach `runtime.build` -> `ExpertStreamer`;
+tests pin that. Measured on one 512-token prefill chunk (273.7 GB of expert bytes in *every* arm), phase
+timers on, so `moe_fetch` includes the landing (the timers synchronise each phase; the phases reconcile
+with the wall):
+
+| io_threads | expert_batch | TTFT | `moe_fetch` | fetch rate | peak HBM |
+|---:|---:|---:|---:|---:|---:|
+| 6 | 8 | 138.2 s | 78 s | 3.50 GB/s | 26.39 GiB |
+| 12 | 8 | 114.9 s | 57 s | 4.80 GB/s | 26.41 GiB |
+| 6 | 32 | 136.4 s | 80 s | 3.42 GB/s | 27.98 GiB |
+| 12 | 32 | 133.5 s | 73 s | 3.75 GB/s | 27.98 GiB |
+
+The arms are in that order, so warmth and load drift with them; to separate the thread effect from the
+array's own drift the same pair was run alternating, four times, with the timers off (a 512-token chunk,
+273.7 GB, the array busy from the other tenant):
+
+| arm | 6:8 | 12:8 | 6:8 | 12:8 |
+|---|---:|---:|---:|---:|
+| TTFT | 229.2 s | 163.2 s | 194.0 s | 204.5 s |
+
+**`expert_batch 32` does not help the prefill and costs HBM.** It changes the fetch rate not at all (3.42
+against 3.50 GB/s at 6 threads) and raises the peak by 1.6 GiB, because the device-side batch is 32 x 35.39
+MB instead of 8. The prediction that a bigger prefill batch finds more array bandwidth is wrong here: the
+batch of 8 already saturates what the array gives this process. Leave the default at 8.
+
+**`io_threads 12` is directionally faster but not separable from this machine's noise.** Three of the four
+comparisons point the same way (fetch 78 -> 57 s in the timed pair; 229.2 -> 163.2 s and 80 -> 73 s), and
+the alternating wall means 6:8 211.6 s against 12:8 183.9 s, but two runs of the *same* configuration
+differed by 35-41 s, and the second pair went the other way. The honest reading: the flag does what it
+claims on the fetch (it is the thread pool; 12 threads measured as fast as 6 and once 29 % faster), but the
+array's run-to-run variation on a shared machine is larger than the effect, so the default stays 6 and 12
+is an operator choice - with §1's cold-array knee (2.3 GB/s at 6, 2.5 at 12) as the prior it is consistent
+with.

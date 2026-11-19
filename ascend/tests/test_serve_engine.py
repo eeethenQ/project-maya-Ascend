@@ -422,5 +422,113 @@ class TheConversationGraphLifecycle(unittest.TestCase):
         self.assertIn("teardown at shutdown failed", err.getvalue())
 
 
+@NEEDS_TORCH
+class ThePromptChunkArguments(unittest.TestCase):
+    """`--prompt-chunk` (with `--prefill-chunk` kept as the old name) and what bounds one forward."""
+
+    @staticmethod
+    def parser():
+        from ascend import serve_engine
+        return serve_engine.build_parser()
+
+    def test_the_default_is_the_old_constant_and_both_names_parse(self):
+        base = self.parser().parse_args(["--serve", "--model", "/tmp/model"])
+        self.assertEqual(base.prefill_chunk, 512, "the current default, unchanged")
+        new = self.parser().parse_args(["--serve", "--model", "/tmp/model", "--prompt-chunk", "2048"])
+        old = self.parser().parse_args(["--serve", "--model", "/tmp/model", "--prefill-chunk", "1024"])
+        self.assertEqual(new.prefill_chunk, 2048)
+        self.assertEqual(old.prefill_chunk, 1024, "--prefill-chunk keeps working")
+        zero = self.parser().parse_args(["--serve", "--model", "/tmp/model", "--prompt-chunk", "0"])
+        self.assertEqual(zero.prefill_chunk, 0, "0 is the one-forward case")
+
+    def test_the_plan_is_one_forward_per_chunk_and_the_whole_prompt_at_zero(self):
+        from ascend.serve_engine import prompt_chunks
+
+        self.assertEqual(prompt_chunks(2000, 512, 8192), [512, 512, 512, 464])
+        self.assertEqual(prompt_chunks(2000, 1024, 8192), [1024, 976])
+        self.assertEqual(prompt_chunks(2000, 2048, 8192), [2000])
+        self.assertEqual(prompt_chunks(2000, 0, 8192), [2000])
+        self.assertEqual(prompt_chunks(0, 512, 8192), [])
+        self.assertEqual(prompt_chunks(1, 512, 8192), [1])
+
+    def test_a_chunk_is_never_longer_than_the_kv_ring(self):
+        """A forward longer than --max-context would overwrite its own rows in the planes' ring."""
+        from ascend.serve_engine import prompt_chunks
+
+        self.assertEqual(prompt_chunks(5000, 8192, 2048), [2048, 2048, 904])
+        self.assertEqual(prompt_chunks(10, 512, 4), [4, 4, 2])
+        self.assertEqual(prompt_chunks(10, 0, 4), [4, 4, 2], "0 is clamped by the ring too")
+
+    def test_a_prompt_reports_one_pp_per_forward(self):
+        """The chunk flag really changes the number of eager forwards the serve path runs."""
+        from ascend import serve_engine
+
+        with TinyModel() as model:
+            for chunk, forwards in ((512, 1), (2, 3), (0, 1)):
+                engine = serve_engine.Engine(engine_args(model.root, prefill_chunk=chunk, graphs=False))
+                try:
+                    out, err = quiet_generate(engine, "GEN 1 3,5,7,11,13,17")
+                finally:
+                    engine.shutdown()
+                pp = [l for l in out.splitlines() if l.startswith("PP ")]
+                self.assertEqual(len(pp), forwards,
+                                 f"--prompt-chunk {chunk} must run {forwards} forward(s), saw {pp}")
+                if forwards > 1:
+                    self.assertIn("fresh tokens in 3 forward(s)", err)
+                self.assertIn("DONE 1 6", out, "the prompt's last token was still decoded")
+
+
+@NEEDS_TORCH
+class TheStreamingFlags(unittest.TestCase):
+    """O7: `--io-threads` and `--expert-batch` reach the streamer that reads the array, and do what they say."""
+
+    @staticmethod
+    def parser():
+        from ascend import serve_engine
+        return serve_engine.build_parser()
+
+    def test_they_are_on_the_serve_cli_with_the_measured_defaults(self):
+        args = self.parser().parse_args(["--serve", "--model", "/tmp/model"])
+        self.assertEqual(args.io_threads, 6, "the engine's historical default")
+        self.assertEqual(args.expert_batch, 8)
+        chosen = self.parser().parse_args(
+            ["--serve", "--model", "/tmp/model", "--io-threads", "12", "--expert-batch", "32"])
+        self.assertEqual(chosen.io_threads, 12)
+        self.assertEqual(chosen.expert_batch, 32)
+
+    def test_the_flags_reach_runtime_build(self):
+        from types import SimpleNamespace
+        from ascend import serve_engine
+
+        seen: dict = {}
+        real = serve_engine.rt.build
+
+        def fake(**kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(cfg=SimpleNamespace(num_hidden_layers=4))
+
+        try:
+            serve_engine.rt.build = fake
+            serve_engine.Engine(engine_args(Path("/tmp/not-loaded"), io_threads=12, expert_batch=32))
+        finally:
+            serve_engine.rt.build = real
+        self.assertEqual(seen["io_threads"], 12)
+        self.assertEqual(seen["expert_batch"], 32)
+
+    def test_the_streamer_gets_that_many_threads_and_experts_per_fetch(self):
+        """`--expert-batch` is the model's read batch, not just the staging ring's capacity."""
+        from ascend.dsv41 import runtime as rt
+
+        with TinyModel() as model:
+            run = rt.build(model=str(model.root), device="cpu", dtype="float32",
+                           io_threads=3, expert_batch=5, graphs=False)
+            try:
+                self.assertEqual(run.experts._pool._max_workers, 3)
+                self.assertEqual(run.experts._max_batch, 5)
+                self.assertEqual(run.model.expert_batch, 5, "the MoE batches at the ring's size")
+            finally:
+                run.close()
+
+
 if __name__ == "__main__":
     unittest.main()
