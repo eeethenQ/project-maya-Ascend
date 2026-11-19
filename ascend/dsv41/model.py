@@ -514,6 +514,10 @@ class ExpertStreamer(ExpertSource):
         # `test_a_cached_expert_owns_exactly_its_own_bytes` pins each cached projection to its own storage;
         # runtime.build turns it on for the captured decode, whose only consumer is the fixed slab.
         self.landing_blocks = bool(landing_blocks)
+        # Diagnostic only (`ascend/bench_slab_repeat.py`): fill the slab this many times.  The copies are
+        # idempotent, so the arithmetic is unchanged and a paired A/B measures the fill's marginal cost on
+        # the critical path - the ceiling every no-copy idea is bounded by.
+        self.landing_repeat = 1
         if self.cache_slots:                 # constructed directly with a slot count: split it over the cards
             self.set_slots(total=self.cache_slots)
 
@@ -758,22 +762,23 @@ class ExpertStreamer(ExpertSource):
             raise ValueError(f"{len(experts)} experts do not fit a landing zone of {slab.shape[0]} slots")
         blocks = self._blocks(layer, experts)
         n = len(experts)
-        for i, block in enumerate(blocks):
-            whole = block.get("slab") if self.landing_mode == "merged" else None
-            if whole is not None:
-                # one expert is contiguous in the slab as [w1 | w2 | w3]: one copy, not three
-                slab[i].copy_(whole)
-                continue
-            for j, p in enumerate(("w1", "w2", "w3")):
-                slab[i, j].copy_(block[p][0][0].reshape(-1))
-        if scale_flat is not None and self.landing_mode == "merged":
-            sources = [block[p][1][0].reshape(-1) for block in blocks
-                       for p in ("w1", "w2", "w3")]
-            torch.cat(sources, out=scale_flat[:n].reshape(-1))
-        else:
+        for _repeat in range(max(1, int(self.landing_repeat))):
             for i, block in enumerate(blocks):
+                whole = block.get("slab") if self.landing_mode == "merged" else None
+                if whole is not None:
+                    # one expert is contiguous in the slab as [w1 | w2 | w3]: one copy, not three
+                    slab[i].copy_(whole)
+                    continue
                 for j, p in enumerate(("w1", "w2", "w3")):
-                    scales[j][i].copy_(block[p][1][0])
+                    slab[i, j].copy_(block[p][0][0].reshape(-1))
+            if scale_flat is not None and self.landing_mode == "merged":
+                sources = [block[p][1][0].reshape(-1) for block in blocks
+                           for p in ("w1", "w2", "w3")]
+                torch.cat(sources, out=scale_flat[:n].reshape(-1))
+            else:
+                for i, block in enumerate(blocks):
+                    for j, p in enumerate(("w1", "w2", "w3")):
+                        scales[j][i].copy_(block[p][1][0])
 
     def staging_bytes(self) -> int:
         """What the pinned staging ring costs, for the budget that decides the expert tier."""
