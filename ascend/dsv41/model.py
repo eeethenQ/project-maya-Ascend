@@ -62,6 +62,14 @@ def dequant_int8(weight: np.ndarray, scale: np.ndarray, offset: np.ndarray | Non
 # flag keeps the CPU reference path - the one every test compares against - on plain torch.
 _FUSED_QUANT = torch_npu is not None and hasattr(torch_npu, "npu_dynamic_quant")
 
+# Queries per block in the vectorised prompt path.  The block's window union is `B + win - 1` rows, so on
+# the real model (win 128) a block computes 191 window keys per query to use 128 - a 33 % over-compute
+# worth at most tens of milliseconds against the 207 s the per-token loop costs.  Doubling B to 128 halves
+# the still-remaining dispatch (~0.9 s -> ~0.5 s per prefill) but doubles both that waste and the fp32 key
+# transient (64: 92 MB, 128: 201 MB); 64 is where the dispatch term stops mattering and the transient is
+# well inside the reserve.
+ATTN_BLOCK = 64
+
 
 def per_token_int8(x: torch.Tensor, *, fused: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamic per-token symmetric int8 activation quantization: ``q = round(x / (max|x|/127))``.
@@ -391,11 +399,13 @@ class ExpertSource:
     this machine), so dequantization happens on the device that is about to multiply.
     """
 
-    def fetch_int8(self, layer: int, experts: list[int]) -> list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+    def fetch_int8(self, layer: int, experts: list[int], insert: bool = True) -> list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         """One ``{"w1"|"w2"|"w3": (q [1,out,in] int8, scale, offset)}`` per requested expert, on the device.
 
         Per expert rather than stacked: a stacked return forces a second copy of every expert's 35 MB when
-        the batch mixes resident and streamed ones, and the batch is per-expert work anyway.
+        the batch mixes resident and streamed ones, and the batch is per-expert work anyway.  ``insert=False``
+        says the misses must not be added to a resident tier: a caller whose working set cannot fit it (a
+        long prompt) would only evict what is there without keeping anything of its own.
         """
         raise NotImplementedError
 
@@ -426,7 +436,7 @@ class NullExpertSource(ExpertSource):
     def __init__(self, ckpt: Checkpoint, cfg: TextConfig, dtype=torch.bfloat16):
         self.ckpt, self.cfg, self.dtype = ckpt, cfg, dtype
 
-    def fetch_int8(self, layer, experts):
+    def fetch_int8(self, layer, experts, insert: bool = True):
         return []
 
 
@@ -637,11 +647,15 @@ class ExpertStreamer(ExpertSource):
                 torch.npu.set_device(previous)
 
     # -- the interface ------------------------------------------------------------------------
-    def _blocks(self, layer: int, experts: list[int]) -> list[dict]:
+    def _blocks(self, layer: int, experts: list[int], insert: bool = True) -> list[dict]:
         """The requested experts' blocks, from the resident tier or streamed, with the tier's accounting.
 
         Both fetch paths share this: where the bytes end up (fresh tensors or a fixed landing slab) is the
         only difference, so the hit/miss counts, the LRU and the scale cache stay one piece of code.
+
+        ``insert=False`` counts and streams the misses but does not put them in the tier.  For a prompt that
+        routes more distinct experts per layer than the tier holds per card, every insert evicts a decode
+        expert that the next token will want back; keeping them would leave the tier exactly as it was.
         """
         experts = [int(e) for e in experts]
         if not experts:
@@ -667,6 +681,8 @@ class ExpertStreamer(ExpertSource):
             fresh = self._read_many(layer, [e for _, e in missing])
             for (i, e), block in zip(missing, fresh):
                 blocks[i] = block
+                if not insert:
+                    continue
                 dev = self.device_for(layer)
                 if self._slots.get(dev, 0):
                     # clone for the cache: a slice of the batch keeps the whole batch's storage alive, so
@@ -704,8 +720,20 @@ class ExpertStreamer(ExpertSource):
             return cached
         return {p: tuple(t.clone() for t in block[p]) for p in ("w1", "w2", "w3")}
 
-    def fetch_int8(self, layer: int, experts: list[int]) -> list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
-        return self._blocks(layer, experts)
+    def tier_slots_per_layer(self, device) -> int:
+        """The tier's slots *per layer* on the card a layer's experts live on; 0 when there is no tier.
+
+        The LRU is one list per card shared by every layer whose experts live there, so the set one layer
+        may keep is its card's slots divided by the number of those layers.  One 2 000-token prompt's layer
+        routes ~250-380 distinct experts against this number, so the prompt cannot warm the tier even if it
+        fills it; `_routed_sum` uses this to decide whether a fetch may insert.
+        """
+        devices = self.layer_devices or [self.device]
+        layers = sum(1 for d in devices if str(d) == str(device))
+        return int(self._slots.get(str(device), 0) // max(1, layers))
+
+    def fetch_int8(self, layer: int, experts: list[int], insert: bool = True) -> list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+        return self._blocks(layer, experts, insert=insert)
 
     def fetch_int8_into(self, layer: int, experts: list[int], slab: torch.Tensor,
                         scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1226,12 +1254,14 @@ class Dsv41:
 
         out = torch.empty(T, H, D, device=x.device, dtype=torch.float32)
         topk = state.topk if (r and state.topk is not None) else None
-        for t in range(T):
-            # always `win` rows plus a mask, never a varying slice: the shape is what a graph replays
-            wkeys, wvalid = state.kv.read_window(li, positions[t:t + 1])
+        scale = float(D) ** -0.5
+        sink = lw.attn["attn_sink"]
+        if T == 1:
+            # the captured decode step: one row, one window read, exactly the arithmetic a graph replays
+            wkeys, wvalid = state.kv.read_window(li, positions[0:1])
             wkeys = wkeys.float()                                          # [win, D]
             if r:
-                j = topk[t]
+                j = topk[0]
                 # the indexer's -1 padding gathers entry 0 and is masked by `cvalid`, exactly as the host
                 # `long_kv[:, j.clamp_min(0)]` slice did, but with no host index in the graph
                 ckeys = state.kv.read_groups(role.kv_source_layer, j).float()
@@ -1240,8 +1270,50 @@ class Dsv41:
                 valid = torch.cat([wvalid, cvalid])
             else:
                 keys, valid = wkeys, wvalid
-            out[t] = self.sparse_attn(q[t:t + 1], keys[None], valid[None], lw.attn["attn_sink"],
-                                      float(D) ** -0.5)[0]
+            out[0] = self.sparse_attn(q[0:1], keys[None], valid[None], sink, scale)[0]
+        else:
+            # A prompt chunk, in blocks of ATTN_BLOCK queries.  Each query sees exactly `win` window rows
+            # plus its own top-k compressed rows, so a block's union of window rows runs from query 0's
+            # first window row to the last query's own position: `nb + win - 1` rows.  Query i's window is
+            # the contiguous slice [i, i + win - 1] of that union, which makes the causal band a lower-
+            # triangle - the union ends at the last query, so the upper edge is never reached.  Keys keep
+            # the per-token order (window ascending, then the indexer's sorted compressed entries), and
+            # `sparse_attn` still folds the sink into the denominator, so this is the same softmax tiled
+            # over queries: only the reduction order inside the two einsums differs.
+            win = state.kv.window
+            plane = state.kv.swa[li][0]
+            max_context = state.kv.max_context
+            full_band = None
+            for t0 in range(0, T, ATTN_BLOCK):
+                t1 = min(t0 + ATTN_BLOCK, T)
+                nb = t1 - t0
+                # absolute window positions of the union, ascending; a negative one clamps onto slot 0 and
+                # is masked by `wvalid` exactly as `read_window` handles a position before token 0
+                wp = positions[t0] - (win - 1) + torch.arange(nb + win - 1, device=x.device)
+                wkeys = plane.index_select(0, wp.clamp_min(0) % max_context).float()    # [nb+win-1, D]
+                if nb == ATTN_BLOCK:
+                    if full_band is None:
+                        cols = torch.arange(ATTN_BLOCK + win - 1, device=x.device)
+                        full_band = cols[None, :] >= cols[:ATTN_BLOCK, None]
+                    band = full_band
+                else:
+                    cols = torch.arange(nb + win - 1, device=x.device)
+                    band = cols[None, :] >= cols[:nb, None]
+                wvalid = band & (wp >= 0)[None, :]
+                keys = wkeys.unsqueeze(0).expand(nb, -1, -1)
+                valid = wvalid
+                if r:
+                    j = topk[t0:t1]                                             # [nb, topk]
+                    # one gather for the whole block: the rows are [nb, topk, D], the same rows the
+                    # per-token `read_groups` returned, with -1 still folded onto entry 0 and masked
+                    ckeys = state.kv.read_groups(role.kv_source_layer, j).float()
+                    keys = torch.cat([keys, ckeys], 1)
+                    valid = torch.cat([wvalid, j >= 0], 1)
+                else:
+                    # two layers only; materialise the expanded view so the batched einsum sees a
+                    # contiguous batch rather than a stride-0 one
+                    keys = keys.contiguous()
+                out[t0:t1] = self.sparse_attn(q[t0:t1], keys, valid, sink, scale)
 
         out = torch.cat([out[..., :-rd],
                          self.rope.apply(out[..., -rd:], freqs, positions, inverse=True, cs=cos_sin_inv)], -1)
@@ -1340,6 +1412,17 @@ class Dsv41:
         shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
         return y + self.mm(shared, lw.ffn["shared_w2"])
 
+    def _tier_holds(self, x: torch.Tensor, n_experts: int) -> bool:
+        """Whether a layer's distinct-expert set can be kept in the tier on the card it runs on.
+
+        A 2 000-token prompt routes ~250-380 distinct experts per layer against ~50 slots on a card, so
+        inserting its misses cannot warm the tier - it can only evict the set the decode stream had
+        resident, and the next decode step then starts near 0 % hit (prefill-analysis O8).  A set that fits
+        still inserts, which is exactly what a decode step and a short chunk do to warm the tier.
+        """
+        capacity = getattr(self.weights.experts, "tier_slots_per_layer", None)
+        return callable(capacity) and capacity(x.device) >= n_experts
+
     def _routed_sum(self, li: int, x: torch.Tensor, idx: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
         """Sum over the routed experts, all tensors on the card the layer's experts live on."""
         T = x.shape[0]
@@ -1347,19 +1430,34 @@ class Dsv41:
             return self._routed_one(li, x, idx, wts)
         y = torch.zeros(T, self.cfg.hidden_size, device=x.device, dtype=torch.float32)
         uniq = torch.unique(idx).tolist()
+        insert = self._tier_holds(x, len(uniq))
+        # One quantisation of the layer's activation for all of its experts: `per_token_int8` is per row, so
+        # quantising the chunk once and gathering rows is the same arithmetic on the same values as the
+        # per-expert `expert_mm` quantising `x[rows]` each time (bit-identical, and three calls per expert
+        # become one per layer).
+        xq, xscale = (per_token_int8(x, fused=False)
+                      if (self.int8_experts and torch_npu is not None) else (None, None))
         # A prompt routes far more distinct experts than a decode step - up to all 384 - and holding their
         # dequantized weights at once is 13 GiB.  Batching bounds both the staging ring and the device.
         for start in range(0, len(uniq), self.expert_batch):
             batch = uniq[start:start + self.expert_batch]
             with self.phase("moe_fetch"):
-                blocks = self.weights.experts.fetch_int8(li, batch)
+                blocks = self.weights.experts.fetch_int8(li, batch, insert=insert)
             for i, e in enumerate(batch):
                 rows, slot = torch.where(idx == e)
-                xs = x[rows]
-                g = self.expert_mm(xs, *blocks[i]["w1"]).clamp(max=self.lim)
-                u = self.expert_mm(xs, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
-                h = F.silu(g) * u
-                y.index_add_(0, rows, self.expert_mm(h, *blocks[i]["w2"]) * wts[rows, slot, None])
+                if xq is not None:
+                    rows_q, rows_s = xq[rows], xscale[rows]
+                    g = self.expert_mm_q(rows_q, rows_s, *blocks[i]["w1"]).clamp(max=self.lim)
+                    u = self.expert_mm_q(rows_q, rows_s, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
+                    h = F.silu(g) * u
+                    y.index_add_(0, rows, self.expert_mm_q(*per_token_int8(h, fused=False),
+                                                           *blocks[i]["w2"]) * wts[rows, slot, None])
+                else:
+                    xs = x[rows]
+                    g = self.expert_mm(xs, *blocks[i]["w1"]).clamp(max=self.lim)
+                    u = self.expert_mm(xs, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
+                    h = F.silu(g) * u
+                    y.index_add_(0, rows, self.expert_mm(h, *blocks[i]["w2"]) * wts[rows, slot, None])
         return y
 
     def _routed_one(self, li: int, x: torch.Tensor, idx: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
