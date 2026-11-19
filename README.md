@@ -408,15 +408,18 @@ python3 -m ascend.run_dsv41 --model /mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-10
 
 `--graphs` is off by default and only the one-token step is captured; prompt chunks stay eager. It works
 with the spread tier, because each layer's `g_post` is captured on the card its experts live on. The serve
-engine (`ascend/strata-ascend`) has no `--graphs` flag yet, so the server runs the eager step; the captured
-numbers above come from `run_dsv41 --graphs`. Add `--engram-tokenizer <the model's tokenizer.json>` to
+engine (`ascend/strata-ascend`) takes the same `--graphs` (and `--graph-verify`): the graphs bake the
+conversation State's buffers, so the server captures them per conversation, keeps them across that
+conversation's turns, and releases them when it ends; the capture cost is reported in the engine log
+(measured: 80 graphs in 1.87-2.06 s on `npu:0`). `--graph-max-conversations` (default 1) is the bound, and
+a teardown that cannot destroy a graph is logged and served eagerly rather than taking the engine down. Add
+`--engram-tokenizer <the model's tokenizer.json>` to
 enable Engram (it works on the captured path too); `--expert-devices npu:0,npu:1,npu:2,npu:3` spreads the
 tier. The engine sizes the tier from the HBM actually left after the resident weights, less a reserve;
 `--expert-slots` overrides it, and a card that runs out of room drops an expert from the tier instead of
 failing the request.
 
-**What is next**, in the order the measurements argue for: wire `--graphs` into the serve engine, which is
-the only way the server gets the 409.6 ms step rather than the 816 ms one; cut the recapture cost - 80 graphs
+**What is next**, in the order the measurements argue for: cut the recapture cost - 80 graphs
 take 1.8-1.9 s and belong to a State, so every new conversation pays it again, and so does crossing an
 indexer bucket; make the expert tier itself the landing zone, so the 8.1 GB/step device-to-device copy stops
 being the top device-time item; decide whether the 137.5 ms device floor is worth attacking, since the three

@@ -27,6 +27,16 @@ Lines this engine prints:
     ERR <reason>                             a request this engine cannot serve
 
 Lines it reads: `GEN <max_new> [k=v ...] <ids>`, `STOP`, `PAUSE [keep]`, `WRAP`, `QUIT`.
+
+With `--graphs` the one-token decode runs as captured NPU graphs, exactly as `run_dsv41 --graphs` does:
+a `g_pre`/`g_post` pair per layer, one `g_pre` per indexer selection bucket, and prompt chunks (`T > 1`)
+stay eager.  A graph bakes the buffers of the `State` it was captured against, so the graphs belong to a
+conversation: this engine captures them for the held conversation, releases them when that conversation
+ends (a diverging prompt) or is abandoned (a request cut during its prompt), and reports what the capture
+cost (1.8-1.9 s for 80 graphs, charged to the decode after the first token - the first token is read from
+the prompt's own logits, so a request never waits on it to answer).  At most
+`--graph-max-conversations` captured conversations may be alive at once (default 1, which is what
+`runtime.build` reserves HBM for); past it a conversation runs eagerly and says so.
 """
 from __future__ import annotations
 
@@ -41,6 +51,7 @@ import time
 import torch
 
 from .dsv41 import runtime as rt
+from .dsv41.graph_runner import GraphTeardownError
 
 EOS = 1
 
@@ -67,6 +78,8 @@ class Engine:
                            expert_reserve_gib=args.expert_reserve_gib,
                            expert_devices=args.expert_devices.split(",") if args.expert_devices else None,
                            engram_tokenizer=args.engram_tokenizer or None,
+                           graphs=getattr(args, "graphs", False),
+                           graph_verify=getattr(args, "graph_verify", False),
                            verbose=args.verbose)
         self.cfg = self.rt.cfg
         self.load_s = time.time() - t0
@@ -76,6 +89,19 @@ class Engine:
         self.input: queue.Queue[str | None] = queue.Queue()
         self.quit = False
         self.stats = {"tokens": 0, "steps": 0, "decode_ms": 0.0}
+        # -- the captured decode, per conversation ----------------------------------------------
+        # The graphs bake the held State's buffers, so there is nothing to reuse once the conversation
+        # is over.  `_graphs_held` is the conversation being served; `_graphs_leaked` counts domains a
+        # failed teardown left alive (their HBM never comes back in this process), and the two together
+        # are what the bound counts.  A leaked domain must never turn into a second landing zone on
+        # every expert card by accident, which is what the bound is for.
+        self._graphs_wanted = bool(getattr(args, "graphs", False))
+        self._graph_max = max(1, int(getattr(args, "graph_max_conversations", 1) or 1))
+        self._graphs_held = 0
+        self._graphs_leaked = 0
+        self._graphs_blocked = False             # this engine forced eager at the bound
+        self._graphs_captured_seen = 0
+        self._graphs_capture_s_seen = 0.0
         # The engine only needs the end-of-sequence id; serve/ does every tokenization.  `--tokenizer` is
         # therefore optional, and a path to something other than a Hugging Face tokenizer.json (the pack
         # layout, say) is a note in the log rather than a failed start.
@@ -100,7 +126,13 @@ class Engine:
         _log(f"dsv41 fast: CUDA0 VRAM before the expert pool: {resident + slots * per_expert / rt.GIB:.2f} "
              f"of 32.00 GB in use - dense weights {resident:.2f}, state/KV ({ctx} ctx) "
              f"{self.kv_gib(ctx):.2f}, activations 0.50, other (context, scratch, prompt path) 0.50")
-        _log(f"maya generate: session is up (ascend dsv41, {self.rt.device}, weights in {self.load_s:.1f}s)")
+        _log(f"maya generate: session is up (ascend dsv41, {self.rt.device}, weights in {self.load_s:.1f}s, "
+             f"graphs {'on' if self._graphs_wanted else 'off'})")
+        if self._graphs_wanted:
+            _log(f"dsv41 graphs: capturing the one-token decode per conversation (g_pre/g_post per layer, "
+                 f"one g_pre per indexer bucket; measured 1.8-1.9 s for 80 graphs).  At most "
+                 f"{self._graph_max} captured conversation(s) alive at once; past that bound a "
+                 f"conversation runs eagerly and says so.  Prompt chunks stay eager.")
         _out(f"INFO context={ctx} kv=bf16 kv_resident=0 expert_slots={slots} "
              f"expert_cache_mib={slots * per_expert // (1 << 20)} engine_kind=dsv41-ascend "
              f"experts={experts_total} vram_slots={slots} vram_gb={resident + slots * per_expert / rt.GIB:.2f} "
@@ -118,6 +150,107 @@ class Engine:
         long_kv = ctx * entry * len(cfg.kv_source_layer_ids)
         index_k = ctx * cfg.index_head_dim * 2 / (1 << 30) * len(cfg.kv_source_layer_ids)
         return swa + long_kv + index_k
+
+    # -- the captured decode, one conversation at a time ----------------------------------------
+    def graphs_live(self) -> int:
+        """Captured conversations whose graphs are still alive: one held plus any leaked domains."""
+        return self._graphs_held + self._graphs_leaked
+
+    def _graphs_can_capture(self) -> bool:
+        """Whether a new conversation may capture, logging the bound once when it refuses.
+
+        The landing zone is 425 MB on every card the experts live on, plus that card's graph pool and
+        registers; `runtime.build(graphs=True)` takes 1 GiB per card out of the expert tier for exactly
+        one conversation's worth, so the default bound is 1.  A domain a failed teardown left alive is
+        counted here too: it still holds its HBM, and the model has forgotten it (so it cannot be
+        released later - only the process exit returns it).
+        """
+        if not self._graphs_wanted:
+            return False
+        if not bool(getattr(self.rt.model, "graphs", False)):
+            # --graphs off, or the model disabled the captured path after a capture/replay failure
+            return False
+        if self.graphs_live() >= self._graph_max:
+            if not self._graphs_blocked:
+                self._graphs_blocked = True
+                self.rt.model.graphs = False
+                _log(f"dsv41 graphs: {self.graphs_live()} captured conversation(s) already hold their "
+                     f"graphs (--graph-max-conversations {self._graph_max}); this conversation runs "
+                     f"eagerly - the tier reserves one landing zone per card, not another")
+            return False
+        return True
+
+    def _plan_graphs(self) -> None:
+        """Count the conversation that is about to capture and report its layout and the capture cost."""
+        if self._graphs_held or not self._graphs_can_capture():
+            return
+        self._graphs_held = 1
+        _log("dsv41 graphs: this conversation captures its decode on the first one-token step "
+             "(measured 1.8-1.9 s for 80 graphs); the first token is read from the prompt's own logits "
+             "before that, so the request never waits on the capture to answer")
+        try:
+            _log(self.rt.model.graph_summary(self.state))
+        except Exception as e:                           # noqa: BLE001 - a log line is not worth a request
+            _log(f"dsv41 graphs: (could not describe the capture table: {type(e).__name__}: {e})")
+
+    def _report_graph_capture(self) -> None:
+        """Say what the capture cost, in the engine log the server keeps (the protocol has no field for it)."""
+        g = getattr(self.rt.model, "_decode_graphs", None)
+        if g is None:
+            return
+        captured, seconds = int(getattr(g, "captured", 0)), float(getattr(g, "capture_s", 0.0))
+        graphs = captured - self._graphs_captured_seen
+        spent = seconds - self._graphs_capture_s_seen
+        self._graphs_captured_seen, self._graphs_capture_s_seen = captured, seconds
+        if graphs > 0:
+            _log(f"dsv41 stat: graphs captured {graphs} in {spent * 1e3:.0f} ms "
+                 f"({seconds * 1e3:.0f} ms, {captured} graphs for this conversation); it is charged to the "
+                 f"decode step, after the token that preceded it was already written")
+
+    def _release_graphs(self, reason: str) -> None:
+        """Release the graphs of the conversation being dropped; a failed teardown is logged, not raised.
+
+        ``Dsv41.release_graphs`` raises :class:`GraphTeardownError` after dropping the domain when a
+        graph could not be destroyed - its HBM is not returned in this process.  A leaked model must not
+        take the server down with it: the failure is named in the log, counted against
+        ``--graph-max-conversations`` (so the bound then sends the next conversation to the eager path
+        instead of capturing into HBM that is not there), and serving continues.
+        """
+        model = self.rt.model
+        domain = getattr(model, "_decode_graphs", None)
+        had = domain is not None
+        try:
+            model.release_graphs()
+        except GraphTeardownError as exc:
+            if had:
+                self._graphs_leaked += 1
+            self._graphs_held = 0
+            _log(f"dsv41 graphs: could not release the graphs of the conversation that ended "
+                 f"({reason}) - {exc}.  The engine keeps serving; the leaked graph models stay alive "
+                 f"until this process exits")
+            return
+        finally:
+            self._graphs_captured_seen = 0
+            self._graphs_capture_s_seen = 0.0
+        if had:
+            _log(f"dsv41 graphs: released {int(getattr(domain, 'captured', 0))} graphs of the "
+                 f"conversation that ended ({reason})")
+        # nothing is held for the dropped conversation: whether it captured or fell back to eager, the
+        # domain is gone now (a capture that never happened leaves nothing behind either)
+        self._graphs_held = 0
+        if self._graphs_blocked and self.graphs_live() < self._graph_max:
+            # only a block this engine set is undone here; a model that disabled graphs itself (a
+            # capture/replay failure) must stay on the eager path
+            self._graphs_blocked = False
+            model.graphs = True
+            _log(f"dsv41 graphs: the bound has room again ({self.graphs_live()}/"
+                 f"{self._graph_max}); new conversations capture")
+
+    def _drop_conversation(self, reason: str) -> None:
+        """Forget the held conversation, releasing its graphs (its State is garbage after this)."""
+        self._release_graphs(reason)
+        self.state = None
+        self.held = []
 
     # -- reading the input ---------------------------------------------------------------------
     def _reader(self) -> None:
@@ -173,8 +306,11 @@ class Engine:
             reused += 1
         fresh = reused < len(self.held) or self.state is None
         if fresh:
-            # the prompt diverged from what the state holds: start the conversation over
+            # the prompt diverged from what the state holds: start the conversation over.  The graphs
+            # of the finished conversation bake its State's buffers and are of no use to the new one,
+            # so they are released *before* a new State (and its KV) is built.
             reused = 0
+            self._drop_conversation("the prompt diverged from the held conversation")
             self.state = self.rt.state(self.args.max_context)
             self.held = []
         to_read = ids[reused:]
@@ -205,9 +341,19 @@ class Engine:
                     return
                 if control in ("STOP", "PAUSE", "PAUSE keep"):
                     _out(f"DONE 0 {prompt_tokens} {ms:.1f} 0.0 cancel 0 0 {reused} 0 0")
+                    # The state is part-way through the prompt and `held` was never updated, so this
+                    # conversation cannot be continued: it is abandoned, and its graphs (if it had
+                    # any from an earlier turn) go with it.
+                    _log("dsv41: the request was abandoned during its prompt - dropping the "
+                         "conversation's state" + (" and its graphs" if self._graphs_held else ""))
+                    self._drop_conversation("the request was abandoned during its prompt")
                     return
         prompt_ms = (time.perf_counter() - t_prompt) * 1e3
         self.held = list(ids)
+        if max_new > 0:
+            # Count the conversations that hold captured graphs.  The capture itself is lazy (the first
+            # one-token step below); this is the bound's accounting and the report of what it will cost.
+            self._plan_graphs()
 
         # --- decode
         produced: list[int] = []
@@ -241,6 +387,7 @@ class Engine:
             if n % 8 == 0:
                 _out(self.stat_line(t0, n))
         decode_ms = (time.perf_counter() - t0) * 1e3
+        self._report_graph_capture()
         self.stats["tokens"] += len(produced)
         self.stats["steps"] += 1
         self.stats["decode_ms"] += decode_ms
@@ -308,6 +455,7 @@ class Engine:
                     if held is None:
                         break
                     if held == "QUIT":
+                        self.shutdown()
                         return 0
                 self.generate(line)
             elif line.startswith("GENI "):
@@ -316,13 +464,26 @@ class Engine:
                 _out(f"ERR {line} text-only model: no vision encoder to lend memory to")
             else:
                 _out(f"ERR unsupported command '{line.split()[0]}'")
-        self.rt.close()
+        self.shutdown()
         return 0
 
+    def shutdown(self) -> None:
+        """Close the runtime; a graph that could not be destroyed is named, never raised.
 
-def main(argv: list[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    serve = "--serve" in argv
+        `rt.close()` tears the graphs down first and `Dsv41.release_graphs` raises after dropping the
+        domain if the destroy failed.  A leak is a real loss of HBM, but it must not turn a clean
+        shutdown into a failed one: the log names it and the process exits, which is when the leaked
+        models finally go.
+        """
+        try:
+            self.rt.close()
+        except GraphTeardownError as exc:
+            _log(f"dsv41 graphs: teardown at shutdown failed ({exc}); the leaked graph models end with "
+                 f"this process")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The engine's arguments; separate from `main` so tests can check the flags without loading a model."""
     ap = argparse.ArgumentParser(description="DeepSeek-V4.1-Flash W8A8 engine on Ascend, serve protocol")
     ap.add_argument("--serve", action="store_true")
     ap.add_argument("--model", required=True)
@@ -345,7 +506,30 @@ def main(argv: list[str] | None = None) -> int:
                          "(2 x 3 x batch x 11.8 MiB)")
     ap.add_argument("--max-context", type=int, default=8192)
     ap.add_argument("--prefill-chunk", type=int, default=512)
+    ap.add_argument("--graphs", action="store_true",
+                    help="capture the one-token decode path as per-layer NPU graphs, as --graphs in "
+                         "ascend/run_dsv41.py: a g_pre/g_post pair per layer, one g_pre per indexer "
+                         "selection bucket, the expert fetch between them on the host.  Off by default; "
+                         "prompt chunks (T > 1) stay eager.  The graphs bake the conversation State's "
+                         "buffers, so they are captured per conversation (1.8-1.9 s for 80 graphs) and "
+                         "released when it ends")
+    ap.add_argument("--graph-verify", action="store_true",
+                    help="run the did-it-capture guard on every graph (slow: 4 eager runs per graph at "
+                         "start-up, then bit-equality at two input values); only meaningful with "
+                         "--graphs")
+    ap.add_argument("--graph-max-conversations", type=int, default=1,
+                    help="the most conversations whose captured graphs may be alive at once.  Each "
+                         "conversation costs a 425 MB landing zone on every card that holds experts plus "
+                         "that card's graph pool and registers, and --graphs reserves 1 GiB per card for "
+                         "one; past this bound a conversation runs eagerly and says so in the log")
     ap.add_argument("--verbose", action="store_true")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    serve = "--serve" in argv
+    ap = build_parser()
     args = ap.parse_args(argv)
     if not serve:
         ap.error("this module is an engine: start it with --serve (see serve/server.py --config)")
@@ -353,6 +537,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return engine.run()
     except BrokenPipeError:
+        engine.shutdown()
         return 0
 
 

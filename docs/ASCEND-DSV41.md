@@ -118,18 +118,17 @@ The model is reading the prompt and producing a sane next-token distribution —
 8.1 GB per decode step, and its read path still did a redundant host copy (`np.stack` of page-cache views)
 before the H2D. `ascend/bench_experts.py` measures the alternatives.
 
-What is **not** done yet: `--graphs` is only in `run_dsv41`, not in `ascend/serve_engine.py`, so `strata-ascend`
-serves the eager step; the graphs belong to a State and a conversation recaptures them (1.8-1.9 s), and
+What is **not** done yet: the graphs belong to a State, so a conversation recaptures them (1.8-1.9 s) and
 crossing an indexer bucket costs another capture; the landing zone still copies the six experts
 device-to-device every step; prefill (`T > 1`) is eager and array-bound; and only one conversation is served
-at a time. The four-card tier is 2 480 slots at 90.9% hit, and the analysis put a hit-count profile 18-31
-points behind the LRU at 2 603 slots (`f8e9010`).
+at a time (the serve engine does expose the captured decode now, §6). The four-card tier is 2 480 slots at
+90.9% hit, and the analysis put a hit-count profile 18-31 points behind the LRU at 2 603 slots (`f8e9010`).
 
 ## 5. Testing
 
-Everything runs as `python -m unittest discover -s ascend -p "test_*.py" -t .`. The suite is **160 tests**;
-8 of them skip when the NPU tests are not opted in (`DSV41_RUN_NPU_TESTS=1`) or when no card is present,
-and the CPU tests run in CI.
+Everything runs as `python -m unittest discover -s ascend -p "test_*.py" -t .`. The suite is **170 tests**;
+10 of them skip in this checkout when the NPU tests are not opted in (`DSV41_RUN_NPU_TESTS=1`) or when no
+card is present, and the CPU tests run in CI.
 
 * `test_config.py` — the 40-row layer plan against the reference's own table, and configs that must fail.
 * `test_checkpoint.py` — the shard reader on a synthetic two-shard file (offsets, duplicates, bf16
@@ -162,7 +161,11 @@ and the CPU tests run in CI.
   first version of that script did, into the shared model directory.
 * `test_serve_engine.py` — the engine started exactly as `serve/server.py` starts it, driven over
   stdin/stdout: READY and the INFO keys, the stderr context-cost line the dashboard reads, PP/T/DONE with
-  its eleven fields, the kept conversation's `reused`, STOP cutting a decode, STAT, and QUIT.
+  its eleven fields, the kept conversation's `reused`, STOP cutting a decode, STAT, and QUIT. Also the
+  captured decode's serve surface: `--graphs`/`--graph-verify`/`--graph-max-conversations` and their
+  defaults, the flags reaching `runtime.build`, capture on a conversation's first decode, release when the
+  conversation ends, release when a prompt is abandoned, and a teardown failure being logged, counted
+  against the bound, and served eagerly instead of taking the engine down.
 * `test_env.py` — the four hardware facts the design rests on.
 
 ## 6. The engine behind the serve protocol
@@ -181,9 +184,18 @@ OpenAI/Anthropic APIs, SSE, tools and the web UI over this engine:
 ```
 
 The repository's own copy is [`ascend/serve-config.example.json`](../ascend/serve-config.example.json). The
-serve engine builds the **eager** model: `ascend/serve_engine.py` calls `rt.build` without `graphs` and has
-no `--graphs` argument, so `strata-ascend` serves the eager step. The captured step is
-`run_dsv41 --graphs` (§4); wiring the flag into the serve engine is the first item in §7.
+serve engine takes `--graphs` and `--graph-verify`, exactly as `run_dsv41` does: the one-token decode is
+captured per layer, prompt chunks (`T > 1`) stay eager. A graph bakes the buffers of the conversation's
+`State`, so the engine captures for the held conversation, keeps the graphs across that conversation's
+turns (prefix reuse), releases them before a diverging prompt builds its new State, and drops them when a
+request is abandoned part-way through its prompt. The capture is lazy - the first one-token step after the
+prompt - and its cost is reported in the engine log (measured on `npu:0`: 80 graphs in 1.87-2.06 s); the
+first token is read from the prompt's own logits before that, so a request never waits on the capture to
+answer. A teardown that cannot destroy a graph is logged and counted against `--graph-max-conversations`
+(default 1), and the process keeps serving - eagerly once the bound is spent. Each captured conversation
+costs a 405.7 MiB landing zone plus registers on every card the experts live on; four measured 1.62 GiB in
+total and put the process at 27.1 GiB of its 32 GiB share on one card at 2 048 context. The server only ever
+holds one conversation, and the tier reserves 1 GiB per card for that one.
 
 `ascend/setup_tokenizer.sh` builds that tokenizer directory: the export ships no tokenizer, V4.1 and V4
 share the vocabulary, `serve/` reads its own pack layout rather than Hugging Face's `tokenizer.json`, and
@@ -191,8 +203,7 @@ it decides a model is DeepSeek's by finding `｜DSML｜` in the chat template. T
 encoding ten texts (digits, contractions, CJK, code, the special tokens) with both tokenizers: 0 mismatches.
 
 `ascend/run-e2e.sh` runs the whole stack — the real `serve/server.py`, the real 578 GB checkpoint, one HTTP
-request. This is the first end-to-end run, before the graphs, and it has not been re-run since; the serve
-path is still eager:
+request. This is the first end-to-end run, before the graphs:
 
 ```
 $ ./ascend/run-e2e.sh           # prompt: "The quick brown fox jumps over the lazy"
@@ -205,6 +216,10 @@ $ ./ascend/run-e2e.sh           # prompt: "The quick brown fox jumps over the la
              "predicted_per_token_ms": 3253.787}}
 ```
 
+Re-run with `--graphs` added to the engine args (`--max-context 2048`, `npu:0` only), the same HTTP path
+answered `"The capital of France is"` with `"The capital of France is **Paris**."`: 9 prompt tokens in
+11.8 s, 80 graphs captured in 1.87 s (engine log), and 8 decoded tokens in 14.9 s including that capture.
+
 The answer is the right one for the prompt it was given, which is the strongest evidence available that the
 whole pipeline — mHC, CSA2, the router, the tokenizer, the conversation state — is wired correctly: there
 is no 578 GB reference to diff against, so coherent generation is the test. `run_dsv41` shows the same model
@@ -215,21 +230,20 @@ with `" dog"` (p=0.999 in that run; the fixed Engram + graphs probe answers at p
 
 The first plan's five items were done or measured dead: the storage array is the floor (R2: ~2.5 GB/s cold);
 the four cards own the tier (2 480 slots, 90.9% hit, 0.774 GB/step); the analysis put a profiled placement
-18-31 points behind the LRU; prefill is chunked and still eager; and the serve surface exists. What is left
-is below, and the queue with acceptance is [`docs/ascend-notes/PLAN.md`](ascend-notes/PLAN.md).
+18-31 points behind the LRU; prefill is chunked and still eager; and the serve surface exists and exposes the
+captured decode (§6). What is left is below, and the queue with acceptance is
+[`docs/ascend-notes/PLAN.md`](ascend-notes/PLAN.md).
 
-1. **Expose the captured decode through the serve engine.** `--graphs` is only in `run_dsv41`;
-   `strata-ascend` builds the eager model, so the server gets the 816 ms step, not the 409.6 ms one. This is
-   the largest gap between the measured engine and the engine a user starts.
-2. **Cut the recapture cost.** 80 graphs take 1.8-1.9 s and belong to a State: every new conversation
+1. **Cut the recapture cost.** 80 graphs take 1.8-1.9 s and belong to a State: every new conversation
    recaptures, and crossing an indexer bucket costs another 1.8 s. The GSM8K run's last State captured 118
-   graphs at 2 048 context.
-3. **Make the tier the landing zone.** At 90.9% hit the step still copies 8.1 GB device-to-device into the
+   graphs at 2 048 context. (The serve engine now exposes `--graphs`; this is the cost it pays per
+   conversation, and the largest one a new client sees.)
+2. **Make the tier the landing zone.** At 90.9% hit the step still copies 8.1 GB device-to-device into the
    fixed slab, 19.65 ms of `TensorMove`; a resident tier that is itself the slab is the profile's next lever.
-4. **The device-time floor.** 137.5 ms at 29 744 operator calls. The three obvious fused ops were measured and
+3. **The device-time floor.** 137.5 ms at 29 744 operator calls. The three obvious fused ops were measured and
    rejected: `npu_dynamic_quant` moves the logits 3.1e-2 (outside the 2e-3 promise), `npu_clipped_swiglu` is
    +1.9 ms net, and `npu_fusion_attention` cannot be captured (error 107025).
-5. **Prefill and multi-session.** Prefill (`T > 1`) is eager and array-bound - 421 s for 823 prompt tokens in
+4. **Prefill and multi-session.** Prefill (`T > 1`) is eager and array-bound - 421 s for 823 prompt tokens in
    the GSM8K re-check; capture does not apply to it. The serve engine still holds one conversation.
 
 ## 8. Where the 3.25 s/token went
@@ -410,8 +424,10 @@ GB/step** at 90.9% hit on the four-card tier; the misses are read from an array 
 and copied at 20 GB/s, then multiplied. The page cache is not a lever here - the same bytes read twice were
 not faster - so what counts is how few misses the tier leaves. An HBM expert tier of 30 GiB covers ~6% of
 the 15,360 experts on one card; the four-card tier measured 2,480 slots, 16.1% of them, at 90.9% hit,
-because the per-card reserve and the graph landing zones take part of the 32 GiB. It shortens the stream but
-does not remove it; the 15.1 GiB of resident non-expert weights leave no room to keep more.
+because the per-card reserve and the graph landing zones take part of the 32 GiB. One captured conversation's
+landing zone measures 405.7 MiB per expert card, so four would take 1.62 GiB per card - more than the 1 GiB
+the tier reserves for one - and the serve engine keeps exactly one captured conversation. It shortens the
+stream but does not remove it; the 15.1 GiB of resident non-expert weights leave no room to keep more.
 
 That is the honest trade of a **W8A8** checkpoint on 128 GB of HBM and a 1.1 GB/s array. The same model at
 1.6–4 bits is 73 GB and fits entirely on two cards, which is what this project's Maya-XS packs are for; at

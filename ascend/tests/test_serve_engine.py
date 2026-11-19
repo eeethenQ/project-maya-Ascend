@@ -9,6 +9,9 @@ ending with exit code 0.
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import os
 import queue
 import subprocess
@@ -32,6 +35,26 @@ NEEDS_TORCH = unittest.skipUnless(HAVE_TORCH, "needs torch")
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE = ROOT / "ascend" / "strata-ascend"
 GIB = 1 << 30
+
+
+def engine_args(model_dir: Path, **overrides) -> argparse.Namespace:
+    """The arguments `main` would hand `Engine`, for tests that drive the engine in this process."""
+    args = argparse.Namespace(
+        model=str(model_dir), tokenizer="", device="cpu", dtype="float32", hbm_share=0.5,
+        expert_slots=None, io_threads=1, expert_batch=8, expert_reserve_gib=6.0, expert_devices="",
+        engram_tokenizer="", verbose=False, max_context=64, prefill_chunk=512, serve=True,
+        graphs=True, graph_verify=False, graph_max_conversations=1)
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def quiet_generate(engine, line: str) -> tuple[str, str]:
+    """Run one request, returning (stdout, stderr); the engine writes both directly."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        engine.generate(line)
+    return out.getvalue(), err.getvalue()
 
 
 class Engine:
@@ -196,6 +219,207 @@ class Quit(unittest.TestCase):
             engine = Engine(model.root)
             engine.read_until("READY")
             self.assertEqual(engine.stop(), 0)
+
+    def test_graphs_over_the_line_protocol(self):
+        """`--graphs` starts, captures, and quits cleanly over the real executable's protocol."""
+        with TinyModel() as model:
+            engine = Engine(model.root, "--graphs")
+            engine.read_until("READY")
+            engine.send("GEN 2 3,5,7")
+            lines = engine.read_until("DONE ")
+            self.assertEqual(len([l for l in lines if l.startswith("T ")]), 2)
+            self.assertEqual(engine.stop(), 0)
+            log = "\n".join(engine.log)
+            self.assertIn("graphs on", log, "the start log names the captured path")
+            self.assertIn("graphs captured", log, "the engine reports what the capture cost")
+
+
+@NEEDS_TORCH
+class TheGraphsArguments(unittest.TestCase):
+    """The flag exists, graphs are off unless asked for, and the bound has a default."""
+
+    @staticmethod
+    def parser():
+        from ascend import serve_engine
+        return serve_engine.build_parser()
+
+    def test_graphs_are_off_by_default(self):
+        args = self.parser().parse_args(["--serve", "--model", "/tmp/model"])
+        self.assertFalse(args.graphs, "the captured decode is opt-in, as in run_dsv41")
+        self.assertFalse(args.graph_verify)
+        self.assertEqual(args.graph_max_conversations, 1)
+
+    def test_the_graph_flags_parse(self):
+        args = self.parser().parse_args(
+            ["--serve", "--model", "/tmp/model", "--graphs", "--graph-verify",
+             "--graph-max-conversations", "3"])
+        self.assertTrue(args.graphs)
+        self.assertTrue(args.graph_verify)
+        self.assertEqual(args.graph_max_conversations, 3)
+
+
+@NEEDS_TORCH
+class TheGraphsPlumbing(unittest.TestCase):
+    def test_the_flags_reach_runtime_build(self):
+        from types import SimpleNamespace
+        from ascend import serve_engine
+
+        seen: dict = {}
+        real = serve_engine.rt.build
+
+        def fake(**kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(cfg=SimpleNamespace(num_hidden_layers=4))
+
+        try:
+            serve_engine.rt.build = fake
+            engine = serve_engine.Engine(engine_args(Path("/tmp/not-loaded"), graphs=True,
+                                                     graph_verify=True, graph_max_conversations=2))
+        finally:
+            serve_engine.rt.build = real
+        self.assertIs(seen["graphs"], True)
+        self.assertIs(seen["graph_verify"], True)
+        self.assertEqual(engine._graph_max, 2)
+
+
+@NEEDS_TORCH
+class TheConversationGraphLifecycle(unittest.TestCase):
+    """A graph bakes a State's buffers: capture per conversation, release when it ends, never leak.
+
+    The CPU capture wrapper is the eager fallback, but the *domain* (`_DecodeGraphs`), its lifecycle and
+    the engine's accounting are the real ones, which is what this class exercises.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = TinyModel()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model.close()
+
+    def engine(self, **overrides):
+        from ascend import serve_engine
+        return serve_engine.Engine(engine_args(self.model.root, **overrides))
+
+    def test_a_conversation_captures_on_its_first_decode_and_keeps_the_graphs(self):
+        engine = self.engine()
+        try:
+            out, err = quiet_generate(engine, "GEN 2 3,5,7")
+            self.assertIn("DONE 2 3", out)
+            graphs = engine.rt.model._decode_graphs
+            self.assertIsNotNone(graphs)
+            self.assertEqual(graphs.captured, 2 * engine.cfg.num_hidden_layers,
+                             "one g_pre and one g_post per layer")
+            self.assertIn("captures its decode", err)
+            self.assertIn("graphs captured", err, "the capture cost is reported in the log")
+            self.assertEqual(engine.graphs_live(), 1)
+            # the next turn of the same conversation reuses the captured domain (that is the point)
+            held = list(engine.held)
+            quiet_generate(engine, "GEN 1 " + ",".join(str(t) for t in held + [11]))
+            self.assertIs(engine.rt.model._decode_graphs, graphs,
+                          "a continuing conversation must not recapture")
+        finally:
+            engine.shutdown()
+
+    def test_a_finished_conversation_releases_its_graphs(self):
+        engine = self.engine()
+        try:
+            quiet_generate(engine, "GEN 2 3,5,7")
+            finished = engine.rt.model._decode_graphs
+            self.assertIsNotNone(finished)
+            out, err = quiet_generate(engine, "GEN 1 11,13")      # a different prompt: new conversation
+            self.assertIn("DONE 1 2", out)
+            self.assertTrue(finished.closed, "the finished conversation's graphs are torn down")
+            self.assertIsNot(engine.rt.model._decode_graphs, finished)
+            self.assertIsNotNone(engine.rt.model._decode_graphs, "the new conversation captures its own")
+            self.assertEqual(engine.graphs_live(), 1, "old released, new held")
+            self.assertIn("released", err)
+        finally:
+            engine.shutdown()
+
+    def test_an_abandoned_prompt_drops_the_conversation_and_its_graphs(self):
+        engine = self.engine(prefill_chunk=1)
+        try:
+            quiet_generate(engine, "GEN 2 3,5,7")
+            finished = engine.rt.model._decode_graphs
+            self.assertIsNotNone(finished)
+            engine.control.put("STOP")              # the next request is cut part-way through its prompt
+            out, err = quiet_generate(engine, "GEN 5 11,13,17")
+            self.assertIn("DONE 0 3", out)
+            self.assertIn("cancel", out)
+            self.assertTrue(finished.closed)
+            self.assertIsNone(engine.state, "a half-read prompt cannot be the next turn's state")
+            self.assertEqual(engine.held, [])
+            self.assertIsNone(engine.rt.model._decode_graphs)
+            self.assertIn("abandoned during its prompt", err)
+            # and the engine serves the next request, capturing a fresh domain
+            out, _ = quiet_generate(engine, "GEN 1 11,13")
+            self.assertIn("DONE 1 2", out)
+            self.assertIsNotNone(engine.rt.model._decode_graphs)
+        finally:
+            engine.shutdown()
+
+    def test_graphs_off_by_default_captures_nothing(self):
+        engine = self.engine(graphs=False)
+        try:
+            for line in ("GEN 2 3,5,7", "GEN 1 11,13"):
+                out, _ = quiet_generate(engine, line)
+                self.assertIn("DONE ", out)
+            self.assertFalse(engine.rt.model.graphs)
+            self.assertIsNone(engine.rt.model._decode_graphs)
+        finally:
+            engine.shutdown()
+
+    def test_a_teardown_failure_is_logged_and_the_bound_falls_back_to_eager(self):
+        from ascend.dsv41.graph_runner import GraphTeardownError
+
+        engine = self.engine()
+        try:
+            quiet_generate(engine, "GEN 2 3,5,7")
+            model = engine.rt.model
+            real = model.release_graphs
+            calls = {"n": 0}
+
+            def failing():
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    # what `Dsv41.release_graphs` does when a destroy failed: drop the reference, name
+                    # the leak.  The HBM is not returned, and the domain can never be freed again.
+                    domain, model._decode_graphs = model._decode_graphs, None
+                    if domain is not None:
+                        domain.close()
+                    raise GraphTeardownError(
+                        "npu:0", [("g_pre.0.0", "rtModelDestroy failed: model not in current ctx")])
+                return real()
+
+            model.release_graphs = failing
+            out, err = quiet_generate(engine, "GEN 1 11,13")
+            self.assertIn("DONE 1 2", out, "one conversation's teardown failure must not kill the engine")
+            self.assertIn("could not release", err)
+            self.assertEqual(engine.graphs_live(), 1, "the leaked domain is counted against the bound")
+            self.assertFalse(model.graphs, "the bound sends the next conversation to the eager path")
+            self.assertIsNone(model._decode_graphs, "nothing captures into HBM the leak already holds")
+            self.assertIn("eagerly", err)
+            out, _ = quiet_generate(engine, "GEN 1 19,23")
+            self.assertIn("DONE 1 2", out)
+            self.assertIsNone(model._decode_graphs)
+        finally:
+            engine.shutdown()
+
+    def test_shutdown_names_a_failed_teardown_instead_of_raising(self):
+        from ascend.dsv41.graph_runner import GraphTeardownError
+
+        engine = self.engine()
+
+        def failing():
+            raise GraphTeardownError("npu:0", [("g_post.0", "destroy failed")])
+
+        engine.rt.model.release_graphs = failing
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            engine.shutdown()
+        self.assertIn("teardown at shutdown failed", err.getvalue())
 
 
 if __name__ == "__main__":
