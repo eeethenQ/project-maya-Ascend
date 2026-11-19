@@ -29,6 +29,20 @@ at a time, so it cannot show what four would cost) and measures:
 6. ``thrash``      - two short ``State``s alternating under graphs: the capture/replay pattern four
    concurrent graph conversations would be stuck in.
 
+``--serve-compare`` runs the before/after measurement of the *serve path itself* instead (one engine
+build, the same prompts, all on the cards given):
+
+* ``before-serial-*``  - the pre-change serve path: one conversation, one ``GEN`` at a time.
+* ``before-4thread-*`` - the pre-change best case, the drive behind the 609.9 s identical-TTFT result:
+  four threads calling ``model.forward`` with a device-wide ``torch.npu.synchronize`` after every forward.
+* ``after-parallel-*`` - ``serve_engine --parallel N``: N conversations, one ``State`` and one NPU stream
+  each, the shared expert fetch held one at a time (its pinned ring is not reentrant); the request past N
+  waits in the engine's queue.
+* ``isolation``        - the same prompts alone against together, token for token.
+
+Four concurrent one-forward 2 000-token prefills on one card need a larger ``--serve-expert-reserve-gib``
+than the engine's 6.0 (each forward's activation high-water is ~2.7 GiB); the default here is 13.0.
+
 Every phase is reported with the cards it used, the tier's hit/miss/bytes delta, and the process's peak
 HBM (``torch.npu.max_memory_allocated``).  The expert tier is sized for the *cards given* - a three-card
 tier is not the four-card 2 480-slot one the 410 ms number was measured on.
@@ -211,9 +225,14 @@ def single_prefill(run, ids: list[int], max_context: int, timers: bool, devices)
 
 
 # --------------------------------------------------------------------------- 3/4: N conversations
-def concurrent_prefill_decode(run, ids: list[int], gen: int, max_context: int, devices,
+def concurrent_prefill_decode(run, ids, gen: int, max_context: int, devices,
                               label: str, eos: int, n: int = 4) -> dict:
-    """`n` threads, one State each: prefill then greedy decode, all starting at the same instant."""
+    """`n` threads, one State each: prefill then greedy decode, all starting at the same instant.
+
+    ``ids`` is one prompt (shared by the `n` conversations) or a list of `n` prompts (distinct ones, so the
+    token streams must differ and a shared-buffer corruption shows).
+    """
+    prompts = [ids[i] if ids and isinstance(ids[0], (list, tuple)) else ids for i in range(n)]
     states = [run.state(max_context) for _ in range(n)]
     results: list[dict | None] = [None] * n
     errors: list[str | None] = [None] * n
@@ -223,10 +242,11 @@ def concurrent_prefill_decode(run, ids: list[int], gen: int, max_context: int, d
 
     def worker(i: int) -> None:
         try:
+            ids_i = prompts[i]
             state = states[i]
             barrier.wait()
             t_start = time.perf_counter()
-            logits = run.model.forward(ids, state, logits_last_only=True)
+            logits = run.model.forward(ids_i, state, logits_last_only=True)
             _sync(devices)
             t_first = time.perf_counter()
             tok = int(logits[0].argmax())
@@ -269,7 +289,7 @@ def concurrent_prefill_decode(run, ids: list[int], gen: int, max_context: int, d
     decode_window = (max(ends) - min(firsts)) if len(done) > 1 else (ends[0] - firsts[0] if done else 0)
     streams = [tuple(r["tokens"][:gen]) for r in done]
     rec = {
-        "scenario": label, "prompt_tokens": len(ids), "max_context": max_context, "requests": n,
+        "scenario": label, "prompt_tokens": len(prompts[0]), "max_context": max_context, "requests": n,
         "gen_tokens": gen, "succeeded": len(done), "errors": [e for e in errors if e],
         "wall_s": round(wall, 2),
         "ttft_s": round(statistics.mean(ttfts), 2) if ttfts else None,
@@ -281,12 +301,14 @@ def concurrent_prefill_decode(run, ids: list[int], gen: int, max_context: int, d
         "ttft_slowest_over_fastest": round(max(ttfts) / max(min(ttfts), 1e-9), 2) if ttfts else None,
         "first_token_spread_s": round(max(firsts) - min(firsts), 2) if len(firsts) > 1 else None,
         "decode_tok_s": round(total_tokens / decode_window, 2) if decode_window else None,
+        "wall_tok_s": round(total_tokens / max(wall, 1e-9), 2),
         "decode_steps_total": total_steps,
         "decode_tok_s_per_request": [round(r["decode_tok_s"], 2) if r["decode_tok_s"] else None
                                      for r in done],
         "decode_ms_median_per_request": [round(r["decode_ms_median"], 1) if r["decode_ms_median"] else None
                                          for r in done],
         "tokens_identical": len(set(streams)) == 1 and len(streams) == len(done),
+        "token_streams": [r["tokens"] for r in done],
         "per_request": [{k: (round(v, 3) if isinstance(v, float) else v)
                          for k, v in r.items() if k != "tokens"} for r in done],
         "tier": _tier_delta(before, _tier(run), requests=n),
@@ -403,6 +425,269 @@ def graph_thrash(run, short_ids: list[int], max_context: int, devices,
     return rec
 
 
+# --------------------------------------------------------------------------- 7: the serve path, N at once
+def distinct_prompts(tokenizer, n_prompts: int, n_tokens: int, source: Path) -> list[list[int]]:
+    """`n_prompts` different prompts of `n_tokens` each, cut at offsets into the same document.
+
+    Different prompts are deliberate: the four conversations then route different experts, which is what a
+    KV/output-contamination check needs (four copies of one prompt can agree while a shared buffer is
+    corrupted).
+    """
+    step = max(1, n_tokens // 4)
+    offsets = [i * step for i in range(n_prompts)]
+    base = make_prompt(tokenizer, offsets[-1] + n_tokens, source)
+    return [base[offsets[i]:offsets[i] + n_tokens] for i in range(n_prompts)]
+
+
+class ServeCollector:
+    """Collect the engine's protocol lines with the instant each arrived (the benchmark's clock)."""
+
+    def __init__(self):
+        self.cv = threading.Condition(threading.Lock())
+        self.items: list[tuple[float, str]] = []
+
+    def __call__(self, line: str) -> None:
+        with self.cv:
+            self.items.append((time.perf_counter(), line))
+            self.cv.notify_all()
+
+    def wait_done(self, n: int, timeout: float) -> list[str]:
+        end = time.perf_counter() + timeout
+        with self.cv:
+            while True:
+                dones = [l for _, l in self.items if l.startswith("DONE ")]
+                if len(dones) >= n:
+                    return dones
+                left = end - time.perf_counter()
+                if left <= 0:
+                    raise TimeoutError(f"{n} DONE line(s) did not arrive; saw {[l for _, l in self.items[-8:]]}")
+                self.cv.wait(min(left, 0.5))
+
+    def snapshot(self) -> list[tuple[float, str]]:
+        with self.cv:
+            return list(self.items)
+
+
+def _serve_rec(label: str, mode: str, collector: ServeCollector, submits: dict[int, float],
+               prompts: list[list[int]], wall: float, devices, engine, tagged: bool = True,
+               **extra) -> dict:
+    """The same fields :func:`concurrent_prefill_decode` reports, from the protocol's own lines.
+
+    ``tagged`` is the `--parallel` protocol (`T <rid> <token>`, `DONE <rid> ...`); the serial arm writes
+    the old untagged lines, whose requests are separated by the submit times instead.
+    """
+    items = collector.snapshot()
+    order = sorted(submits)
+    per: list[dict] = []
+    for idx, rid in enumerate(order):
+        if tagged:
+            ts = [(t, l) for t, l in items if l.startswith(f"T {rid} ")]
+            dones = [(t, l) for t, l in items if l.startswith(f"DONE {rid} ")]
+            tok_at = 2
+        else:
+            end = submits[order[idx + 1]] if idx + 1 < len(order) else float("inf")
+            window = [(t, l) for t, l in items if submits[rid] <= t < end]
+            ts = [(t, l) for t, l in window if l.startswith("T ")]
+            dones = [(t, l) for t, l in window if l.startswith("DONE ")]
+            tok_at = 1
+        tokens = [int(l.split()[tok_at]) for _, l in ts]
+        first = ts[0][0] if ts else None
+        done = dones[0] if dones else (None, "")
+        f = done[1].split()
+        # tagged: DONE <rid> n prompt prompt_ms decode_ms finish ...; untagged: DONE n prompt prompt_ms ...
+        b = 1 if tagged else 0
+        per.append({"rid": rid, "ttft_s": round(first - submits[rid], 3) if first is not None else None,
+                    "tokens": tokens, "decode_steps": max(0, len(tokens) - 1),
+                    "decode_s": round(ts[-1][0] - first, 3) if len(ts) > 1 else 0.0,
+                    "end_s": round(done[0] - submits[rid], 3) if done[0] is not None else None,
+                    "finish": f[5 + b] if len(f) > 5 + b else None,
+                    "prompt_ms": float(f[3 + b]) if len(f) > 3 + b else None,
+                    "decode_ms": float(f[4 + b]) if len(f) > 4 + b else None})
+    ttfts = [r["ttft_s"] for r in per if r["ttft_s"] is not None]
+    firsts = [r["ttft_s"] for r in per if r["ttft_s"] is not None]        # relative to each submit
+    total_tokens = sum(len(r["tokens"]) for r in per)
+    starts = [r["ttft_s"] + submits[r["rid"]] for r in per if r["ttft_s"] is not None]
+    lasts = [r["end_s"] + submits[r["rid"]] for r in per if r["end_s"] is not None]
+    decode_window = (max(lasts) - min(starts)) if len(starts) > 1 else (
+        (lasts[0] - starts[0]) if starts else 0.0)
+    per_request = []
+    for r in per:
+        rate = (r["decode_steps"] / r["decode_s"]) if r["decode_s"] else None
+        per_request.append(round(rate, 2) if rate else None)
+    return {
+        "scenario": label, "mode": mode, "prompt_tokens": len(prompts[0]),
+        "requests": len(prompts), "gen_tokens": max(len(r["tokens"]) for r in per),
+        "wall_s": round(wall, 2),
+        "ttft_s": round(statistics.mean(ttfts), 2) if ttfts else None,
+        "ttft_s_list": [round(x, 2) for x in ttfts],
+        "ttft_median_s": round(statistics.median(ttfts), 2) if ttfts else None,
+        "ttft_spread_s": round(max(ttfts) - min(ttfts), 2) if len(ttfts) > 1 else None,
+        "ttft_sum_over_wall": round(sum(ttfts) / max(wall, 1e-9), 2) if ttfts else None,
+        "ttft_slowest_over_fastest": round(max(ttfts) / max(min(ttfts), 1e-9), 2) if ttfts else None,
+        "first_token_spread_s": round(max(firsts) - min(firsts), 2) if len(firsts) > 1 else None,
+        "decode_tok_s": round(total_tokens / decode_window, 2) if decode_window else None,
+        "wall_tok_s": round(total_tokens / max(wall, 1e-9), 2),
+        "decode_steps_total": sum(r["decode_steps"] for r in per),
+        "decode_tok_s_per_request": per_request,
+        "per_request": per,
+        "token_streams": [r["tokens"] for r in per],
+        "tokens_identical": len({tuple(r["tokens"]) for r in per}) == 1,
+        "tier": _tier_delta(extra.pop("tier_before"), _tier(engine.rt), requests=len(prompts)),
+        "peak_gib": _peak_gib(devices), "allocated_gib": _allocated_gib(devices),
+        **extra,
+    }
+
+
+def serve_parallel(engine, prompts: list[list[int]], gen: int, label: str, devices) -> dict:
+    """N requests submitted at once to the `--parallel` engine (the after arm): one State and stream each."""
+    collector = ServeCollector()
+    engine.emit = collector
+    before = _tier(engine.rt)
+    _reset_peak(devices)
+    submits: dict[int, float] = {}
+    t0 = time.perf_counter()
+    for rid, ids in enumerate(prompts, 1):
+        submits[rid] = time.perf_counter()
+        engine.submit(f"GEN {gen} rid={rid} " + ",".join(str(int(t)) for t in ids))
+    try:
+        collector.wait_done(len(prompts), timeout=3600)
+        wall = time.perf_counter() - t0
+    finally:
+        engine.wait_idle(timeout=3600)
+    return _serve_rec(label, "parallel", collector, submits, prompts, wall, devices, engine,
+                      tier_before=before)
+
+
+def serve_serial(engine, prompts: list[list[int]], gen: int, label: str, devices) -> dict:
+    """The pre-change serve path: requests one at a time, each measured from its own GEN to its DONE."""
+    collector = ServeCollector()
+    engine.emit = collector
+    before = _tier(engine.rt)
+    _reset_peak(devices)
+    submits, per = {}, []
+    t_all = time.perf_counter()
+    for rid, ids in enumerate(prompts, 1):
+        submits[rid] = time.perf_counter()
+        engine.generate(f"GEN {gen} " + ",".join(str(int(t)) for t in ids))   # untagged: the old protocol
+        per.append(time.perf_counter() - submits[rid])
+    wall = time.perf_counter() - t_all
+    rec = _serve_rec(label, "serial", collector, submits, prompts, wall, devices, engine,
+                     tagged=False, tier_before=before)
+    rec["per_request_serial_s"] = [round(x, 2) for x in per]                # no overlap: each request's wall
+    return rec
+
+
+def serve_compare_phase(a, tokenizer, rec: Recorder, devices, cards, prompts: list[list[int]],
+                        gen: int, reserve: float, label: str, serial: bool = False) -> dict:
+    """One engine build, one prompt size: the before arms and the after arm against the same tier.
+
+    The reserve differs per prompt size on purpose: a short prompt's four conversations fit the engine's
+    normal tier (reserve 6-8 GiB), while four concurrent one-forward 2 000-token prefills need ~2.7 GiB of
+    activation each and can only fit with a much smaller tier.  Comparing before/after *within* a phase
+    keeps the tier identical across the arms being compared.
+    """
+    from . import serve_engine
+
+    n = a.parallel
+    ns = argparse.Namespace(
+        model=a.model, tokenizer=a.tokenizer, device=a.device, dtype="bfloat16",
+        hbm_share=a.hbm_share, expert_slots=None, io_threads=a.io_threads,
+        expert_batch=a.expert_batch, expert_reserve_gib=reserve,
+        expert_devices=",".join(cards), engram_tokenizer="", verbose=False,
+        max_context=a.max_context, prefill_chunk=0,     # one forward for a 2 000-token prompt
+        serve=True, graphs=False, graph_verify=False, graph_max_conversations=1, parallel=n,
+        parallel_streams=getattr(a, "parallel_streams", False))
+    print(f"\nbuilding the serve engine ({n} conversations, reserve {reserve:.1f} GiB, {label})",
+          flush=True)
+    t0 = time.perf_counter()
+    engine = serve_engine.Engine(ns)
+    build_s = time.perf_counter() - t0
+    run = engine.rt
+    per_expert = 3 * run.cfg.moe_intermediate_size * run.cfg.hidden_size
+    print(f"engine: resident {run.weights.resident_bytes() / GIB:.2f} GiB, tier {run.expert_slots} slots "
+          f"({run.expert_slots * per_expert / GIB:.2f} GiB) over "
+          f"{sorted(set(run.experts.layer_devices or [run.device]))}, built in {build_s:.0f}s", flush=True)
+    engine.say_ready()
+    results: dict[str, dict] = {}
+
+    def arm(name: str, fn, note: str) -> dict | None:
+        """One measurement; a failure is a record, not the end of the run (the other arms still run)."""
+        try:
+            r = fn()
+            r.update({"cards": cards, "device": a.device, "note": note})
+            rec.add(r)
+            results[name] = r
+            if hasattr(torch, "npu"):                 # give the next arm the cached blocks back
+                torch.npu.empty_cache()
+            return r
+        except Exception:                                             # noqa: BLE001
+            err = traceback.format_exc()
+            print(f"{name} failed:\n{err}", flush=True)
+            rec.add({"scenario": name, "error": err, "cards": cards, "device": a.device})
+            return None
+
+    try:
+        # warm the tier with a decode before any arm is timed; every arm then starts from the same tier
+        engine.generate("GEN 4 " + ",".join(str(int(t)) for t in prompts[0]))
+        _reset_peak(devices)
+        if serial:
+            arm(f"before-serial-{label}",
+                lambda: serve_serial(engine, prompts, gen, f"before-serial-{label}", devices),
+                "the pre-change serve path: one conversation, one request at a time")
+        arm(f"before-4thread-{label}",
+            lambda: concurrent_prefill_decode(run, prompts, gen, a.max_context, devices,
+                                              f"before-4thread-{label}", a.eos, n=n),
+            "pre-change best case: four threads, default stream, device-wide sync per forward")
+        engine.start_workers()
+        arm(f"after-parallel-{label}",
+            lambda: serve_parallel(engine, prompts, gen, f"after-parallel-{label}", devices),
+            f"{n} conversations, one NPU stream each")
+    finally:
+        engine.stop_workers()
+        engine.shutdown()
+    return results
+
+
+def serve_compare(a, tokenizer, rec: Recorder, devices, cards) -> None:
+    """The before/after run: the old serial serve path and the old 4-thread drive against --parallel.
+
+    * ``before-serial-short``  - the old serve path (one conversation, one GEN at a time).
+    * ``before-4thread-*``    - the pre-change *best case*, the drive that produced the 609.9 s / 1.14 tok/s
+      numbers: four threads calling ``model.forward`` with a device-wide ``torch.npu.synchronize`` after
+      every forward, so every worker waits for the whole device queue.
+    * ``after-parallel-*``    - this change: four requests admitted to four conversation slots, each on its
+      own NPU stream, the expert fetch (only) one at a time.
+    """
+    n = a.parallel
+    short = distinct_prompts(tokenizer, n, a.short_tokens, Path(a.prompt_source))
+    two_k = distinct_prompts(tokenizer, n, a.prompt_tokens, Path(a.prompt_source))
+    short_gen = max(16, a.serve_gen)
+
+    short_results = serve_compare_phase(a, tokenizer, rec, devices, cards, short, short_gen,
+                                        a.serve_short_reserve_gib, "short", serial=True)
+    two_k_results = serve_compare_phase(a, tokenizer, rec, devices, cards, two_k, a.serve_gen,
+                                        a.serve_expert_reserve_gib, "2k", serial=True)
+
+    serial_short = short_results.get("before-serial-short")
+    after_short = short_results.get("after-parallel-short")
+    serial_2k = two_k_results.get("before-serial-2k")
+    before_2k = two_k_results.get("before-4thread-2k")
+    after_2k = two_k_results.get("after-parallel-2k")
+    iso_short = bool(serial_short and after_short and
+                     after_short["token_streams"] == serial_short["token_streams"])
+    iso_2k = bool(before_2k and after_2k and after_2k["token_streams"] == before_2k["token_streams"])
+    # the strongest form: each 2 000-token request ALONE (the serial arm) against all four at once
+    iso_2k_alone = bool(serial_2k and after_2k and
+                        after_2k["token_streams"] == serial_2k["token_streams"])
+    isolation = {"short_serial_equals_parallel": iso_short,
+                 "short_streams": after_short["token_streams"] if after_short else None,
+                 "two_k_serial_equals_parallel": iso_2k_alone,
+                 "two_k_4thread_equals_serve": iso_2k,
+                 "two_k_streams": after_2k["token_streams"] if after_2k else None}
+    print(f"\nisolation: short serial==parallel {iso_short}; 2k 4-thread==serve {iso_2k}", flush=True)
+    rec.add({"scenario": "isolation", "cards": cards, "device": a.device, "wall_s": 0.0, **isolation})
+
+
 # --------------------------------------------------------------------------- main
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -430,6 +715,25 @@ def main() -> int:
     ap.add_argument("--eos", type=int, default=1)
     ap.add_argument("--only", default="single,phases,concurrent,control,graphs,thrash",
                     help="comma-separated subset of single,phases,concurrent,control,graphs,thrash")
+    ap.add_argument("--serve-compare", action="store_true",
+                    help="run ONLY the before/after serve measurement: the old serial serve path and 4-thread "
+                         "drive against --parallel conversations, at 4 x 2 000 tokens and 4 x short prompts, "
+                         "plus the isolation check.  Builds a serve_engine.Engine instead of a bare runtime.")
+    ap.add_argument("--parallel", type=int, default=4,
+                    help="serve_engine --parallel for the after arms (default 4)")
+    ap.add_argument("--parallel-streams", action="store_true",
+                    help="give the after arm's conversations their own NPU streams (serve_engine "
+                         "--parallel-streams); off by default, which measured faster")
+    ap.add_argument("--serve-gen", type=int, default=8,
+                    help="tokens decoded per request in the 2k arms (the short control decodes at least 16)")
+    ap.add_argument("--serve-short-reserve-gib", type=float, default=8.0,
+                    help="expert reserve for the short-prompt serve phase.  Four conversations did not fit "
+                         "the engine default 6.0 on one card (NPU OOM at 30.4 of 30.5 GiB reserved), so the "
+                         "tier gives way by 2 GiB; both the before and the after arm use the same tier")
+    ap.add_argument("--serve-expert-reserve-gib", type=float, default=13.0,
+                    help="expert reserve for the serve run.  One card with four concurrent one-forward 2 000-token "
+                         "prefills needs a bigger reserve than the engine's 6.0: each forward's activation "
+                         "high-water is ~2.7 GiB (the indexer's T^2 score tensor), so the tier must give way")
     ap.add_argument("--jsonl", default="ascend/results/bench_serve-2k.jsonl")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
@@ -446,6 +750,24 @@ def main() -> int:
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(a.tokenizer)
     src = Path(a.prompt_source)
+    if a.serve_compare:
+        rec = Recorder(a.jsonl)
+        t_run = time.perf_counter()
+        a.expert_reserve_gib = a.serve_expert_reserve_gib
+        serve_compare(a, tok, rec, devices, cards)
+        total_s = time.perf_counter() - t_run
+        summary = {"run_s": round(total_s, 1), "cards": cards, "visible": visible, "device": a.device,
+                   "mode": "serve-compare", "parallel": a.parallel, "max_context": a.max_context,
+                   "prompt_tokens": a.prompt_tokens, "serve_gen": a.serve_gen,
+                   "expert_reserve_gib": a.expert_reserve_gib,
+                   "serve_short_reserve_gib": a.serve_short_reserve_gib, "scenarios": len(rec.records)}
+        print(f"\ntotal wall: {total_s / 60:.1f} min; {len(rec.records)} scenarios", flush=True)
+        if a.out:
+            Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+            Path(a.out).write_text(json.dumps({"summary": summary, "records": rec.records}, indent=1))
+            print(f"report: {a.out}", flush=True)
+        print("summary:", json.dumps(summary), flush=True)
+        return 0
     ids = make_prompt(tok, a.prompt_tokens, src)
     short = make_prompt(tok, a.short_tokens, src)
     print(f"prompt: {len(ids)} tokens from {src}; control {len(short)} tokens", flush=True)

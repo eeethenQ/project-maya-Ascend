@@ -1,0 +1,1313 @@
+{
+ "summary": {
+  "run_s": 1081.1,
+  "cards": [
+   "npu:0"
+  ],
+  "visible": "0",
+  "device": "npu:0",
+  "mode": "serve-compare",
+  "parallel": 4,
+  "max_context": 2048,
+  "prompt_tokens": 2000,
+  "serve_gen": 8,
+  "expert_reserve_gib": 13.0,
+  "serve_short_reserve_gib": 8.0,
+  "scenarios": 7
+ },
+ "records": [
+  {
+   "scenario": "before-serial-short",
+   "mode": "serial",
+   "prompt_tokens": 8,
+   "requests": 4,
+   "gen_tokens": 16,
+   "wall_s": 122.93,
+   "ttft_s": 6.65,
+   "ttft_s_list": [
+    6.35,
+    6.97,
+    6.85,
+    6.42
+   ],
+   "ttft_median_s": 6.63,
+   "ttft_spread_s": 0.62,
+   "ttft_sum_over_wall": 0.22,
+   "ttft_slowest_over_fastest": 1.1,
+   "first_token_spread_s": 0.62,
+   "decode_tok_s": 0.55,
+   "wall_tok_s": 0.52,
+   "decode_steps_total": 60,
+   "decode_tok_s_per_request": [
+    0.65,
+    0.66,
+    0.68,
+    0.69
+   ],
+   "per_request": [
+    {
+     "rid": 1,
+     "ttft_s": 6.353,
+     "tokens": [
+      67,
+      8590,
+      1281,
+      17684,
+      3320,
+      21134,
+      1718,
+      67,
+      7339,
+      82,
+      4697,
+      5,
+      223,
+      26503,
+      271,
+      28669
+     ],
+     "decode_steps": 15,
+     "decode_s": 23.164,
+     "end_s": 31.23,
+     "finish": "length",
+     "prompt_ms": 6349.1,
+     "decode_ms": 24878.7
+    },
+    {
+     "rid": 2,
+     "ttft_s": 6.968,
+     "tokens": [
+      1281,
+      6174,
+      9553,
+      3320,
+      16920,
+      1718,
+      67,
+      4697,
+      5,
+      223,
+      48215,
+      5595,
+      271,
+      917,
+      48215,
+      5595
+     ],
+     "decode_steps": 15,
+     "decode_s": 22.802,
+     "end_s": 31.392,
+     "finish": "length",
+     "prompt_ms": 6963.9,
+     "decode_ms": 24426.4
+    },
+    {
+     "rid": 3,
+     "ttft_s": 6.853,
+     "tokens": [
+      26887,
+      3320,
+      2143,
+      1718,
+      67,
+      32,
+      369,
+      818,
+      67,
+      8590,
+      1281,
+      101691,
+      26887,
+      3320,
+      36464,
+      34506
+     ],
+     "decode_steps": 15,
+     "decode_s": 22.192,
+     "end_s": 30.63,
+     "finish": "length",
+     "prompt_ms": 6848.9,
+     "decode_ms": 23778.7
+    },
+    {
+     "rid": 4,
+     "ttft_s": 6.417,
+     "tokens": [
+      26887,
+      3320,
+      66140,
+      1718,
+      67,
+      32,
+      369,
+      818,
+      67,
+      8590,
+      1281,
+      5395,
+      2272,
+      14806,
+      87,
+      15
+     ],
+     "decode_steps": 15,
+     "decode_s": 21.673,
+     "end_s": 29.677,
+     "finish": "length",
+     "prompt_ms": 6413.1,
+     "decode_ms": 23262.4
+    }
+   ],
+   "token_streams": [
+    [
+     67,
+     8590,
+     1281,
+     17684,
+     3320,
+     21134,
+     1718,
+     67,
+     7339,
+     82,
+     4697,
+     5,
+     223,
+     26503,
+     271,
+     28669
+    ],
+    [
+     1281,
+     6174,
+     9553,
+     3320,
+     16920,
+     1718,
+     67,
+     4697,
+     5,
+     223,
+     48215,
+     5595,
+     271,
+     917,
+     48215,
+     5595
+    ],
+    [
+     26887,
+     3320,
+     2143,
+     1718,
+     67,
+     32,
+     369,
+     818,
+     67,
+     8590,
+     1281,
+     101691,
+     26887,
+     3320,
+     36464,
+     34506
+    ],
+    [
+     26887,
+     3320,
+     66140,
+     1718,
+     67,
+     32,
+     369,
+     818,
+     67,
+     8590,
+     1281,
+     5395,
+     2272,
+     14806,
+     87,
+     15
+    ]
+   ],
+   "tokens_identical": false,
+   "tier": {
+    "hits": 0,
+    "misses": 19143,
+    "hit_rate": 0.0,
+    "gb_read": 677.46,
+    "gb_read_per_request": 169.37,
+    "slots": 223,
+    "oom_skips": 0
+   },
+   "peak_gib": {
+    "npu:0": 23.63
+   },
+   "allocated_gib": {
+    "npu:0": 23.07
+   },
+   "per_request_serial_s": [
+    31.23,
+    31.39,
+    30.63,
+    29.68
+   ],
+   "cards": [
+    "npu:0"
+   ],
+   "device": "npu:0",
+   "note": "the pre-change serve path: one conversation, one request at a time",
+   "at": "2026-11-19T13:40:00",
+   "client_ttft_s": [
+    6.3,
+    38.2,
+    69.5,
+    99.7
+   ],
+   "client_ttft_mean_s": 53.43
+  },
+  {
+   "scenario": "before-4thread-short",
+   "prompt_tokens": 8,
+   "max_context": 2048,
+   "requests": 4,
+   "gen_tokens": 16,
+   "succeeded": 4,
+   "errors": [],
+   "wall_s": 59.3,
+   "ttft_s": 10.86,
+   "ttft_s_list": [
+    10.88,
+    10.87,
+    10.92,
+    10.77
+   ],
+   "ttft_median_s": 10.88,
+   "ttft_spread_s": 0.15,
+   "ttft_sum_over_wall": 0.73,
+   "ttft_slowest_over_fastest": 1.01,
+   "first_token_spread_s": 0.15,
+   "decode_tok_s": 1.32,
+   "wall_tok_s": 1.08,
+   "decode_steps_total": 64,
+   "decode_tok_s_per_request": [
+    0.34,
+    0.34,
+    0.33,
+    0.33
+   ],
+   "decode_ms_median_per_request": [
+    2923.1,
+    2932.7,
+    3050.3,
+    3039.3
+   ],
+   "tokens_identical": false,
+   "token_streams": [
+    [
+     67,
+     8590,
+     1281,
+     17684,
+     3320,
+     21134,
+     1718,
+     67,
+     7339,
+     82,
+     4697,
+     5,
+     223,
+     26503,
+     271,
+     28669
+    ],
+    [
+     1281,
+     6174,
+     9553,
+     3320,
+     16920,
+     1718,
+     67,
+     4697,
+     5,
+     223,
+     48215,
+     5595,
+     271,
+     917,
+     48215,
+     5595
+    ],
+    [
+     26887,
+     3320,
+     34129,
+     59173,
+     331,
+     1718,
+     67,
+     32,
+     369,
+     818,
+     67,
+     8590,
+     1281,
+     101691,
+     26887,
+     3320
+    ],
+    [
+     369,
+     223,
+     9291,
+     31072,
+     15124,
+     127375,
+     223,
+     369,
+     223,
+     369,
+     223,
+     369,
+     223,
+     369,
+     223,
+     369
+    ]
+   ],
+   "per_request": [
+    {
+     "ttft_s": 10.881,
+     "first_token": 67,
+     "decode_steps": 16,
+     "decode_s": 47.258,
+     "decode_tok_s": 0.339,
+     "decode_ms_median": 2923.089,
+     "end_s": 58.139
+    },
+    {
+     "ttft_s": 10.873,
+     "first_token": 1281,
+     "decode_steps": 16,
+     "decode_s": 47.702,
+     "decode_tok_s": 0.335,
+     "decode_ms_median": 2932.653,
+     "end_s": 58.575
+    },
+    {
+     "ttft_s": 10.921,
+     "first_token": 26887,
+     "decode_steps": 16,
+     "decode_s": 48.374,
+     "decode_tok_s": 0.331,
+     "decode_ms_median": 3050.255,
+     "end_s": 59.295
+    },
+    {
+     "ttft_s": 10.77,
+     "first_token": 369,
+     "decode_steps": 16,
+     "decode_s": 48.498,
+     "decode_tok_s": 0.33,
+     "decode_ms_median": 3039.327,
+     "end_s": 59.268
+    }
+   ],
+   "tier": {
+    "hits": 3037,
+    "misses": 16056,
+    "hit_rate": 0.1591,
+    "gb_read": 568.21,
+    "gb_read_per_request": 142.05,
+    "slots": 215,
+    "oom_skips": 0
+   },
+   "peak_gib": {
+    "npu:0": 24.51
+   },
+   "allocated_gib": {
+    "npu:0": 23.27
+   },
+   "cards": [
+    "npu:0"
+   ],
+   "device": "npu:0",
+   "note": "pre-change best case: four threads, default stream, device-wide sync per forward",
+   "at": "2026-11-19T13:41:00"
+  },
+  {
+   "scenario": "after-parallel-short",
+   "mode": "parallel",
+   "prompt_tokens": 8,
+   "requests": 4,
+   "gen_tokens": 16,
+   "wall_s": 58.56,
+   "ttft_s": 10.37,
+   "ttft_s_list": [
+    10.46,
+    10.43,
+    10.52,
+    10.06
+   ],
+   "ttft_median_s": 10.44,
+   "ttft_spread_s": 0.46,
+   "ttft_sum_over_wall": 0.71,
+   "ttft_slowest_over_fastest": 1.05,
+   "first_token_spread_s": 0.46,
+   "decode_tok_s": 1.32,
+   "wall_tok_s": 1.09,
+   "decode_steps_total": 60,
+   "decode_tok_s_per_request": [
+    0.33,
+    0.33,
+    0.33,
+    0.33
+   ],
+   "per_request": [
+    {
+     "rid": 1,
+     "ttft_s": 10.456,
+     "tokens": [
+      67,
+      8590,
+      1281,
+      17684,
+      3320,
+      21134,
+      1718,
+      67,
+      7339,
+      82,
+      4697,
+      5,
+      223,
+      26503,
+      271,
+      28669
+     ],
+     "decode_steps": 15,
+     "decode_s": 45.126,
+     "end_s": 58.558,
+     "finish": "length",
+     "prompt_ms": 10444.8,
+     "decode_ms": 48104.7
+    },
+    {
+     "rid": 2,
+     "ttft_s": 10.431,
+     "tokens": [
+      1281,
+      6174,
+      9553,
+      3320,
+      16920,
+      1718,
+      67,
+      4697,
+      5,
+      223,
+      48215,
+      5595,
+      271,
+      917,
+      48215,
+      5595
+     ],
+     "decode_steps": 15,
+     "decode_s": 45.006,
+     "end_s": 58.514,
+     "finish": "length",
+     "prompt_ms": 10421.6,
+     "decode_ms": 48085.2
+    },
+    {
+     "rid": 3,
+     "ttft_s": 10.523,
+     "tokens": [
+      26887,
+      3320,
+      2143,
+      1718,
+      67,
+      32,
+      369,
+      818,
+      67,
+      8590,
+      1281,
+      101691,
+      26887,
+      3320,
+      36464,
+      34506
+     ],
+     "decode_steps": 15,
+     "decode_s": 44.85,
+     "end_s": 58.452,
+     "finish": "length",
+     "prompt_ms": 10515.0,
+     "decode_ms": 47930.2
+    },
+    {
+     "rid": 4,
+     "ttft_s": 10.063,
+     "tokens": [
+      26887,
+      3320,
+      66140,
+      1718,
+      67,
+      32,
+      369,
+      818,
+      67,
+      8590,
+      1281,
+      5395,
+      2272,
+      14806,
+      87,
+      15
+     ],
+     "decode_steps": 15,
+     "decode_s": 44.916,
+     "end_s": 58.177,
+     "finish": "length",
+     "prompt_ms": 10053.7,
+     "decode_ms": 48116.2
+    }
+   ],
+   "token_streams": [
+    [
+     67,
+     8590,
+     1281,
+     17684,
+     3320,
+     21134,
+     1718,
+     67,
+     7339,
+     82,
+     4697,
+     5,
+     223,
+     26503,
+     271,
+     28669
+    ],
+    [
+     1281,
+     6174,
+     9553,
+     3320,
+     16920,
+     1718,
+     67,
+     4697,
+     5,
+     223,
+     48215,
+     5595,
+     271,
+     917,
+     48215,
+     5595
+    ],
+    [
+     26887,
+     3320,
+     2143,
+     1718,
+     67,
+     32,
+     369,
+     818,
+     67,
+     8590,
+     1281,
+     101691,
+     26887,
+     3320,
+     36464,
+     34506
+    ],
+    [
+     26887,
+     3320,
+     66140,
+     1718,
+     67,
+     32,
+     369,
+     818,
+     67,
+     8590,
+     1281,
+     5395,
+     2272,
+     14806,
+     87,
+     15
+    ]
+   ],
+   "tokens_identical": false,
+   "tier": {
+    "hits": 5828,
+    "misses": 13315,
+    "hit_rate": 0.3044,
+    "gb_read": 471.21,
+    "gb_read_per_request": 117.8,
+    "slots": 223,
+    "oom_skips": 0
+   },
+   "peak_gib": {
+    "npu:0": 24.57
+   },
+   "allocated_gib": {
+    "npu:0": 23.54
+   },
+   "cards": [
+    "npu:0"
+   ],
+   "device": "npu:0",
+   "note": "4 conversations, one NPU stream each",
+   "at": "2026-11-19T13:41:58"
+  },
+  {
+   "scenario": "before-serial-2k",
+   "mode": "serial",
+   "prompt_tokens": 2000,
+   "requests": 4,
+   "gen_tokens": 8,
+   "wall_s": 305.39,
+   "ttft_s": 65.38,
+   "ttft_s_list": [
+    65.49,
+    66.28,
+    66.38,
+    63.39
+   ],
+   "ttft_median_s": 65.89,
+   "ttft_spread_s": 2.99,
+   "ttft_sum_over_wall": 0.86,
+   "ttft_slowest_over_fastest": 1.05,
+   "first_token_spread_s": 2.99,
+   "decode_tok_s": 0.13,
+   "wall_tok_s": 0.1,
+   "decode_steps_total": 28,
+   "decode_tok_s_per_request": [
+    0.74,
+    0.71,
+    0.74,
+    0.74
+   ],
+   "per_request": [
+    {
+     "rid": 1,
+     "ttft_s": 65.49,
+     "tokens": [
+      64528,
+      7743,
+      5395,
+      2272,
+      74,
+      1269,
+      5426,
+      2699
+     ],
+     "decode_steps": 7,
+     "decode_s": 9.48,
+     "end_s": 76.337,
+     "finish": "length",
+     "prompt_ms": 65484.7,
+     "decode_ms": 10847.8
+    },
+    {
+     "rid": 2,
+     "ttft_s": 66.281,
+     "tokens": [
+      56847,
+      7743,
+      45295,
+      17,
+      101691,
+      26887,
+      2542,
+      797
+     ],
+     "decode_steps": 7,
+     "decode_s": 9.832,
+     "end_s": 77.566,
+     "finish": "length",
+     "prompt_ms": 66275.7,
+     "decode_ms": 11286.1
+    },
+    {
+     "rid": 3,
+     "ttft_s": 66.376,
+     "tokens": [
+      7833,
+      45,
+      5148,
+      369,
+      223,
+      223,
+      18935,
+      369
+     ],
+     "decode_steps": 7,
+     "decode_s": 9.511,
+     "end_s": 77.276,
+     "finish": "length",
+     "prompt_ms": 66370.2,
+     "decode_ms": 10901.8
+    },
+    {
+     "rid": 4,
+     "ttft_s": 63.39,
+     "tokens": [
+      94,
+      2619,
+      23085,
+      58,
+      223,
+      20282,
+      18,
+      223
+     ],
+     "decode_steps": 7,
+     "decode_s": 9.478,
+     "end_s": 74.21,
+     "finish": "length",
+     "prompt_ms": 63383.9,
+     "decode_ms": 10822.3
+    }
+   ],
+   "token_streams": [
+    [
+     64528,
+     7743,
+     5395,
+     2272,
+     74,
+     1269,
+     5426,
+     2699
+    ],
+    [
+     56847,
+     7743,
+     45295,
+     17,
+     101691,
+     26887,
+     2542,
+     797
+    ],
+    [
+     7833,
+     45,
+     5148,
+     369,
+     223,
+     223,
+     18935,
+     369
+    ],
+    [
+     94,
+     2619,
+     23085,
+     58,
+     223,
+     20282,
+     18,
+     223
+    ]
+   ],
+   "tokens_identical": false,
+   "tier": {
+    "hits": 288,
+    "misses": 48780,
+    "hit_rate": 0.0059,
+    "gb_read": 1726.3,
+    "gb_read_per_request": 431.57,
+    "slots": 72,
+    "oom_skips": 0
+   },
+   "peak_gib": {
+    "npu:0": 19.83
+   },
+   "allocated_gib": {
+    "npu:0": 18.22
+   },
+   "per_request_serial_s": [
+    76.34,
+    77.57,
+    77.28,
+    74.21
+   ],
+   "cards": [
+    "npu:0"
+   ],
+   "device": "npu:0",
+   "note": "the pre-change serve path: one conversation, one request at a time",
+   "at": "2026-11-19T13:49:00",
+   "client_ttft_s": [
+    65.5,
+    142.6,
+    220.3,
+    294.6
+   ],
+   "client_ttft_mean_s": 180.75
+  },
+  {
+   "scenario": "before-4thread-2k",
+   "prompt_tokens": 2000,
+   "max_context": 2048,
+   "requests": 4,
+   "gen_tokens": 8,
+   "succeeded": 4,
+   "errors": [],
+   "wall_s": 169.55,
+   "ttft_s": 138.96,
+   "ttft_s_list": [
+    141.25,
+    139.4,
+    139.76,
+    135.42
+   ],
+   "ttft_median_s": 139.58,
+   "ttft_spread_s": 5.83,
+   "ttft_sum_over_wall": 3.28,
+   "ttft_slowest_over_fastest": 1.04,
+   "first_token_spread_s": 5.83,
+   "decode_tok_s": 0.94,
+   "wall_tok_s": 0.19,
+   "decode_steps_total": 32,
+   "decode_tok_s_per_request": [
+    0.28,
+    0.28,
+    0.28,
+    0.27
+   ],
+   "decode_ms_median_per_request": [
+    3739.8,
+    3683.1,
+    3698.7,
+    3654.2
+   ],
+   "tokens_identical": false,
+   "token_streams": [
+    [
+     64528,
+     7743,
+     5395,
+     2272,
+     74,
+     1269,
+     5426,
+     2699
+    ],
+    [
+     56847,
+     7743,
+     45295,
+     17,
+     101691,
+     26887,
+     2542,
+     797
+    ],
+    [
+     7833,
+     45,
+     5148,
+     369,
+     223,
+     223,
+     18935,
+     369
+    ],
+    [
+     94,
+     2619,
+     23085,
+     58,
+     223,
+     20282,
+     18,
+     223
+    ]
+   ],
+   "per_request": [
+    {
+     "ttft_s": 141.247,
+     "first_token": 64528,
+     "decode_steps": 8,
+     "decode_s": 28.302,
+     "decode_tok_s": 0.283,
+     "decode_ms_median": 3739.843,
+     "end_s": 169.549
+    },
+    {
+     "ttft_s": 139.401,
+     "first_token": 56847,
+     "decode_steps": 8,
+     "decode_s": 28.682,
+     "decode_tok_s": 0.279,
+     "decode_ms_median": 3683.077,
+     "end_s": 168.083
+    },
+    {
+     "ttft_s": 139.758,
+     "first_token": 7833,
+     "decode_steps": 8,
+     "decode_s": 28.769,
+     "decode_tok_s": 0.278,
+     "decode_ms_median": 3698.728,
+     "end_s": 168.527
+    },
+    {
+     "ttft_s": 135.42,
+     "first_token": 94,
+     "decode_steps": 8,
+     "decode_s": 29.578,
+     "decode_tok_s": 0.27,
+     "decode_ms_median": 3654.19,
+     "end_s": 164.998
+    }
+   ],
+   "tier": {
+    "hits": 394,
+    "misses": 48652,
+    "hit_rate": 0.008,
+    "gb_read": 1721.77,
+    "gb_read_per_request": 430.44,
+    "slots": 72,
+    "oom_skips": 0
+   },
+   "peak_gib": {
+    "npu:0": 22.97
+   },
+   "allocated_gib": {
+    "npu:0": 18.66
+   },
+   "cards": [
+    "npu:0"
+   ],
+   "device": "npu:0",
+   "note": "pre-change best case: four threads, default stream, device-wide sync per forward",
+   "at": "2026-11-19T13:51:50"
+  },
+  {
+   "scenario": "after-parallel-2k",
+   "mode": "parallel",
+   "prompt_tokens": 2000,
+   "requests": 4,
+   "gen_tokens": 8,
+   "wall_s": 185.11,
+   "ttft_s": 154.05,
+   "ttft_s_list": [
+    156.16,
+    154.57,
+    155.75,
+    149.7
+   ],
+   "ttft_median_s": 155.16,
+   "ttft_spread_s": 6.46,
+   "ttft_sum_over_wall": 3.33,
+   "ttft_slowest_over_fastest": 1.04,
+   "first_token_spread_s": 6.46,
+   "decode_tok_s": 0.9,
+   "wall_tok_s": 0.17,
+   "decode_steps_total": 28,
+   "decode_tok_s_per_request": [
+    0.27,
+    0.26,
+    0.27,
+    0.26
+   ],
+   "per_request": [
+    {
+     "rid": 1,
+     "ttft_s": 156.161,
+     "tokens": [
+      64528,
+      7743,
+      5395,
+      2272,
+      74,
+      1269,
+      5426,
+      2699
+     ],
+     "decode_steps": 7,
+     "decode_s": 26.227,
+     "end_s": 185.106,
+     "finish": "length",
+     "prompt_ms": 156130.4,
+     "decode_ms": 28955.2
+    },
+    {
+     "rid": 2,
+     "ttft_s": 154.57,
+     "tokens": [
+      56847,
+      7743,
+      45295,
+      17,
+      101691,
+      26887,
+      2542,
+      797
+     ],
+     "decode_steps": 7,
+     "decode_s": 26.484,
+     "end_s": 184.22,
+     "finish": "length",
+     "prompt_ms": 154555.4,
+     "decode_ms": 29651.4
+    },
+    {
+     "rid": 3,
+     "ttft_s": 155.754,
+     "tokens": [
+      7833,
+      45,
+      5148,
+      369,
+      223,
+      223,
+      18935,
+      369
+     ],
+     "decode_steps": 7,
+     "decode_s": 26.223,
+     "end_s": 184.863,
+     "finish": "length",
+     "prompt_ms": 155729.4,
+     "decode_ms": 29119.4
+    },
+    {
+     "rid": 4,
+     "ttft_s": 149.701,
+     "tokens": [
+      94,
+      2619,
+      23085,
+      58,
+      223,
+      20282,
+      18,
+      223
+     ],
+     "decode_steps": 7,
+     "decode_s": 26.935,
+     "end_s": 180.409,
+     "finish": "length",
+     "prompt_ms": 149685.4,
+     "decode_ms": 30709.8
+    }
+   ],
+   "token_streams": [
+    [
+     64528,
+     7743,
+     5395,
+     2272,
+     74,
+     1269,
+     5426,
+     2699
+    ],
+    [
+     56847,
+     7743,
+     45295,
+     17,
+     101691,
+     26887,
+     2542,
+     797
+    ],
+    [
+     7833,
+     45,
+     5148,
+     369,
+     223,
+     223,
+     18935,
+     369
+    ],
+    [
+     94,
+     2619,
+     23085,
+     58,
+     223,
+     20282,
+     18,
+     223
+    ]
+   ],
+   "tokens_identical": false,
+   "tier": {
+    "hits": 279,
+    "misses": 48789,
+    "hit_rate": 0.0057,
+    "gb_read": 1726.62,
+    "gb_read_per_request": 431.65,
+    "slots": 72,
+    "oom_skips": 0
+   },
+   "peak_gib": {
+    "npu:0": 23.04
+   },
+   "allocated_gib": {
+    "npu:0": 18.66
+   },
+   "cards": [
+    "npu:0"
+   ],
+   "device": "npu:0",
+   "note": "4 conversations, one NPU stream each",
+   "at": "2026-11-19T13:54:55"
+  },
+  {
+   "scenario": "isolation",
+   "cards": [
+    "npu:0"
+   ],
+   "device": "npu:0",
+   "wall_s": 0.0,
+   "short_serial_equals_parallel": true,
+   "short_streams": [
+    [
+     67,
+     8590,
+     1281,
+     17684,
+     3320,
+     21134,
+     1718,
+     67,
+     7339,
+     82,
+     4697,
+     5,
+     223,
+     26503,
+     271,
+     28669
+    ],
+    [
+     1281,
+     6174,
+     9553,
+     3320,
+     16920,
+     1718,
+     67,
+     4697,
+     5,
+     223,
+     48215,
+     5595,
+     271,
+     917,
+     48215,
+     5595
+    ],
+    [
+     26887,
+     3320,
+     2143,
+     1718,
+     67,
+     32,
+     369,
+     818,
+     67,
+     8590,
+     1281,
+     101691,
+     26887,
+     3320,
+     36464,
+     34506
+    ],
+    [
+     26887,
+     3320,
+     66140,
+     1718,
+     67,
+     32,
+     369,
+     818,
+     67,
+     8590,
+     1281,
+     5395,
+     2272,
+     14806,
+     87,
+     15
+    ]
+   ],
+   "two_k_4thread_equals_serve": true,
+   "two_k_streams": [
+    [
+     64528,
+     7743,
+     5395,
+     2272,
+     74,
+     1269,
+     5426,
+     2699
+    ],
+    [
+     56847,
+     7743,
+     45295,
+     17,
+     101691,
+     26887,
+     2542,
+     797
+    ],
+    [
+     7833,
+     45,
+     5148,
+     369,
+     223,
+     223,
+     18935,
+     369
+    ],
+    [
+     94,
+     2619,
+     23085,
+     58,
+     223,
+     20282,
+     18,
+     223
+    ]
+   ],
+   "at": "2026-11-19T13:54:56",
+   "two_k_serial_equals_parallel": true,
+   "note": "derived from this file: the four 2k requests alone (before-serial-2k) against all four at once (after-parallel-2k)"
+  }
+ ]
+}

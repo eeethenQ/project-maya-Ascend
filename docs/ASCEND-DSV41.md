@@ -198,8 +198,9 @@ first token is read from the prompt's own logits before that, so a request never
 answer. A teardown that cannot destroy a graph is logged and counted against `--graph-max-conversations`
 (default 1), and the process keeps serving - eagerly once the bound is spent. Each captured conversation
 costs a 405.7 MiB landing zone plus registers on every card the experts live on; four measured 1.62 GiB in
-total and put the process at 27.1 GiB of its 32 GiB share on one card at 2 048 context. The server only ever
-holds one conversation, and the tier reserves 1 GiB per card for that one.
+total and put the process at 27.1 GiB of its 32 GiB share on one card at 2 048 context. With `--parallel 1` (the default) the
+server holds one conversation, and the tier reserves 1 GiB per card for that one; `--parallel N` gives it N
+conversations (and the server's FIFO N places), and it runs eagerly - see §16.
 
 `ascend/setup_tokenizer.sh` builds that tokenizer directory: the export ships no tokenizer, V4.1 and V4
 share the vocabulary, `serve/` reads its own pack layout rather than Hugging Face's `tokenizer.json`, and
@@ -250,7 +251,8 @@ captured decode (§6). What is left is below, and the queue with acceptance is
 4. **Prefill and multi-session.** Prefill (`T > 1`) is eager and array-bound - 421 s for 823 prompt tokens in
    the GSM8K re-check; capture does not apply to it. **Do not leave `--prompt-chunk` at 512**: one
    2 000-token forward measured 233.5 s against 440.0 s for the default four, and it is also the safer side
-   of the HBM ledger (§15). The serve engine still holds one conversation.
+   of the HBM ledger (§15). The serve engine holds one conversation by default and N with `--parallel N`
+   (§16); request-level *batching* still needs a `batch > 1` `forward`, which is the design there.
 
 ## 8. Where the 3.25 s/token went
 
@@ -616,3 +618,190 @@ claims on the fetch (it is the thread pool; 12 threads measured as fast as 6 and
 array's run-to-run variation on a shared machine is larger than the effect, so the default stays 6 and 12
 is an operator choice - with §1's cold-array knee (2.3 GB/s at 6, 2.5 at 12) as the prior it is consistent
 with.
+
+## 16. Concurrency on the serve path: where the serialisation was, and the batching that removes it
+
+The question this section answers: four concurrent 2 000-token requests all finished with the *same* TTFT
+(609.9 s, spread 0.00 s) and an aggregate 1.14 tok/s against 0.61 for one - 1.9x, not 4x. Where is the
+serialisation, what can the serve path do about it without a batched forward, and what would batching take?
+
+### 16.1 The three serialisation points
+
+1. **The serve path held one conversation, so the server's FIFO had one place.** `Engine` owns
+   `self.state`/`self.held`; `Engine.run()` reads one `GEN` from `self.input` and calls `self.generate(line)`
+   to completion. READY carried no `multi=`, so `serve/server.py` built its `FairLock` with capacity 1
+   (`svc.fifo.set_capacity(engine.multi)` only runs when `multi > 1`) and never wrote a second request's
+   `GEN` until the first `DONE`. Four *clients* were therefore serialised before the engine ever saw the
+   second request; the engine could not overlap anything. That is the line: `self.generate(line)` inside
+   `Engine.run()` (`ascend/serve_engine.py`).
+2. **The 4-thread bench's device-wide sync waits for the whole queue.** `bench_serve.concurrent_prefill_decode`
+   calls `_sync(devices)` after every `forward`; `_sync` is `torch.npu.synchronize(device)`, which waits for
+   *every* op on the device, including the other three workers' forwards. The identical TTFT is that barrier:
+   four workers waiting out one queue and returning in the same instant. That line is `_sync(devices)` in the
+   worker (`ascend/bench_serve.py`).
+3. **One default stream, and a decode step is one long chain of calls.** Even without the explicit sync, all
+   four threads enqueue onto the device's single default stream. A decode step is ~32 242 operator calls
+   (§10); the device executes them in stream order, and a conversation's `logits.cpu()` in `sample` cannot
+   return until everything queued before it on that stream has run - including other conversations' steps.
+   So the four requests interleave in one queue and each pays for the queue.  Host dispatch overlaps
+   across the threads, but they share the interpreter: a forward is ~32 242 Python-level aten calls, and the
+   GIL makes that the shared resource.  That is the second serialisation, and it is why the old drive got
+   1.9x and why the new path (which keeps the default stream and only removes the FIFO and the explicit
+   device-wide sync, keeping the implicit `logits.cpu()` per step) measures the same ~2x.
+
+### 16.2 Batching is not reachable from the engine
+
+`Dsv41.forward(self, ids, state)` (`ascend/dsv41/model.py`) takes one token sequence and one `State`:
+`ids_t = torch.as_tensor(ids).reshape(-1)`, one `start = state.next_pos`, one `positions` range, one
+`state.candidates`. There is no batch axis anywhere in it. `State.__init__` does take `batch=`, but
+`KvPlanes.__init__` (`ascend/dsv41/kv_planes.py`) refuses anything but 1:
+
+    raise ValueError(f"KvPlanes addresses one conversation (batch=1), got batch={self.batch}")
+
+so `rt.state(max_context, batch=2)` fails at construction. The captured decode is `T == 1` for one `State`
+and the model holds one graph domain (`_graph_decode` closes a domain whose `state` is not the current one),
+so graphs are one conversation by construction too. A 4-conversation decode step is therefore **four eager
+forwards, not one** - which is exactly what the old 4-thread drive did.
+
+### 16.3 What landed: `--parallel N`, and the graphs conflict stated
+
+`ascend/serve_engine.py` now has `--parallel N` (default **1**, the pre-existing behaviour):
+
+* READY becomes `READY <ctx> stop pause multi=N`; `serve/server.py` reads it and gives its FIFO N places,
+  and tags every request it writes (`GEN ... rid=<id>`, `STOP <rid>`, `PAUSE <rid> [keep]`).
+* N conversation slots, each with its own `State` (KV is only 0.015 GiB at 2 048 context), selected by the
+  longest common prefix among idle slots, so a chat's next turn still reuses its state and a divergent
+  prompt starts a new one. A request past N waits in the engine's queue and the engine logs that it queued;
+  `STOP <rid>` cuts one request, a bare `STOP`/`PAUSE` cuts all of them, `WRAP` is a thinking request's soft
+  cut, `QUIT` ends the engine.
+* The lines are per-request: `PP <rid> read total ms tok_s reuse`, `T <rid> tok`, `DONE <rid> ...`,
+  `ERR <rid> ...`; `STAT` stays engine-wide (the dashboard reads it).
+* **The shared expert streamer is not reentrant.** `ExpertStreamer._read_many` rotates one pinned staging
+  ring (`self._slot`, `self._staging`) and, with a spread tier, moves the process's current device around
+  every copy. Two forwards fetching at once can take the same staging slot and hand each other's expert
+  bytes to the card - a silent wrong answer. With `--parallel > 1` the engine wraps `fetch_int8` in one
+  lock (host read + H2D only, and only while the scheduler runs); attention, the router and the expert
+  matmuls still overlap across the request threads.
+* **Graphs are off when `--parallel > 1`**, and the conflict is logged at start, not silently resolved: a
+  captured decode is one `State` at `T == 1` and one graph domain per model, so N conversations would
+  recapture on every step (the thrash `bench_serve` measures). `--graphs` is effective with `--parallel 1`.
+* **Per-conversation NPU streams are opt-in** (`--parallel-streams`) and default off: measured on one
+  910B3, four streams were ~10-15% slower than the device's default stream at the same expert tier - the
+  staging ring's per-slot events then couple the streams, so the independence the streams buy is given
+  back at the ring. Host dispatch still overlaps across the threads in both modes.
+* `bench_serve.py --serve-compare` is the harness for this: one engine build per prompt size, the old
+  serial serve path, the old 4-thread device-sync drive, the new `--parallel` path, and the isolation
+  check, all on the same tier and cards.
+
+On one card, four concurrent conversations also need HBM for four activation high-waters at once (~2.7 GiB
+each for a one-forward 2 000-token prompt, §15), so the run below uses `--serve-expert-reserve-gib 13` and
+a much smaller expert tier than the engine's default 6. That is a real caveat, not a harness detail: 4x2k
+one-forward prefills on one 32 GB share fit only with a small tier (or with `--prompt-chunk`).
+
+### 16.4 Measured
+
+`bench_serve --serve-compare`, **one card** (`ASCEND_RT_VISIBLE_DEVICES=0`, `--cards npu:0`), four
+*different* prompts per arm, greedy, one forward per prompt (`--prompt-chunk 0`).  Short: 8-token prompts,
+16 decoded tokens each; 2k: 2 000-token prompts, 8 decoded tokens each.  Each size builds its own engine, so
+the tier is identical across the arms being compared: reserve 8 GiB (223 slots) for the short prompts, 13 GiB
+(72 slots) for 4x2k, because four one-forward 2 000-token prefills each need ~2.7 GiB of activation (§15) and
+four only fit with a small tier.  The array was page-cache warm (1.9 TB host, this checkpoint read many times
+this round), so the absolute TTFTs are optimistic; the arms ran in the order shown; total run 18.0 min.
+
+**4 x 2 000-token prompt, 8 tokens each**
+
+| arm | wall | TTFT (client) | aggregate decode tok/s | per-request decode tok/s | wall tok/s | peak HBM |
+|---|---:|---:|---:|---:|---:|---:|
+| old serve path (one conversation, serial GENs) | 305.4 s | 65.5/142.6/220.3/294.6 (mean 180.8) | 0.74 | 0.71-0.74 | 0.10 | 19.8 GiB |
+| old 4-thread drive (default stream, device-wide sync) | 169.6 s | 139.0 s [135.4-141.3] | 0.94 | 0.27-0.28 | 0.19 | 23.0 GiB |
+| **new `--parallel 4`** | **185.1 s** | **154.1 s [149.7-156.2]** | **0.90** | 0.26-0.27 | 0.17 | 23.0 GiB |
+
+**4 x 8-token prompt, 16 tokens each (the prefill taken out)**
+
+| arm | wall | TTFT (client) | aggregate decode tok/s | per-request decode tok/s | wall tok/s | peak HBM |
+|---|---:|---:|---:|---:|---:|---:|
+| old serve path (one conversation, serial GENs) | 122.9 s | 6.3/38.2/69.5/99.7 (mean 53.4) | 0.67 | 0.65-0.69 | 0.52 | 23.6 GiB |
+| old 4-thread drive (default stream, device-wide sync) | 59.3 s | 10.86 s [10.77-10.92] | 1.32 | 0.33-0.34 | 1.08 | 24.5 GiB |
+| **new `--parallel 4`** | **58.6 s** | **10.37 s [10.06-10.52]** | **1.32** | 0.33 | 1.09 | 24.6 GiB |
+
+(For the old serial path the TTFT is what a *client* waits: the queue in front of it plus its own prefill
+(so 65.5, 142.6, 220.3 and 294.6 s at 2k); its service TTFT once it starts is 65.4 s.  For the concurrent
+arms every client starts at once, so the mean is the client's TTFT.  The old serial arm's aggregate decode
+is its per-request rate - nothing overlaps; its "wall tok/s" is the end-to-end rate including the prefills.
+The concurrent arms' aggregate is 4 x per-request, measured from the first token to the last.)
+
+**What it says.**
+
+* **The serve path now overlaps, and that is worth 1.65-2.1x of wall (5.1x of client TTFT at short).**
+  4x2k went from 305.4 s of wall to 185.1 s (1.65x) and 4xshort from 122.9 s to 58.6 s (2.10x).  The old
+  path queued clients: at 2k their first tokens came at 65.5, 142.6, 220.3 and 294.6 s; `--parallel 4` gives
+  all four theirs at ~154 s.  At short, the old clients waited 6.3/38.2/69.5/99.7 s against ~10.4 s now
+  (mean client TTFT 53.4 -> 10.4 s).
+* **It is 2x, not 4x, and the shared resource is the host, not the device.**  At short prompts, four
+  conversations decode at 0.33 tok/s each against 0.67 alone: per-request halves while aggregate doubles.
+  A decode step is ~32 242 Python-level operator calls and only ~164 ms of device time (§10), so the four
+  request threads are not waiting on the NPU - they are serialising on the interpreter while dispatching
+  those calls.  The NPU streams (`--parallel-streams`) do not change that, which is why they measured
+  slower and are off by default.
+* **At 2k on one card a second ceiling appears: the expert stream.**  With 72 tier slots the four
+  conversations hit 0.6% and each token's experts come from the shared array (page-cache warm here);
+  aggregate decode is 0.90 against 0.74 for one request - **1.2x**.  The lead's 1.9x was measured on a
+  three-card, 1 769-slot tier; the same mechanism on one 72-slot card gives 1.2x.  Concurrency does not
+  create expert bandwidth, and neither does batching - only a bigger tier or a shared expert fetch does.
+* **The new path equals the old 4-thread best case at short prompts** (1.32 vs 1.32 tok/s, 58.6 vs 59.3 s)
+  **and is 9% behind it at 2k** (185.1 vs 169.6 s).  Part of that is the engine holding the shared expert
+  staging ring one fetch at a time (the old drive took a race it did not know it had: see 16.3); part may
+  be drift - the after arm ran second.  Peak HBM is 24.6 GiB (short) and 23.0 GiB (2k) of the 30.48 GiB
+  share, so four conversations fit once the tier gives way.
+* **Isolation holds.**  The four prompts are distinct and their greedy token streams are identical
+  token-for-token in every pairing: each request run *alone* (the serial arm) and all four at once
+  (`--parallel`) at both sizes, and the old 4-thread drive against `--parallel` at 2k.  The streams are in
+  `ascend/results/bench_serve-concurrency-npu0.json` (`token_streams`), e.g. the four 2k streams
+  `[64528, 7743, 5395, 2272, 74, 1269, 5426, 2699]`, `[56847, ...]`, `[7833, ...]`, `[94, ...]` are the same
+  alone and concurrent.  `bench_serve --serve-compare` records the flags
+  (`short_serial_equals_parallel`, `two_k_serial_equals_parallel`, `two_k_4thread_equals_serve`).
+
+The 4x the original measurement hoped for is therefore not available from concurrency alone on this
+machine: the second serialisation (shared host dispatch) leaves ~2x, and the third (expert bandwidth on a
+small tier) leaves 1.2x at 2k.  A batched forward removes the first; the second only a bigger tier does.
+
+
+### 16.5 The batching change, for the lead to schedule
+
+A batched decode is the only way to the 4x the measurement asks for, and it is a `model.py` change. The
+shape of it:
+
+1. **`KvPlanes(batch=N)`**: every plane already allocates `[batch, ...]`; make the batch axis real in
+   `write_window`/`read_window`/`write_group`/`read_groups`/`write_raw`, where a row's position is
+   `[batch]`. Today those paths squeeze or assume one row; per-row positions and masks are the change.
+2. **`State` per-row cursors**: `next_pos` becomes a host list/array with the device `pos` mirror; `rewind`
+   moves all rows or one. The graph's fixed registers do not apply (graphs stay per conversation).
+3. **`Dsv41.forward(tokens: [N][T], state)`**: all N rows at the same step. The cheapest entry is
+   *decode-only*: `T == 1` per row, `[N, 1]`, positions and `lens` per row. Prompt chunks stay
+   per-conversation (prefill is storage-bound; batching it does not help).
+4. **MoE**: `_routed_sum`'s one-token path walks the six ids of a single row and quantises the activation
+   once. A batch needs the union of N rows' ids (<= 6N per layer), `--expert-batch` and the landing zone
+   sized for 6N, and one quantised activation row per conversation. This is the largest piece: the landing
+   zone is `[6, 3, per]` today and the captured `g_post` bakes its address.
+5. **Scheduler**: hold conversations at the same decode step and call one forward per step, sample per row,
+   and keep the graphs only in the one-conversation case. Batching and graphs are exclusive by
+   construction, which is why the policy above exists now.
+6. **Acceptance**: per-row logits bit-equal to N separate forwards (the existing model-parity bar), then
+   the same `bench_serve --serve-compare` table with `batch=4`.
+
+The prize is the *measured* ceiling of 16.4: with concurrency alone, four conversations decode at 0.33
+tok/s each against 0.67 for one - 2x aggregate, not 4x - because the four request threads share the
+interpreter while dispatching ~32 242 Python-level aten calls per step. One batched forward issues those
+calls once for four tokens, which removes exactly that shared cost; the device (164.3 ms of work against a
+~1.6 s eager step, §10) has the room. Two caveats follow from the same table:
+
+* At 2k on one 72-slot card the aggregate was capped at 1.2x by the shared expert stream, so batching alone
+  would not lift *that* number - the four conversations would still fetch four sets of experts. The
+  batching win needs the larger tier the four cards give (1 769-2 480 slots), where the step really is
+  call-bound.
+* The engine's expert-fetch lock costs ~9% at 2k (185.1 s against the old drive's 169.6 s). It is there
+  because `ExpertStreamer`'s staging ring is one ring; making it per-conversation (or per-thread) is a small
+  `model.py` change and should be part of the same batch work, so that the lock can come out.
+* The engine's `--parallel N` stays the right behaviour either way - it makes the serve path accept N
+  requests instead of queueing them at a FIFO with one place, and it is the scheduler the batched forward
+  would plug into.

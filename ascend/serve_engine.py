@@ -37,16 +37,44 @@ cost (1.8-1.9 s for 80 graphs, charged to the decode after the first token - the
 the prompt's own logits, so a request never waits on it to answer).  At most
 `--graph-max-conversations` captured conversations may be alive at once (default 1, which is what
 `runtime.build` reserves HBM for); past it a conversation runs eagerly and says so.
+
+Several conversations at once (`--parallel N`)
+------------------------------------------------
+The default is one conversation, exactly as before.  With `--parallel N` the engine admits up to N
+conversations at once, each with its own `State` (and, with `--parallel-streams`, its own NPU stream), and
+advertises `multi=N` in READY
+so `serve/server.py` gives its FIFO N places and tags every request (`GEN ... rid=<id>`, `T <rid> <token>`,
+`DONE <rid> ...`, `STOP <rid>`).  A request is placed on the idle conversation sharing the longest prefix
+with its prompt (so a chat's next turn still reuses the state, and a divergent prompt starts a new one); a
+request past N waits for a conversation to free, and the engine logs that it queued.
+
+What this does **not** do is batch: `Dsv41.forward` takes one `State` and one token list, and `KvPlanes`
+refuses `batch != 1`, so N conversations cannot share a forward.  Each conversation therefore still pays
+its own 32 242 operator calls per token; the overlap is host dispatch across the request threads (and, only
+with the opt-in `--parallel-streams`, NPU execution across streams), not one batched call.  The measured consequence is in `docs/ASCEND-DSV41.md` §6 and §16.
+
+Two consequences of sharing one model, both handled here:
+
+* **The expert streamer is not reentrant.**  `ExpertStreamer._read_many` rotates one pinned staging ring
+  and, with a spread tier, moves the process's current device around each copy; two forwards fetching at
+  once could hand each other's expert bytes to the card.  With `--parallel > 1` the engine wraps
+  `fetch_int8` in one lock (host read + H2D only), so the shared ring is used one fetch at a time.  The
+  rest of a forward - attention, the expert matmuls - still overlaps across the request threads.
+* **Graphs are one conversation's buffers.**  A captured decode is `T == 1` for one `State` and the model
+  holds one graph domain, so `--parallel > 1` runs eagerly and says so; `--graphs` is only meaningful with
+  `--parallel 1`.  The two are never silently mixed: the conflict is logged at start.
 """
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import queue
 import sys
 import threading
 import time
+import traceback
 
 import torch
 
@@ -55,15 +83,46 @@ from .dsv41.graph_runner import GraphTeardownError
 
 EOS = 1
 
+# one line is one write: several request threads emit concurrently in --parallel mode
+_OUT_LOCK = threading.Lock()
+
 
 def _log(msg: str) -> None:
-    sys.stderr.write(msg + "\n")
-    sys.stderr.flush()
+    with _OUT_LOCK:
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
 
 
 def _out(msg: str) -> None:
-    sys.stdout.write(msg + "\n")
-    sys.stdout.flush()
+    with _OUT_LOCK:
+        sys.stdout.write(msg + "\n")
+        sys.stdout.flush()
+
+
+class Conversation:
+    """One conversation's State and the tokens it covers.
+
+    The single-conversation engine *is* one of these (`Engine` has `state` and `held` too, and passes
+    itself where a conversation is expected), so `generate` has one code path.  In `--parallel` mode each
+    scheduler slot is a `Conversation`; the scheduler only reads `held` while the slot is idle, and the
+    serving thread owns the State.
+    """
+
+    def __init__(self, name: str = ""):
+        self.name = name
+        self.state = None
+        self.held: list[int] = []
+        self.busy = False
+        self.rid: int | None = None
+        self.queue: "queue.Queue" = queue.Queue()
+
+    def common_prefix(self, ids: list[int]) -> int:
+        n = 0
+        for a, b in zip(ids, self.held):
+            if a != b:
+                break
+            n += 1
+        return n
 
 
 def prompt_chunks(n_tokens: int, chunk: int, max_context: int) -> list[int]:
@@ -102,6 +161,12 @@ class Engine:
 
     def __init__(self, args):
         self.args = args
+        self.parallel = max(1, int(getattr(args, "parallel", 1) or 1))
+        # A captured decode is T == 1 for one State and the model holds one graph domain: it cannot be
+        # shared by N conversations, and switching domains on every step is the thrash the graph work
+        # exists to avoid.  The policy is explicit - --parallel > 1 runs eagerly - never a silent mix.
+        self._graphs_conflict = bool(getattr(args, "graphs", False)) and self.parallel > 1
+        self._graphs_wanted = bool(getattr(args, "graphs", False)) and self.parallel == 1
         t0 = time.time()
         self.rt = rt.build(model=args.model, device=args.device, dtype=args.dtype,
                            hbm_share=args.hbm_share, expert_slots=args.expert_slots,
@@ -109,7 +174,7 @@ class Engine:
                            expert_reserve_gib=args.expert_reserve_gib,
                            expert_devices=args.expert_devices.split(",") if args.expert_devices else None,
                            engram_tokenizer=args.engram_tokenizer or None,
-                           graphs=getattr(args, "graphs", False),
+                           graphs=self._graphs_wanted,
                            graph_verify=getattr(args, "graph_verify", False),
                            verbose=args.verbose)
         self.cfg = self.rt.cfg
@@ -120,13 +185,35 @@ class Engine:
         self.input: queue.Queue[str | None] = queue.Queue()
         self.quit = False
         self.stats = {"tokens": 0, "steps": 0, "decode_ms": 0.0}
+        # -- several conversations at once (--parallel) -----------------------------------------
+        # `self` is the single conversation of the default engine and the first slot's owner is never
+        # it: with --parallel the scheduler hands requests to `self.slots`, each a `Conversation` with
+        # its own State, and `generate` treats `self` and a slot alike.  `_sched` guards the slot table
+        # and the control state; a worker owns its slot's State while it serves.
+        self.slots: list[Conversation] = ([Conversation(f"slot{i}") for i in range(self.parallel)]
+                                          if self.parallel > 1 else [])
+        self._sched = threading.Lock()
+        self._cut = 0                            # incremented by a global STOP/PAUSE/QUIT
+        self._wrap = 0                           # incremented by WRAP (a thinking request's soft cut)
+        self._rid_cut: set[int] = set()          # request ids the server has stopped
+        self._waiting: "collections.deque[tuple[str, int]]" = collections.deque()
+        self._workers: list[threading.Thread] = []
+        self._multi_running = False
+        self._queued_seen = 0
+        # Per-conversation NPU streams are opt-in: measured on one 910B3 they were ~10-15% slower than the
+        # device's default stream at the same tier (four conversations then contend not only for the SM but
+        # for the shared staging ring's per-slot events, whose cross-stream waits add to the work).  The
+        # default keeps the one stream and still overlaps host dispatch across the request threads.
+        self._parallel_streams = bool(getattr(args, "parallel_streams", False)) and self.parallel > 1
+        self._expert_lock = threading.Lock()
+        self._install_expert_lock()
+        self._closed = False
         # -- the captured decode, per conversation ----------------------------------------------
         # The graphs bake the held State's buffers, so there is nothing to reuse once the conversation
         # is over.  `_graphs_held` is the conversation being served; `_graphs_leaked` counts domains a
         # failed teardown left alive (their HBM never comes back in this process), and the two together
         # are what the bound counts.  A leaked domain must never turn into a second landing zone on
         # every expert card by accident, which is what the bound is for.
-        self._graphs_wanted = bool(getattr(args, "graphs", False))
         self._graph_max = max(1, int(getattr(args, "graph_max_conversations", 1) or 1))
         self._graphs_held = 0
         self._graphs_leaked = 0
@@ -158,18 +245,36 @@ class Engine:
              f"of 32.00 GB in use - dense weights {resident:.2f}, state/KV ({ctx} ctx) "
              f"{self.kv_gib(ctx):.2f}, activations 0.50, other (context, scratch, prompt path) 0.50")
         _log(f"maya generate: session is up (ascend dsv41, {self.rt.device}, weights in {self.load_s:.1f}s, "
-             f"graphs {'on' if self._graphs_wanted else 'off'})")
+             f"graphs {'on' if self._graphs_wanted else 'off'}, conversations {self.parallel})")
+        if self._graphs_conflict:
+            _log(f"dsv41 graphs: OFF - --graphs was asked for with --parallel {self.parallel}.  A captured "
+                 f"decode is one State at T == 1 and the model holds one graph domain, so N conversations "
+                 f"cannot replay it (a second conversation would recapture on every step, the thrash "
+                 f"bench_serve measures); this engine runs eagerly.  Use --parallel 1 with --graphs, or "
+                 f"--parallel N without it")
         if self._graphs_wanted:
             _log(f"dsv41 graphs: capturing the one-token decode per conversation (g_pre/g_post per layer, "
                  f"one g_pre per indexer bucket; measured 1.8-1.9 s for 80 graphs).  At most "
                  f"{self._graph_max} captured conversation(s) alive at once; past that bound a "
                  f"conversation runs eagerly and says so.  Prompt chunks stay eager.")
+        if self.parallel > 1:
+            _log(f"dsv41 parallel: {self.parallel} conversations at once, one State each"
+                 f"{' and one NPU stream each' if self._parallel_streams else ''}; "
+                 f"a request past {self.parallel} waits for one to free (the server's FIFO has {self.parallel} "
+                 f"places when it reads multi={self.parallel}).  The shared expert streamer is held one fetch "
+                 f"at a time (its pinned ring is not reentrant); each conversation's KV costs "
+                 f"{self.kv_gib(ctx):.3f} GiB at {ctx} context, so size --expert-reserve-gib for N "
+                 f"concurrent activations")
         _out(f"INFO context={ctx} kv=bf16 kv_resident=0 expert_slots={slots} "
              f"expert_cache_mib={slots * per_expert // (1 << 20)} engine_kind=dsv41-ascend "
              f"experts={experts_total} vram_slots={slots} vram_gb={resident + slots * per_expert / rt.GIB:.2f} "
              f"ram_slots=0 ram_gb=0.0 mtp=0 dflash=0 vision_lend=0 ling=0 cpu_threads=0 cpu_threads_max=0 "
              f"pcie_share={self.args.hbm_share:.2f} logit_bias=1")
-        _out(f"READY {ctx} stop pause")
+        if self.parallel > 1:
+            # serve/server.py reads multi=<n>: n places in its FIFO, and every GEN carries rid=<id>
+            _out(f"READY {ctx} stop pause multi={self.parallel}")
+        else:
+            _out(f"READY {ctx} stop pause")
         _log("maya generate: dsv41 ascend serve: GEN <max_new> [keys] <ids>, STOP, PAUSE, WRAP, QUIT")
 
     def kv_gib(self, ctx: int) -> float:
@@ -277,11 +382,17 @@ class Engine:
             _log(f"dsv41 graphs: the bound has room again ({self.graphs_live()}/"
                  f"{self._graph_max}); new conversations capture")
 
-    def _drop_conversation(self, reason: str) -> None:
-        """Forget the held conversation, releasing its graphs (its State is garbage after this)."""
-        self._release_graphs(reason)
-        self.state = None
-        self.held = []
+    def _drop_conversation(self, reason: str, conv=None) -> None:
+        """Forget a conversation, releasing its graphs (its State is garbage after this).
+
+        Only the engine's own (the single-conversation default) holds a graph domain; a `--parallel` slot
+        runs eagerly, and releasing the model's graphs from a slot thread would tear down somebody else's.
+        """
+        conv = self if conv is None else conv
+        if conv is self:
+            self._release_graphs(reason)
+        conv.state = None
+        conv.held = []
 
     # -- reading the input ---------------------------------------------------------------------
     def _reader(self) -> None:
@@ -289,7 +400,8 @@ class Engine:
             line = line.strip()
             if not line:
                 continue
-            if line in ("STOP", "WRAP", "PAUSE", "PAUSE keep"):
+            # `STOP <rid>` / `PAUSE <rid> [keep]` are one request's control in --parallel mode
+            if line in ("STOP", "WRAP", "PAUSE", "PAUSE keep") or line.startswith(("STOP ", "PAUSE ")):
                 self.control.put(line)
             elif line == "QUIT":
                 self.control.put("QUIT")
@@ -305,8 +417,288 @@ class Engine:
         except queue.Empty:
             return None
 
+    def _control_for(self, rid: int | None, cut0: int, wrap0: int) -> str | None:
+        """The control this request should see now: `STOP`/`PAUSE`/`WRAP`/`QUIT`, or None.
+
+        In single-conversation mode this is the old control queue (`--parallel` not in use).  In
+        `--parallel` mode a request started at global cut generation ``cut0``/wrap ``wrap0`` is cut by a
+        later global STOP/PAUSE or, if the server named it, by its own ``STOP <rid>``.  WRAP is not a cut:
+        a thinking request closes its reasoning at the next token (the caller's loop does that).
+        """
+        if rid is None:
+            return self.controls_held()
+        with self._sched:
+            if self.quit:
+                return "QUIT"
+            if rid in self._rid_cut:
+                self._rid_cut.discard(rid)
+                return "STOP"
+            if self._cut != cut0:
+                return "STOP"
+            if self._wrap != wrap0:
+                return "WRAP"
+        return None
+
+    # -- several conversations at once ---------------------------------------------------------
+    def _install_expert_lock(self) -> None:
+        """Make the one shared ExpertStreamer safe for N concurrent forwards.
+
+        `ExpertStreamer._read_many` rotates **one** pinned staging ring (`self._slot`, `self._staging`)
+        and, with a spread tier, moves the process's current device around each copy; that is written for
+        one forward at a time.  Two conversations fetching at once can pick the same staging slot and hand
+        each other's expert bytes to the card - a silently wrong answer, not a crash.  The wrapper takes
+        `self._expert_lock` for the host read + H2D of a fetch only, and only while the multi scheduler is
+        running (`--parallel 1`, and the bench's own before-arm, are untouched).  The rest of a forward -
+        attention, the router, the expert matmuls - still overlaps across the request threads.
+
+        `Dsv41.forward` reaching the streamer through `self.weights.experts.fetch_int8` means an instance
+        attribute shadows the bound method, which is why this lives here rather than in `model.py` (owned
+        elsewhere this round).
+        """
+        if self.parallel <= 1:
+            return
+        experts = getattr(self.rt, "experts", None)
+        fetch = getattr(experts, "fetch_int8", None)
+        if fetch is None or getattr(fetch, "_serve_locked", False):
+            return
+        lock, engine = self._expert_lock, self
+
+        def fetch_int8(*a, **kw):
+            if engine._multi_running:
+                with lock:
+                    return fetch(*a, **kw)
+            return fetch(*a, **kw)
+
+        fetch_int8._serve_locked = True
+        experts.fetch_int8 = fetch_int8
+
+    def _emit(self, msg: str, rid: int | None = None) -> None:
+        """Write one protocol line, tagged with its request id in --parallel mode.
+
+        `serve/server.py` routes `T`/`PP`/`DONE`/`ERR` by the id after the verb; `STAT` stays engine-wide.
+        """
+        if rid is not None:
+            verb, sep, rest = msg.partition(" ")
+            if sep and verb in ("T", "PP", "DONE", "ERR"):
+                msg = f"{verb} {rid} {rest}"
+        self.emit(msg)
+
+    def emit(self, msg: str) -> None:
+        """Where protocol lines go; a test or a benchmark may replace this with a collector."""
+        _out(msg)
+
+    def start_workers(self) -> None:
+        """Start the `--parallel` worker threads (one per conversation slot); idempotent."""
+        if self.parallel <= 1 or self._workers:
+            return
+        self.quit = False
+        self._multi_running = True
+        for slot in self.slots:
+            t = threading.Thread(target=self._worker, args=(slot,), name=f"serve-{slot.name}", daemon=True)
+            t.start()
+            self._workers.append(t)
+
+    def stop_workers(self, timeout: float = 120.0) -> None:
+        """Stop the workers, ending any request in flight (QUIT semantics: no DONE is promised).
+
+        The expert lock stays armed until the last worker has left: a worker can still be inside a
+        forward when this is called, and disarming it then would let two fetches race the staging ring.
+        """
+        self.quit = True
+        workers, self._workers = self._workers, []
+        for slot in self.slots:
+            slot.queue.put(None)
+        for t in workers:
+            t.join(timeout)
+        self._multi_running = False
+
+    def wait_idle(self, timeout: float = 3600.0) -> bool:
+        """Wait until no conversation is running and no request is waiting; False on timeout."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            with self._sched:
+                if not self._waiting and not any(s.busy for s in self.slots):
+                    return True
+            time.sleep(0.02)
+        return False
+
+    def submit(self, line: str) -> bool:
+        """Hand one line to the `--parallel` scheduler; False when this engine is single-conversation."""
+        if self.parallel <= 1:
+            return False
+        self._dispatch(line)
+        return True
+
+    def _dispatch(self, line: str) -> None:
+        """A line from the server, in `--parallel` mode: a GEN to admit, or a control to apply."""
+        if line.startswith("GEN "):
+            rid = self._rid_of(line)
+            if rid is None:
+                self._emit("ERR multi mode needs rid=<id> on GEN (READY multi=N)")
+                return
+            self._admit(line, rid)
+        elif line.startswith(("STOP", "PAUSE", "WRAP", "QUIT")):
+            self._apply_control(line)
+        elif line.startswith("GENI "):
+            self._emit("ERR this engine serves text only: no images")
+        elif line in ("VLEND", "VRECLAIM"):
+            self._emit(f"ERR {line} text-only model: no vision encoder to lend memory to")
+        else:
+            self._emit(f"ERR unsupported command '{line.split()[0]}'")
+
+    @staticmethod
+    def _rid_of(line: str) -> int | None:
+        fields = line.split()
+        for f in fields[2:-1]:
+            if f.startswith("rid="):
+                try:
+                    return int(f.split("=", 1)[1])
+                except ValueError:
+                    return None
+        return None
+
+    def _apply_control(self, line: str) -> None:
+        """Apply STOP / PAUSE / WRAP / QUIT to the conversations they are meant for.
+
+        A bare STOP/PAUSE cuts every running request (and cancels the queued ones, each with its own
+        `DONE ... cancel`, so the server's drain does not wait for a line that will not come); `STOP <rid>`
+        cuts one.  WRAP is not a cut.  QUIT ends the engine.
+        """
+        parts = line.split()
+        verb = parts[0]
+        rid = parts[1] if len(parts) > 1 and parts[1].isdigit() else None
+        cancelled: list[tuple[int, int]] = []
+        with self._sched:
+            if verb == "QUIT":
+                self._cut += 1
+                self.quit = True
+                cancelled = [(r, self._prompt_len(line_)) for line_, r in self._waiting]
+                self._waiting.clear()
+            elif verb == "WRAP":
+                self._wrap += 1
+            elif verb == "STOP" or verb == "PAUSE":
+                if rid is not None:
+                    self._rid_cut.add(int(rid))
+                else:
+                    self._cut += 1
+                    cancelled = [(r, self._prompt_len(line_)) for line_, r in self._waiting]
+                    self._waiting.clear()
+        for r, n in cancelled:
+            self._emit(f"DONE 0 {n} 0.0 0.0 cancel 0 0 0 0 0", r)
+
+    @staticmethod
+    def _prompt_len(line: str) -> int:
+        fields = line.split()
+        if not fields:
+            return 0
+        return len([x for x in fields[-1].split(",") if x])
+
+    def _admit(self, line: str, rid: int) -> None:
+        """Place a request on the idle conversation sharing the longest prefix, else queue it."""
+        ids = [int(x) for x in line.split()[-1].split(",") if x]
+        with self._sched:
+            if rid in self._rid_cut:
+                # stopped while it was on its way in: answer its DONE so the server's drain completes
+                self._rid_cut.discard(rid)
+                cancelled = True
+                slot = None
+            else:
+                cancelled = False
+                slot, best = None, -1
+                for s in self.slots:
+                    if s.busy:
+                        continue
+                    n = s.common_prefix(ids)
+                    if n > best:
+                        slot, best = s, n
+                if slot is not None:
+                    self._assign(slot, line, rid, self._cut, self._wrap)
+                else:
+                    self._waiting.append((line, rid))
+                    self._queued_seen += 1
+        if cancelled:
+            self._emit(f"DONE 0 {len(ids)} 0.0 0.0 cancel 0 0 0 0 0", rid)
+        elif slot is None:
+            _log(f"dsv41 parallel: request {rid} queued behind {self.parallel} running conversation(s); "
+                 f"it starts when one frees (the server should hold at most multi={self.parallel})")
+
+    def _assign(self, slot: Conversation, line: str, rid: int, cut0: int, wrap0: int) -> None:
+        """Give a request to an idle slot.  Caller holds `_sched`."""
+        slot.busy = True
+        slot.rid = rid
+        slot.queue.put((line, rid, cut0, wrap0))
+
+    def _worker(self, slot: Conversation) -> None:
+        """Serve this slot's requests, in this thread's own NPU stream if enabled, until stopped."""
+        stream = self._new_stream()
+        while True:
+            item = slot.queue.get()
+            if item is None:
+                return
+            line, rid, cut0, wrap0 = item
+            try:
+                with self._sched:
+                    cancelled = rid in self._rid_cut
+                    self._rid_cut.discard(rid)
+                if self.quit or cancelled:
+                    if not self.quit:
+                        self._emit(f"DONE 0 {self._prompt_len(line)} 0.0 0.0 cancel 0 0 0 0 0", rid)
+                elif stream is None:
+                    self._serve_one(line, slot, rid, cut0, wrap0)
+                else:
+                    with torch.npu.stream(stream):
+                        self._serve_one(line, slot, rid, cut0, wrap0)
+            finally:
+                self._finish_slot(slot)
+
+    def _serve_one(self, line: str, conv: Conversation, rid: int, cut0: int, wrap0: int) -> None:
+        """One request: an exception is this request's error, never the engine's (the others go on)."""
+        try:
+            self.generate(line, conv=conv, rid=rid, cut0=cut0, wrap0=wrap0)
+        except Exception as exc:                          # noqa: BLE001 - one request's failure
+            _log("dsv41 parallel: request %s failed - %s: %s\n%s"
+                 % (rid, type(exc).__name__, exc, traceback.format_exc()))
+            conv.state = None
+            conv.held = []
+            self._emit(f"ERR {type(exc).__name__}: {exc}", rid)
+
+    def _finish_slot(self, slot: Conversation) -> None:
+        """Free the slot and start a queued request on it, if any (FIFO; the oldest waiter goes first)."""
+        cancelled: list[tuple[int, int]] = []
+        with self._sched:
+            if slot.rid is not None:
+                self._rid_cut.discard(slot.rid)       # a STOP that lost the race with the request's end
+            slot.busy = False
+            slot.rid = None
+            while self._waiting and not self.quit:
+                line, rid = self._waiting.popleft()
+                if rid in self._rid_cut:
+                    self._rid_cut.discard(rid)
+                    cancelled.append((rid, self._prompt_len(line)))
+                    continue
+                self._assign(slot, line, rid, self._cut, self._wrap)
+                break
+        for rid, n in cancelled:
+            self._emit(f"DONE 0 {n} 0.0 0.0 cancel 0 0 0 0 0", rid)
+
+    def _new_stream(self):
+        """This worker's own NPU stream (opt-in), or None: CPU tests, the default path, `--parallel` without
+        `--parallel-streams`."""
+        if not self._parallel_streams or self.parallel <= 1 or \
+                not str(getattr(self.rt, "device", "cpu")).startswith("npu"):
+            return None
+        if not hasattr(torch, "npu"):
+            return None
+        try:
+            return torch.npu.Stream()
+        except Exception:                                 # noqa: BLE001 - streams are an optimisation
+            _log("dsv41 parallel: could not create a per-conversation NPU stream; using the default one")
+            return None
+
     # -- one request ---------------------------------------------------------------------------
-    def generate(self, line: str) -> None:
+    def generate(self, line: str, conv=None, rid: int | None = None,
+                 cut0: int = 0, wrap0: int = 0) -> None:
+        conv = self if conv is None else conv
         fields = line.split()
         max_new = int(fields[1])
         keys = {}
@@ -314,9 +706,10 @@ class Engine:
             if "=" in f:
                 k, v = f.split("=", 1)
                 keys[k] = v
+        keys.pop("rid", None)
         ids = [int(x) for x in fields[-1].split(",") if x]
         if not ids:
-            _out("ERR the request carries no tokens")
+            self._emit("ERR the request carries no tokens", rid)
             return
         prompt_tokens = len(ids)
         temperature = float(keys.get("temperature", 0.0) or 0.0)
@@ -331,27 +724,27 @@ class Engine:
 
         # how much of this prompt the held conversation already covers
         reused = 0
-        for a, b in zip(ids, self.held):
+        for a, b in zip(ids, conv.held):
             if a != b:
                 break
             reused += 1
-        fresh = reused < len(self.held) or self.state is None
+        fresh = reused < len(conv.held) or conv.state is None
         if fresh:
             # the prompt diverged from what the state holds: start the conversation over.  The graphs
             # of the finished conversation bake its State's buffers and are of no use to the new one,
             # so they are released *before* a new State (and its KV) is built.
             reused = 0
-            self._drop_conversation("the prompt diverged from the held conversation")
-            self.state = self.rt.state(self.args.max_context)
-            self.held = []
+            self._drop_conversation("the prompt diverged from the held conversation", conv)
+            conv.state = self.rt.state(self.args.max_context)
+            conv.held = []
         to_read = ids[reused:]
 
         t_prompt = time.perf_counter()
         if reused == len(ids):
             # the state already covers the whole prompt, but decoding needs the *last* token's logits:
             # step back one and read it again
-            self.state.rewind(1)
-            self.held.pop()
+            conv.state.rewind(1)
+            conv.held.pop()
             to_read = [ids[-1]]
         logits = None
         if to_read:
@@ -367,27 +760,28 @@ class Engine:
                 piece = to_read[done:done + size]
                 done += len(piece)
                 last = done >= len(to_read)
-                got = self.rt.model.forward(piece, self.state, logits_last_only=True, compute_logits=last)
+                got = self.rt.model.forward(piece, conv.state, logits_last_only=True, compute_logits=last)
                 if last:
                     logits = got
                 ms = (time.perf_counter() - t_prompt) * 1e3
-                _out(f"PP {reused + done} {prompt_tokens} {ms:.1f} {done / max(ms / 1e3, 1e-9):.1f}")
-                control = self.controls_held()
+                self._emit(f"PP {reused + done} {prompt_tokens} {ms:.1f} "
+                           f"{done / max(ms / 1e3, 1e-9):.1f} {reused}", rid)
+                control = self._control_for(rid, cut0, wrap0)
                 if control == "QUIT":
                     self.quit = True
                     return
                 if control in ("STOP", "PAUSE", "PAUSE keep"):
-                    _out(f"DONE 0 {prompt_tokens} {ms:.1f} 0.0 cancel 0 0 {reused} 0 0")
+                    self._emit(f"DONE 0 {prompt_tokens} {ms:.1f} 0.0 cancel 0 0 {reused} 0 0", rid)
                     # The state is part-way through the prompt and `held` was never updated, so this
                     # conversation cannot be continued: it is abandoned, and its graphs (if it had
                     # any from an earlier turn) go with it.
                     _log("dsv41: the request was abandoned during its prompt - dropping the "
                          "conversation's state" + (" and its graphs" if self._graphs_held else ""))
-                    self._drop_conversation("the request was abandoned during its prompt")
+                    self._drop_conversation("the request was abandoned during its prompt", conv)
                     return
         prompt_ms = (time.perf_counter() - t_prompt) * 1e3
-        self.held = list(ids)
-        if max_new > 0:
+        conv.held = list(ids)
+        if max_new > 0 and conv is self:
             # Count the conversations that hold captured graphs.  The capture itself is lazy (the first
             # one-token step below); this is the bound's accounting and the report of what it will cost.
             self._plan_graphs()
@@ -398,7 +792,7 @@ class Engine:
         t0 = time.perf_counter()
         in_think = think_budget > 0 and think_end >= 0
         while len(produced) < max_new:
-            control = self.controls_held()
+            control = self._control_for(rid, cut0, wrap0)
             if control == "QUIT":
                 self.quit = True
                 finish = "cancel"
@@ -413,23 +807,25 @@ class Engine:
                 tok = self.sample(logits, temperature, top_p, top_k, gen)
                 if in_think and tok == think_end:
                     in_think = False
-            _out(f"T {tok}")
+            self._emit(f"T {tok}", rid)
             produced.append(tok)
-            self.held.append(tok)
+            conv.held.append(tok)
             if tok == self.eos_id():
                 finish = "stop"
                 break
-            logits = self.rt.model.forward([tok], self.state, logits_last_only=True)
+            logits = self.rt.model.forward([tok], conv.state, logits_last_only=True)
             n = len(produced)
             if n % 8 == 0:
-                _out(self.stat_line(t0, n))
+                self.emit(self.stat_line(t0, n))
         decode_ms = (time.perf_counter() - t0) * 1e3
-        self._report_graph_capture()
-        self.stats["tokens"] += len(produced)
-        self.stats["steps"] += 1
-        self.stats["decode_ms"] += decode_ms
-        _out(f"DONE {len(produced)} {prompt_tokens} {prompt_ms:.1f} {decode_ms:.1f} {finish} 0 0 {reused} "
-             f"{len(produced)} {len(produced)}")
+        if conv is self:
+            self._report_graph_capture()
+        with self._sched:
+            self.stats["tokens"] += len(produced)
+            self.stats["steps"] += 1
+            self.stats["decode_ms"] += decode_ms
+        self._emit(f"DONE {len(produced)} {prompt_tokens} {prompt_ms:.1f} {decode_ms:.1f} {finish} 0 0 "
+                   f"{reused} {len(produced)} {len(produced)}", rid)
         _log(f"dsv41 stat: decode {decode_ms / max(1, len(produced)):.2f} ms/tok "
              f"({1000.0 * len(produced) / max(decode_ms, 1e-3):.2f} tok/s) | reused {reused}/{prompt_tokens} | "
              f"finish {finish}")
@@ -475,6 +871,8 @@ class Engine:
 
     # -- the loop ------------------------------------------------------------------------------
     def run(self) -> int:
+        if self.parallel > 1:
+            return self._run_multi()
         self.say_ready()
         threading.Thread(target=self._reader, daemon=True).start()
         while not self.quit:
@@ -496,11 +894,37 @@ class Engine:
                         return 0
                 self.generate(line)
             elif line.startswith("GENI "):
-                _out("ERR this engine serves text only: no images")
+                self._emit("ERR this engine serves text only: no images")
             elif line in ("VLEND", "VRECLAIM"):
-                _out(f"ERR {line} text-only model: no vision encoder to lend memory to")
+                self._emit(f"ERR {line} text-only model: no vision encoder to lend memory to")
             else:
-                _out(f"ERR unsupported command '{line.split()[0]}'")
+                self._emit(f"ERR unsupported command '{line.split()[0]}'")
+        self.shutdown()
+        return 0
+
+    def _run_multi(self) -> int:
+        """The `--parallel` loop: admit GEN lines onto conversation slots, apply controls, never block a
+        request on another's device sync."""
+        self.say_ready()
+        self.start_workers()
+        threading.Thread(target=self._reader, daemon=True).start()
+        while not self.quit:
+            while True:                           # controls first: STOP/PAUSE/WRAP/QUIT are not queued behind GENs
+                held = self.controls_held()
+                if held is None:
+                    break
+                self._apply_control(held)
+            try:
+                line = self.input.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if line is None:
+                break
+            if line == "QUIT":
+                self.quit = True
+                break
+            self._dispatch(line)
+        self.stop_workers()
         self.shutdown()
         return 0
 
@@ -510,10 +934,16 @@ class Engine:
         `rt.close()` tears the graphs down first and `Dsv41.release_graphs` raises after dropping the
         domain if the destroy failed.  A leak is a real loss of HBM, but it must not turn a clean
         shutdown into a failed one: the log names it and the process exits, which is when the leaked
-        models finally go.
+        models finally go.  Idempotent: a benchmark may stop the workers and then close the engine.
         """
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self.rt, "close", None)
+        if close is None:                     # a test double: nothing to close
+            return
         try:
-            self.rt.close()
+            close()
         except GraphTeardownError as exc:
             _log(f"dsv41 graphs: teardown at shutdown failed ({exc}); the leaked graph models end with "
                  f"this process")
@@ -548,6 +978,20 @@ def build_parser() -> argparse.ArgumentParser:
                          "read batch: a prefill reads ~318 experts a layer, so this is how many large "
                          "preads each fetch issues (see docs/ASCEND-DSV41.md §15 for the measured effect)")
     ap.add_argument("--max-context", type=int, default=8192)
+    ap.add_argument("--parallel-streams", action="store_true",
+                    help="run each --parallel conversation on its own NPU stream.  Off by default: measured "
+                         "on one 910B3, four streams were ~10-15%% slower than the device's default stream "
+                         "at the same tier (the shared staging ring's per-slot events then couple the "
+                         "streams).  Host dispatch still overlaps across the request threads either way")
+    ap.add_argument("--parallel", type=int, default=1, metavar="N",
+                    help="conversations served at once (default 1, the pre-existing behaviour).  With N > 1 "
+                         "READY says multi=N, serve/server.py gives its FIFO N places and tags every request "
+                         "with rid=<id>; each conversation gets its own State (and, with --parallel-streams, "
+                         "its own NPU stream).  This is NOT batching: forward takes one State (KvPlanes "
+                         "refuses batch > 1), so the gain is host dispatch overlap across the request "
+                         "threads.  Runs eagerly - a captured decode is one State - "
+                         "so --graphs needs --parallel 1.  Size --expert-reserve-gib for N concurrent "
+                         "activations; a request past N waits in the engine's queue")
     ap.add_argument("--prompt-chunk", "--prefill-chunk", dest="prefill_chunk", type=int, default=512,
                     metavar="N",
                     help="the most tokens one prompt forward reads (default 512; 0 = the whole prompt).  "

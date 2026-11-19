@@ -43,7 +43,7 @@ def engine_args(model_dir: Path, **overrides) -> argparse.Namespace:
         model=str(model_dir), tokenizer="", device="cpu", dtype="float32", hbm_share=0.5,
         expert_slots=None, io_threads=1, expert_batch=8, expert_reserve_gib=6.0, expert_devices="",
         engram_tokenizer="", verbose=False, max_context=64, prefill_chunk=512, serve=True,
-        graphs=True, graph_verify=False, graph_max_conversations=1)
+        graphs=True, graph_verify=False, graph_max_conversations=1, parallel=1)
     for key, value in overrides.items():
         setattr(args, key, value)
     return args
@@ -528,6 +528,302 @@ class TheStreamingFlags(unittest.TestCase):
                 self.assertEqual(run.model.expert_batch, 5, "the MoE batches at the ring's size")
             finally:
                 run.close()
+
+
+@NEEDS_TORCH
+class TheParallelArguments(unittest.TestCase):
+    """`--parallel N` is opt-in, advertises multi=N, and its one conflict (graphs) is stated, not silent."""
+
+    @staticmethod
+    def parser():
+        from ascend import serve_engine
+        return serve_engine.build_parser()
+
+    def test_one_conversation_is_the_default_and_ready_does_not_say_multi(self):
+        args = self.parser().parse_args(["--serve", "--model", "/tmp/model"])
+        self.assertEqual(args.parallel, 1, "the pre-existing, single-conversation behaviour")
+        with TinyModel() as model:
+            from ascend import serve_engine
+            engine = serve_engine.Engine(engine_args(model.root, graphs=False))
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    engine.say_ready()
+            finally:
+                engine.shutdown()
+        ready = [l for l in out.getvalue().splitlines() if l.startswith("READY")]
+        self.assertEqual(ready, ["READY 64 stop pause"], "a single-conversation engine must not say multi=")
+        self.assertNotIn("multi=", err.getvalue())
+
+    def test_multi_is_the_number_the_scheduler_holds_and_the_conflict_is_logged(self):
+        from ascend import serve_engine
+        from types import SimpleNamespace
+
+        seen: dict = {}
+        real = serve_engine.rt.build
+
+        def fake(**kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(cfg=SimpleNamespace(num_hidden_layers=4))
+
+        try:
+            serve_engine.rt.build = fake
+            engine = serve_engine.Engine(engine_args(Path("/tmp/not-loaded"), parallel=4, graphs=True))
+        finally:
+            serve_engine.rt.build = real
+        try:
+            self.assertIs(seen["graphs"], False,
+                          "graphs must not reserve a landing zone the multi path cannot use")
+            self.assertTrue(engine._graphs_conflict)
+        finally:
+            engine.shutdown()
+
+        with TinyModel() as model:
+            engine = serve_engine.Engine(engine_args(model.root, parallel=4, graphs=True))
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    engine.say_ready()
+            finally:
+                engine.shutdown()
+        self.assertIn("READY 64 stop pause multi=4", out.getvalue())
+        self.assertIn("graphs: OFF - --graphs was asked for with --parallel 4", err.getvalue(),
+                      "the conflict is stated, not silently resolved")
+        self.assertIn("4 conversations at once", err.getvalue())
+
+    def test_parallel_parses(self):
+        args = self.parser().parse_args(["--serve", "--model", "/tmp/model", "--parallel", "8"])
+        self.assertEqual(args.parallel, 8)
+
+    def test_per_conversation_streams_are_opt_in(self):
+        """Measured slower than the default stream on one 910B3, so the flag defaults off."""
+        base = self.parser().parse_args(["--serve", "--model", "/tmp/model", "--parallel", "4"])
+        self.assertFalse(base.parallel_streams)
+        on = self.parser().parse_args(["--serve", "--model", "/tmp/model", "--parallel", "4",
+                                       "--parallel-streams"])
+        self.assertTrue(on.parallel_streams)
+        with TinyModel() as model:
+            from ascend import serve_engine
+            engine = serve_engine.Engine(engine_args(model.root, parallel=4, graphs=False,
+                                                     parallel_streams=False))
+            try:
+                self.assertFalse(engine._parallel_streams)
+                self.assertIsNone(engine._new_stream())
+            finally:
+                engine.shutdown()
+            engine = serve_engine.Engine(engine_args(model.root, parallel=4, graphs=False,
+                                                     parallel_streams=True))
+            try:
+                self.assertTrue(engine._parallel_streams)
+                self.assertIsNone(engine._new_stream(), "a CPU test has no NPU stream to make")
+            finally:
+                engine.shutdown()
+
+
+@NEEDS_TORCH
+class TheParallelScheduler(unittest.TestCase):
+    """`--parallel` serving: N requests in flight, tagged lines, per-request control, and isolation."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = TinyModel()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model.close()
+
+    def engine(self, **overrides):
+        from ascend import serve_engine
+        base = {"parallel": 4, "graphs": False}
+        base.update(overrides)
+        return serve_engine.Engine(engine_args(self.model.root, **base))
+
+    @staticmethod
+    def collector(engine):
+        """Record the engine's protocol lines; (`engine.emit` is the seam the bench uses too)."""
+        lines: list[str] = []
+        engine.emit = lines.append
+        return lines
+
+    @staticmethod
+    def wait_done(lines, n: int, timeout: float = 60.0) -> list[str]:
+        end = time.time() + timeout
+        while time.time() < end:
+            dones = [l for l in lines if l.startswith("DONE ")]
+            if len(dones) >= n:
+                return dones
+            time.sleep(0.01)
+        raise AssertionError(f"{n} DONE line(s) did not arrive; saw {lines[-12:]}")
+
+    @staticmethod
+    def tokens(lines, rid: int) -> list[int]:
+        return [int(l.split()[2]) for l in lines if l.startswith(f"T {rid} ")]
+
+    def test_four_requests_are_served_at_once_and_each_rides_its_own_tag(self):
+        engine = self.engine()
+        try:
+            engine.say_ready()
+            lines = self.collector(engine)
+            engine.start_workers()
+            prompts = [[3, 5, 7], [11, 13, 17], [19, 23, 29], [31, 2, 4]]
+            for rid, ids in enumerate(prompts, 1):
+                self.assertTrue(engine.submit(f"GEN 3 rid={rid} " + ",".join(str(i) for i in ids)))
+            dones = self.wait_done(lines, 4)
+            self.assertTrue(engine.wait_idle(timeout=10))
+        finally:
+            engine.stop_workers()
+            engine.shutdown()
+        self.assertEqual(len({int(d.split()[1]) for d in dones}), 4, f"one DONE per request: {dones}")
+        for rid in range(1, 5):
+            self.assertEqual(len(self.tokens(lines, rid)), 3, f"request {rid}'s three tokens are tagged with it")
+        # every T line carries a request id, and only the four requests' ids
+        tagged = {int(l.split()[1]) for l in lines if l.startswith("T ")}
+        self.assertEqual(tagged, {1, 2, 3, 4})
+
+    def test_a_request_past_parallel_waits_in_the_engine_queue(self):
+        engine = self.engine(parallel=2)
+        try:
+            engine.say_ready()
+            lines = self.collector(engine)
+            # slow every step just enough that three requests cannot all be in flight at the slot count
+            engine.start_workers()
+            for rid in (1, 2, 3):
+                engine.submit(f"GEN 2 rid={rid} " + ",".join(str(i) for i in (3, 5, 7 + rid)))
+            dones = self.wait_done(lines, 3)
+            self.assertTrue(engine.wait_idle(timeout=10))
+        finally:
+            engine.stop_workers()
+            engine.shutdown()
+        self.assertEqual(len(dones), 3)
+        self.assertEqual(engine._queued_seen, 1, "the third request waited; the queue is what admitted it")
+
+    def test_continuation_reuses_the_prefix_on_a_slot(self):
+        engine = self.engine()
+        try:
+            engine.say_ready()
+            lines = self.collector(engine)
+            engine.start_workers()
+            engine.submit("GEN 2 rid=1 3,5,7")
+            first = self.wait_done(lines, 1)[0].split()
+            produced = self.tokens(lines, 1)
+            longer = [3, 5, 7] + produced + [11]
+            engine.submit("GEN 1 rid=2 " + ",".join(str(i) for i in longer))
+            second = self.wait_done(lines, 2)[1].split()
+            self.assertTrue(engine.wait_idle(timeout=10))
+        finally:
+            engine.stop_workers()
+            engine.shutdown()
+        # DONE <rid> n prompt prompt_ms decode_ms finish da do reused hits lookups
+        self.assertEqual(int(first[1]), 1)
+        self.assertEqual(int(second[9]), len(longer) - 1, "the next turn's whole prefix was held")
+
+    def test_stop_rid_cuts_only_that_request(self):
+        engine = self.engine()
+        try:
+            engine.say_ready()
+            lines = self.collector(engine)
+            real_sample = engine.sample
+
+            def slow_sample(*a, **kw):
+                time.sleep(0.05)                     # ~2 s for 40 tokens: room to cut one and not the other
+                return real_sample(*a, **kw)
+
+            engine.sample = slow_sample
+            engine.start_workers()
+            engine.submit("GEN 40 rid=1 3,5,7")
+            engine.submit("GEN 40 rid=2 11,13,17")
+            end = time.time() + 20
+            while len([l for l in lines if l.startswith("T ")]) < 2 and time.time() < end:
+                time.sleep(0.01)
+            engine.submit("STOP 1")
+            dones = self.wait_done(lines, 1, timeout=20)
+            cut_at = len(self.tokens(lines, 2))
+            engine.submit("STOP 2")
+            dones = self.wait_done(lines, 2, timeout=20)
+        finally:
+            engine.stop_workers()
+            engine.shutdown()
+        by_rid = {int(d.split()[1]): d.split() for d in dones}
+        self.assertEqual(by_rid[1][6], "cancel")
+        self.assertLess(int(by_rid[1][2]), 32, "request 1 was cut")
+        self.assertGreater(len(self.tokens(lines, 2)), cut_at, "request 2 kept generating after request 1 was cut")
+        self.assertEqual(by_rid[2][6], "cancel")
+
+    def test_the_same_requests_produce_the_same_tokens_alone_and_concurrently(self):
+        """The isolation bar: four distinct prompts, greedy, same ids with and without the other three."""
+        prompts = [[3, 5, 7, 11, 13], [17, 19, 23, 29, 31], [2, 4, 6, 8, 10], [1, 3, 9, 27, 12]]
+        engine = self.engine()
+        try:
+            engine.say_ready()
+            alone = []
+            for ids in prompts:                       # one at a time, the pre-change serve path
+                out, _ = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    engine.generate("GEN 6 " + ",".join(str(i) for i in ids))
+                alone.append([int(l.split()[1]) for l in out.getvalue().splitlines()
+                              if l.startswith("T ")])
+            lines = self.collector(engine)
+            engine.start_workers()
+            for rid, ids in enumerate(prompts, 1):
+                engine.submit(f"GEN 6 rid={rid} " + ",".join(str(i) for i in ids))
+            self.wait_done(lines, 4)
+            self.assertTrue(engine.wait_idle(timeout=30))
+            concurrent = [self.tokens(lines, rid) for rid in range(1, 5)]
+        finally:
+            engine.stop_workers()
+            engine.shutdown()
+        self.assertEqual(concurrent, alone, "a concurrent conversation must not change another's tokens")
+        self.assertEqual(len({tuple(s) for s in concurrent}), 4, "the four prompts are actually distinct")
+
+    def test_an_untagged_gen_is_refused_rather_than_guessed(self):
+        engine = self.engine()
+        try:
+            engine.say_ready()
+            lines = self.collector(engine)
+            engine.start_workers()
+            engine.submit("GEN 1 3,5,7")               # no rid=: a legacy line cannot be routed
+            end = time.time() + 5
+            while not any(l.startswith("ERR ") for l in lines) and time.time() < end:
+                time.sleep(0.01)
+        finally:
+            engine.stop_workers()
+            engine.shutdown()
+        self.assertTrue(any("needs rid=" in l for l in lines), lines)
+
+    def test_the_expert_streamer_is_only_locked_while_the_scheduler_runs(self):
+        """The shared pinned ring needs one fetch at a time under --parallel; the default path is untouched."""
+        engine = self.engine(parallel=1, graphs=False)
+        try:
+            self.assertFalse(getattr(engine.rt.experts.fetch_int8, "_serve_locked", False),
+                             "--parallel 1 must not add a lock to the streaming path")
+        finally:
+            engine.shutdown()
+        engine = self.engine()
+        try:
+            self.assertTrue(getattr(engine.rt.experts.fetch_int8, "_serve_locked", False))
+            self.assertFalse(engine._multi_running)
+        finally:
+            engine.shutdown()
+
+
+@NEEDS_TORCH
+class ParallelOverTheProtocol(unittest.TestCase):
+    """The real executable: READY multi=N, a rid-tagged GEN, tagged T/DONE, and a clean QUIT."""
+
+    def test_a_parallel_engine_tags_its_lines_and_quits(self):
+        with TinyModel() as model:
+            engine = Engine(model.root, "--parallel", "2", "--graphs")
+            ready = engine.read_until("READY")[-1]
+            self.assertIn("multi=2", ready.split())
+            end = time.time() + 20
+            while not any("graphs: OFF" in l for l in engine.log) and time.time() < end:
+                time.sleep(0.02)
+            self.assertIn("graphs: OFF", "\n".join(engine.log), "graphs/parallel conflict is stated")
+            engine.send("GEN 2 rid=7 3,5,7")
+            lines = engine.read_until("DONE ")
+            self.assertTrue([l for l in lines if l.startswith("T 7 ")], lines)
+            self.assertTrue([l for l in lines if l.startswith("DONE 7 ")], lines)
+            self.assertEqual(engine.stop(), 0)
 
 
 if __name__ == "__main__":
