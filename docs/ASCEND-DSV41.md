@@ -805,3 +805,36 @@ calls once for four tokens, which removes exactly that shared cost; the device (
 * The engine's `--parallel N` stays the right behaviour either way - it makes the serve path accept N
   requests instead of queueing them at a FIFO with one place, and it is the scheduler the batched forward
   would plug into.
+
+## 17. Batching the decode across conversations was tried, and it does not pay
+
+§16 designed a batch axis so N conversations could share one `forward`, on the theory that the ~32 242
+Python calls a step are what limits concurrency (measured: `--parallel 4` gives 2.10x on short prompts but
+only because per-request rate halves, 0.67 -> 0.33 tok/s). The design was implemented - per-row planes and
+cursors in `KvPlanes`, a batched decode `forward`, a `6N`-expert union fetched once with each row's experts
+accumulated in the single-token path's top-k order so its arithmetic stays bit-identical.
+
+**It is slower, and it is not exact.** Four distinct prompts, four cards, same tier:
+
+| arm | wall | TTFT | aggregate tok/s | per-request |
+|---|---:|---:|---:|---:|
+| serial serve path | 111.3 s | 5.2 s | 0.59 | 0.67-0.77 |
+| `--parallel 4`, interleaved | 52.2 s | 10.7 s | **1.52** | 0.38-0.40 |
+| batched decode | 57.1 s | 11.1 s | **1.36** | 0.36-0.37 |
+
+Batched is **0.89x** the interleaved aggregate. The reason is the same wall as everywhere else in this
+engine: the step is expert-stream bound (0.774 GB/step read at a 77.3% hit rate), and interleaving four
+conversations lets one thread's expert fetch overlap another's arithmetic, while batching serialises the
+`6N`-expert fetch into one bigger stall. The host dispatch that batching removes was not the binding term.
+
+And mixed positions do not reproduce: a group whose rows sit at **different** positions - one conversation
+joining one token behind - changes tokens (row 0 step 2: 27190 batched against 1281 alone), while a group
+that starts together is bit-identical. One real bug did fall out and was fixed on the way (the batched
+compressor pooled with `softmax(-1)` over the channels instead of `softmax(1)` over the group), but the first
+remaining difference is an internal consumer-layer attention output with identical KV reads and is not
+resolved.
+
+So the ~1 300 lines were reverted rather than kept behind a flag: a feature that is slower than what it
+replaces and wrong in the case that matters is not something to leave switched off in the tree. What is kept
+is the measurement, this note, and one small fix: `test_env` read a multi-index `ASCEND_RT_VISIBLE_DEVICES`
+as logical ids, which broke the suite whenever the cards were taken in a non-contiguous set.

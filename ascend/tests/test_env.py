@@ -25,7 +25,18 @@ except Exception:                                       # noqa: BLE001 - any imp
     torch = None
     HAS_NPU = False
 
-DEVICES = [int(x) for x in os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3").split(",") if x.strip()]
+def visible_devices(value: str) -> list[int]:
+    """The **logical** ids a visible-card list maps to.
+
+    ``ASCEND_RT_VISIBLE_DEVICES=1,2,3`` names three physical cards, but torch_npu renumbers the visible
+    set from 0: the process sees cards 0, 1 and 2, and ``set_device(3)`` fails.  Every test in this file
+    wants the logical id, and the count is what the environment promises.
+    """
+    named = [x for x in value.split(",") if x.strip()]
+    return list(range(len(named))) if named else [0]
+
+
+DEVICES = visible_devices(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3"))
 
 # Each process keeps to this share of one card: the card is shared, 32 GB of its 64 GB is ours.
 HBM_SHARE = float(os.environ.get("MAYA_ASCEND_HBM_SHARE", "0.5"))
@@ -48,6 +59,13 @@ def hbm_gb(device=None):
 
 @npu_only()
 class DeviceVisibility(unittest.TestCase):
+    def test_the_environment_names_are_read_as_logical_ids(self):
+        """A multi-index ASCEND_RT_VISIBLE_DEVICES is not a list of device ids: torch_npu renumbers it."""
+        self.assertEqual(visible_devices("1,2,3"), [0, 1, 2])
+        self.assertEqual(visible_devices("3"), [0])
+        self.assertEqual(visible_devices("0,1,2,3"), [0, 1, 2, 3])
+        self.assertEqual(visible_devices(""), [0])
+
     def test_every_card_the_environment_names_is_there(self):
         self.assertGreaterEqual(torch.npu.device_count(), len(DEVICES),
                                 f"ASCEND_RT_VISIBLE_DEVICES={DEVICES} but torch.npu sees "
