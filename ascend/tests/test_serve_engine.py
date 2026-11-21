@@ -921,6 +921,44 @@ class ThePrefixReuse(unittest.TestCase):
         self.assertEqual(int(self.done(out)[8]), 0, "the flag restores the re-prefill-everything path")
         self.assertNotIn("dsv41 prefix:", err)
 
+    def test_safe_mode_reuses_only_the_chunk_aligned_prefix(self):
+        """`--prefix-reuse=safe` stops on the chunk grid, not at the whole common prefix.
+
+        The conversation's first 16 tokens are four full 4-token prompt chunks; the held state also has
+        four decode-written rows.  A prompt that shares 18 tokens may resume at 16 (the last aligned chunk
+        boundary) but not at 18: the from-scratch path writes tokens 16..19 in one 4-token forward, so a
+        suffix starting at 18 would compute rows 18..19 with a different shape.
+        """
+        engine = self.engine(prefill_chunk=4, prefix_reuse="safe")
+        longer = self.A[:18] + [9, 9]
+        try:
+            quiet_generate(engine, "GEN 4 " + ",".join(str(t) for t in self.A))
+            out, err = quiet_generate(engine, "GEN 6 " + ",".join(str(t) for t in longer))
+        finally:
+            engine.shutdown()
+        self.assertEqual(int(self.done(out)[8]), 16,
+                         "safe reuse must stop at the last full aligned 4-token chunk")
+        self.assertIn("not on the 4-token chunk grid", err)
+        scratch = self.engine(prefill_chunk=4, prefix_reuse=False)
+        try:
+            out_scratch, _ = quiet_generate(scratch, "GEN 6 " + ",".join(str(t) for t in longer))
+        finally:
+            scratch.shutdown()
+        self.assertEqual(self.tokens(out), self.tokens(out_scratch),
+                         "the aligned reuse must equal a from-scratch prefill, token for token")
+
+    def test_safe_mode_is_a_no_op_when_the_chunk_exceeds_the_prompt(self):
+        """No chunk grid to align to: safe mode must not reuse, so it cannot be inexact either."""
+        engine = self.engine(prefill_chunk=512, prefix_reuse="safe")
+        try:
+            quiet_generate(engine, "GEN 4 " + ",".join(str(t) for t in self.A))
+            out, err = quiet_generate(engine, "GEN 6 " + ",".join(str(t) for t in self.B))
+        finally:
+            engine.shutdown()
+        self.assertEqual(int(self.done(out)[8]), 0,
+                         "a 20-token prompt on a 512-token grid has no aligned chunk to reuse")
+        self.assertIn("safe reuse stops at 0", err)
+
     def test_the_eos_is_not_claimed_by_the_state_it_never_entered(self):
         """The emitted eos is not fed (the loop breaks first), so it must not be in `held`.
 

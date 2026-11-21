@@ -57,6 +57,24 @@ because a query sees only *completed* groups).  `DONE ... reused` reports the sh
 server's context bar and prefill rate see the hit.  `--no-prefix-reuse` restores the pre-change
 "diverged prompt re-reads from token 0" path, for A/B measurement.
 
+**Is a reused prefix token-exact?**  Not on this checkpoint in general: bf16 accumulation is
+shape-dependent, so a row written by a forward of one shape is not bit-identical to the same row written
+by a forward of another shape (a 2 000-token prompt read whole and read in pieces already produce
+different greedy streams).  A real conversation's held rows are written by a mix of prompt forwards of
+whatever size each turn needed and one-token decode steps; a from-scratch prefill of the next turn's whole
+prompt writes them again with *its* chunk plan.  `--prefix-reuse=always` (the long-standing default) reuses
+whatever prefix matches and is therefore not token-exact in that case.
+
+`--prefix-reuse=safe` reuses only the part of the shared prefix that a from-scratch prefill under the same
+`--prompt-chunk` would have written with the *same forward shapes at the same offsets*: the conversation
+tracks a ``clean`` boundary, extended only through full, offset-aligned prompt chunks (the engine's chunk
+unit is ``--prompt-chunk``, or ``--max-context`` when the flag is 0), and a request never reuses past the
+first row that was written by a partial chunk or by a decode step.  The suffix is then read on exactly the
+same chunk grid as the from-scratch path (a multiple-of-chunk boundary has the same ``prompt_chunks``
+tail), so every forward, its position and its context are identical on both paths.  With the chunk unit
+larger than the prompt, safe reuse is a no-op - which is the honest answer: there is no grid to align to.
+`--prefix-reuse=off` is the pre-change path.
+
 What this does **not** do is batch: `Dsv41.forward` takes one `State` and one token list, and `KvPlanes`
 refuses `batch != 1`, so N conversations cannot share a forward.  Each conversation therefore still pays
 its own 32 242 operator calls per token; the overlap is host dispatch across the request threads (and, only
@@ -125,6 +143,10 @@ class Conversation:
         self.name = name
         self.state = None
         self.held: list[int] = []
+        # The longest prefix of `held` whose rows were written by *full, offset-aligned prompt chunks* -
+        # the rows a from-scratch prefill of a longer prompt would recompute with the same shape.  Only
+        # `--prefix-reuse=safe` reads it: a decode row, or a partial final chunk, ends it.
+        self.clean = 0
         self.busy = False
         self.rid: int | None = None
         self.queue: "queue.Queue" = queue.Queue()
@@ -169,6 +191,21 @@ def prompt_chunks(n_tokens: int, chunk: int, max_context: int) -> list[int]:
     return [min(size, n - done) for done in range(0, n, size)]
 
 
+def chunk_unit(chunk: int, max_context: int) -> int:
+    """The forward size a *long* prompt is read in: the grid `--prefix-reuse=safe` aligns to.
+
+    ``prompt_chunks`` uses the whole prompt when ``chunk <= 0``, so for that setting the only forward
+    size two different prompt lengths can share is ``max_context`` (the clamp).  With a positive chunk the
+    unit is that chunk, clamped to the context the same way ``prompt_chunks`` clamps it.
+    """
+    size = int(chunk)
+    if size <= 0:
+        size = int(max_context) if int(max_context) > 0 else 1
+    if int(max_context) > 0:
+        size = min(size, int(max_context))
+    return max(1, size)
+
+
 class Engine:
     """One conversation, held across requests: the state a reply left is where the next prompt starts."""
 
@@ -183,7 +220,17 @@ class Engine:
         # burst pays one released domain plus one eager step - stated in the log, never silent.
         self._graphs_wanted = bool(getattr(args, "graphs", False))
         self._graphs_conflict = False            # kept as an attribute for older tests: no static conflict now
-        self._prefix_reuse = bool(getattr(args, "prefix_reuse", True))
+        # `--prefix-reuse` is a plain boolean for old callers (`False` means off), but it also accepts the
+        # names always/safe/off.  `safe` is the shape-exact mode described in the module docstring.
+        raw = getattr(args, "prefix_reuse", True)
+        if isinstance(raw, str):
+            self._prefix_mode = raw if raw in ("always", "safe", "off") else "always"
+        else:
+            self._prefix_mode = "always" if raw else "off"
+        chosen = getattr(args, "prefix_reuse_mode", None)
+        if chosen in ("always", "safe", "off"):
+            self._prefix_mode = chosen
+        self._prefix_reuse = self._prefix_mode != "off"
         t0 = time.time()
         self.rt = rt.build(model=args.model, device=args.device, dtype=args.dtype,
                            hbm_share=args.hbm_share, expert_slots=args.expert_slots,
@@ -198,6 +245,7 @@ class Engine:
         self.load_s = time.time() - t0
         self.state = None
         self.held: list[int] = []                 # the tokens the state covers
+        self.clean = 0                            # `held` prefix written by full, aligned prompt chunks
         self.control: queue.Queue[str] = queue.Queue()
         self.input: queue.Queue[str | None] = queue.Queue()
         self.quit = False
@@ -296,8 +344,12 @@ class Engine:
                  f"{self.kv_gib(ctx):.3f} GiB at {ctx} context, so size --expert-reserve-gib for N "
                  f"concurrent activations")
         if self._prefix_reuse:
-            _log("dsv41 prefix: a request that shares a prefix with the conversation it lands on starts "
-                 "from that KV (rewind, not a re-prefill); the shared tokens are never read twice")
+            _log(f"dsv41 prefix: reuse mode {self._prefix_mode}: a request that shares a prefix with the "
+                 f"conversation it lands on starts from that KV (rewind, not a re-prefill); the shared "
+                 f"tokens are never read twice"
+                 + ("; safe mode reuses only rows a from-scratch prefill would rewrite with the same "
+                    f"forward shapes, on the {chunk_unit(self.args.prefill_chunk, self.args.max_context)}"
+                    f"-token chunk grid" if self._prefix_mode == "safe" else ""))
         _out(f"INFO context={ctx} kv=bf16 kv_resident=0 expert_slots={slots} "
              f"expert_cache_mib={slots * per_expert // (1 << 20)} engine_kind=dsv41-ascend "
              f"experts={experts_total} vram_slots={slots} vram_gb={resident + slots * per_expert / rt.GIB:.2f} "
@@ -514,6 +566,68 @@ class Engine:
             self._release_graphs(reason)
         conv.state = None
         conv.held = []
+        conv.clean = 0
+
+    # -- safe prefix reuse: only rows a from-scratch prefill would rewrite identically --------------------
+    def _safe_prefix(self, conv, ids: list[int], shared: int) -> int:
+        """How much of a shared prefix `--prefix-reuse=safe` may reuse, and say why it stops.
+
+        The reused rows must have been written by full, offset-aligned prompt chunks: then the
+        from-scratch path of the same prompt (same ``--prompt-chunk``, same ``--max-context``) computes
+        those positions in forwards of exactly the same size, at exactly the same offsets, with the same
+        context - and reading the suffix from that boundary is the same ``prompt_chunks`` tail the
+        from-scratch path would run.  A decode-written row (shape 1) or a partial chunk (shape ``r``) ends
+        the reusable prefix, because the from-scratch path would rewrite it as part of a full chunk.
+
+        The last block is never reused whole: decoding needs the last token's logits, which the engine
+        obtains by rewinding one token and reading it as a one-token forward.  Reusing the whole prompt
+        would therefore replace the final full-chunk row with a shape-1 row, so one full chunk is read
+        again instead (the from-scratch path's own last chunk, exact).
+        """
+        unit = chunk_unit(self.args.prefill_chunk, self.args.max_context)
+        limit = min(int(shared), max(0, int(getattr(conv, "clean", 0))))
+        aligned = limit - (limit % unit)
+        if aligned < limit:
+            _log(f"dsv41 prefix: safe reuse stops at {limit} of {shared} shared token(s) - {limit} is not on "
+                 f"the {unit}-token chunk grid, so reusing it would read a suffix the from-scratch path "
+                 f"writes as part of a full chunk")
+            limit = aligned
+        elif limit < shared:
+            _log(f"dsv41 prefix: safe reuse stops at {limit} of {shared} shared token(s) - the rows past "
+                 f"it were written by a decode step or a partial chunk, not by an aligned {unit}-token "
+                 f"prompt chunk a from-scratch prefill would reproduce")
+        if limit > 0 and limit >= len(ids):
+            capped = max(0, limit - unit)
+            _log(f"dsv41 prefix: safe reuse keeps one {unit}-token chunk un-reused so the last token's "
+                 f"logits come from a full chunk: {limit} -> {capped} of {len(ids)}")
+            limit = capped
+        if limit > 0:
+            _log(f"dsv41 prefix: the prompt shares {shared} of {len(ids)} token(s) with this conversation; "
+                 f"safe mode resumes from {limit} on the {unit}-token chunk grid and reads "
+                 f"{len(ids) - limit} fresh token(s), a forward plan a from-scratch prefill reproduces")
+        return limit
+
+    def _advance_clean(self, clean: int, start: int, plan: list[int]) -> int:
+        """Move the safe boundary through the prompt forwards this request just ran.
+
+        ``clean`` counts rows from position 0 that an aligned full-chunk prefill would write the same way.
+        A read that starts before the boundary (`start < clean`) rewrites those rows, so the boundary is
+        cut back to `start`; then only consecutive full, offset-aligned chunks extend it.
+        """
+        unit = chunk_unit(self.args.prefill_chunk, self.args.max_context)
+        clean = min(int(clean), int(start))
+        if int(start) != int(clean):
+            # the read began past the clean boundary: rows between it and `start` were not rewritten, so
+            # the boundary cannot move (safe reuse always starts at the boundary; this is a guard)
+            return clean
+        off = int(start)
+        for size in plan:
+            if off % unit == 0 and int(size) == unit:
+                off += int(size)
+                clean = off
+            else:
+                break
+        return clean
 
     # -- reading the input ---------------------------------------------------------------------
     def _reader(self) -> None:
@@ -864,10 +978,14 @@ class Engine:
                 break
             reused += 1
         held_before = len(conv.held)
+        if (conv.state is not None and reused > 0 and self._prefix_reuse
+                and self._prefix_mode == "safe"):
+            reused = self._safe_prefix(conv, ids, reused)
         if conv.state is None:
             # a fresh conversation (a new slot, or the first request): nothing to start from
             conv.state = self.rt.state(self.args.max_context)
             conv.held = []
+            conv.clean = 0
             reused = 0
         elif reused == 0:
             # the very first token differs: this is a different conversation, start it over.  The graphs
@@ -906,6 +1024,7 @@ class Engine:
             reused -= 1
             to_read = [ids[-1]]
         logits = None
+        plan: list[int] = []
         if to_read:
             plan = prompt_chunks(len(to_read), self.args.prefill_chunk, self.args.max_context)
             if len(plan) > 1:
@@ -940,6 +1059,8 @@ class Engine:
                     return
         prompt_ms = (time.perf_counter() - t_prompt) * 1e3
         conv.held = list(ids)
+        if self._prefix_mode == "safe":
+            conv.clean = self._advance_clean(conv.clean, reused, plan)
         if max_new > 0:
             # Count the conversation that holds captured graphs.  The capture itself is lazy (the first
             # one-token step below); this is the lease's accounting and the report of what it will cost.
@@ -1168,12 +1289,26 @@ def build_parser() -> argparse.ArgumentParser:
                          "to about 4 096 on one card (the indexer's T^2 tensor doubles per doubling).  "
                          "Clamped to --max-context (a longer forward would overwrite its own KV rows); "
                          "docs/ASCEND-DSV41.md §15")
-    ap.add_argument("--prefix-reuse", dest="prefix_reuse", action="store_true", default=True,
+    ap.add_argument("--prefix-reuse", dest="prefix_reuse", nargs="?", const="always", default="always",
+                    choices=["always", "safe", "off"],
+                    metavar="{always,safe,off}",
                     help="start a request that shares a prefix with the conversation it lands on from that "
                          "conversation's KV instead of re-reading the shared tokens (default on).  The "
                          "State is rewound to the shared prefix and only the new suffix is read; the DONE "
                          "line's `reused` field carries the shared count, so serve/server.py's context bar "
-                         "and prefill rate see it")
+                         "and prefill rate see it.  `always` reuses every matching token, which is NOT "
+                         "token-exact on this checkpoint (bf16 accumulation is shape-dependent, so a row "
+                         "written by a decode step or a partial chunk differs from the same row a "
+                         "from-scratch prefill writes).  `safe` reuses only the matching prefix written by "
+                         "full, offset-aligned --prompt-chunk forwards, and reads the suffix on the same "
+                         "chunk grid as a from-scratch prefill: with a chunk unit no larger than the "
+                         "context that is token-exact, and it is a no-op when the prompt is shorter than "
+                         "the chunk unit.  `off` re-prefills from token 0")
+    ap.add_argument("--prefix-reuse-mode", dest="prefix_reuse_mode", default=None,
+                    choices=["always", "safe", "off"],
+                    help="the same choice as --prefix-reuse=<mode>, as a separate flag (wins when both are "
+                         "given); kept so a launcher that passes the boolean --no-prefix-reuse can add a "
+                         "mode without changing its command line")
     ap.add_argument("--no-prefix-reuse", dest="prefix_reuse", action="store_false",
                     help="re-prefill from token 0 whenever a prompt diverges from the held conversation "
                          "(the pre-change behaviour; for A/B measurement and for isolating a suspected "
