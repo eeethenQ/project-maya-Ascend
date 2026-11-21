@@ -282,12 +282,24 @@ class Weights:
     """The checkpoint through a device: what stays resident, and where the experts come from."""
 
     def __init__(self, ckpt: Checkpoint, cfg: TextConfig, device, dtype=torch.bfloat16,
-                 expert_source: "ExpertSource | None" = None, verbose: bool = False):
+                 expert_source: "ExpertSource | None" = None, verbose: bool = False,
+                 shard: "tuple[int, int] | None" = None):
         self.ckpt = ckpt
         self.cfg = cfg
         self.device = device
         self.dtype = dtype
         self.verbose = verbose
+        # Tensor parallelism: this copy holds rank `r` of a `w`-way split.  The dense weights are the only
+        # thing split here - the routed experts are the expert tier's business (`ExpertStreamer`), and a
+        # TP forward asks each card only for the experts it owns (`Dsv41._ep_owns`).  `shard=None` is the
+        # single-card path, byte for byte.
+        self.tp_rank, self.tp_size = (0, 1) if shard is None else (int(shard[0]), int(shard[1]))
+        if self.tp_size > 1:
+            # every split below is a whole number of heads / groups / output groups / vocabulary rows
+            for name, total in (("attention heads", cfg.num_attention_heads), ("output groups", cfg.o_groups),
+                                ("moe intermediate", cfg.moe_intermediate_size), ("vocab", cfg.vocab_size)):
+                if total % self.tp_size:
+                    raise ValueError(f"{name} {total} does not split over tp={self.tp_size}")
         self.experts = expert_source or NullExpertSource(ckpt, cfg, dtype)
         self.layers: list[LayerWeights] = []
         # the int8 matmul path has no zero point; the checkpoint is symmetric (offset 0), and this records
@@ -311,6 +323,33 @@ class Weights:
     def _put(self, name: str, out_dtype=None) -> torch.Tensor:
         return self._dequant(name).to(device=self.device, dtype=out_dtype or self.dtype)
 
+    def _put_shard(self, name: str, axis: int, lo: int, hi: int, out_dtype=None) -> torch.Tensor:
+        """One rank's slice of a dense weight, dequantized on the host **after** the slice.
+
+        Slicing first matters: the head is 2.65 GB as fp32 and a shard is a quarter of that, and the int8
+        weights' per-output-channel scale/offset have to follow the row slice or the dequant is scaled by
+        the wrong channel.  A column slice keeps the full scale vector (its rows are unchanged).
+        """
+        info = self.ckpt.info(name)
+        if info.dtype == "I8":
+            w = self.ckpt.numpy(name)
+            o = self.ckpt.numpy(name + "_offset") if (name + "_offset") in self.ckpt else None
+            if o is not None and o.any():
+                self.offsets_are_zero = False
+            s = self.ckpt.numpy(name + "_scale")
+            if axis == 0:
+                w, s = w[lo:hi], s[lo:hi]
+                o = o[lo:hi] if o is not None else None
+            else:
+                w = w[:, lo:hi]
+            out = dequant_int8(w, s, o)
+        else:
+            a = self.ckpt.numpy(name)
+            a = a[lo:hi] if axis == 0 else a[:, lo:hi]
+            out = np.array(a, dtype=np.float32, copy=True)
+        return torch.from_numpy(np.ascontiguousarray(out)).to(device=self.device,
+                                                             dtype=out_dtype or self.dtype)
+
     def _maybe(self, name: str, out_dtype=None) -> torch.Tensor | None:
         if name not in self.ckpt:
             return None
@@ -320,8 +359,17 @@ class Weights:
     def load(self, layers: "range | list[int] | None" = None) -> "Weights":
         cfg = self.cfg
         dev, dt = self.device, self.dtype
-        self.embed = self._put("embed.weight", dt)
-        self.head = self._put("head.weight", dt)
+        if self.tp_size > 1:
+            # a vocab shard per rank: the embedding lookup and the head's logits are gathered across the
+            # group in `TPEngine` (two small collectives a step), which keeps HBM symmetric.  Replicating
+            # 2.6 GiB of embed+head on every card would cost the expert tier more than it saves.
+            rows = cfg.vocab_size // self.tp_size
+            lo = self.tp_rank * rows
+            self.embed = self._put_shard("embed.weight", 0, lo, lo + rows, dt)
+            self.head = self._put_shard("head.weight", 0, lo, lo + rows, dt)
+        else:
+            self.embed = self._put("embed.weight", dt)
+            self.head = self._put("head.weight", dt)
         self.final_norm = self._put("norm.weight", torch.float32)
         wanted = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
         self.layers = [LayerWeights() for _ in range(cfg.num_hidden_layers)]
@@ -330,16 +378,40 @@ class Weights:
             role = plan.layer(li)
             B = f"layers.{li}."
             lw = self.layers[li]
-            lw.attn = {
-                "wq_a": self._put(B + "attn.wq_a.weight", dt),
-                "wq_b": self._put(B + "attn.wq_b.weight", dt),
-                "wkv": self._put(B + "attn.wkv.weight", dt),
-                "wo_a": self._put(B + "attn.wo_a.weight", dt),
-                "wo_b": self._put(B + "attn.wo_b.weight", dt),
-                "q_norm": self._put(B + "attn.q_norm.weight", torch.float32),
-                "kv_norm": self._put(B + "attn.kv_norm.weight", torch.float32),
-                "attn_sink": self._put(B + "attn.attn_sink", torch.float32),
-            }
+            if self.tp_size > 1:
+                # column-parallel over heads: wq_b's rows are the heads, wo_a's rows are the output groups
+                # and wo_b's columns are the same groups.  wq_a and wkv are replicated on purpose - every
+                # head needs the whole q latent and the whole KV latent, so splitting them would need an
+                # all-gather to put them back together for a 5 MB weight.
+                Hh = cfg.num_attention_heads // self.tp_size
+                Gg = cfg.o_groups // self.tp_size
+                ol = cfg.o_lora_rank
+                r0 = self.tp_rank
+                lw.attn = {
+                    "wq_a": self._put(B + "attn.wq_a.weight", dt),
+                    "wq_b": self._put_shard(B + "attn.wq_b.weight", 0, r0 * Hh * cfg.head_dim,
+                                            (r0 + 1) * Hh * cfg.head_dim, dt),
+                    "wkv": self._put(B + "attn.wkv.weight", dt),
+                    "wo_a": self._put_shard(B + "attn.wo_a.weight", 0, r0 * Gg * ol,
+                                            (r0 + 1) * Gg * ol, dt),
+                    "wo_b": self._put_shard(B + "attn.wo_b.weight", 1, r0 * Gg * ol,
+                                            (r0 + 1) * Gg * ol, dt),
+                    "q_norm": self._put(B + "attn.q_norm.weight", torch.float32),
+                    "kv_norm": self._put(B + "attn.kv_norm.weight", torch.float32),
+                    "attn_sink": self._put_shard(B + "attn.attn_sink", 0, r0 * Hh,
+                                                 (r0 + 1) * Hh, torch.float32),
+                }
+            else:
+                lw.attn = {
+                    "wq_a": self._put(B + "attn.wq_a.weight", dt),
+                    "wq_b": self._put(B + "attn.wq_b.weight", dt),
+                    "wkv": self._put(B + "attn.wkv.weight", dt),
+                    "wo_a": self._put(B + "attn.wo_a.weight", dt),
+                    "wo_b": self._put(B + "attn.wo_b.weight", dt),
+                    "q_norm": self._put(B + "attn.q_norm.weight", torch.float32),
+                    "kv_norm": self._put(B + "attn.kv_norm.weight", torch.float32),
+                    "attn_sink": self._put(B + "attn.attn_sink", torch.float32),
+                }
             if role.is_kv_source:
                 lw.compressor["wkv"] = self._put(B + "attn.compressor.wkv.weight", dt)
                 lw.compressor["norm"] = self._put(B + "attn.compressor.norm.weight", torch.float32)
@@ -354,8 +426,17 @@ class Weights:
                 lw.indexer["weights_proj"] = self._put(B + "attn.indexer.weights_proj.weight", dt)
             lw.ffn["gate"] = self._put(B + "ffn.gate.weight", torch.float32)   # the router is fp32
             lw.ffn["gate_bias"] = self._put(B + "ffn.gate.bias", torch.float32)
-            for p in ("w1", "w2", "w3"):
-                lw.ffn["shared_" + p] = self._put(B + f"ffn.shared_experts.{p}.weight", dt)
+            if self.tp_size > 1:
+                # the shared expert is an ordinary FFN: w1/w3 column-parallel, w2 row-parallel, one
+                # all-reduce with the routed partial in `moe`
+                inter = cfg.moe_intermediate_size // self.tp_size
+                a, b = self.tp_rank * inter, (self.tp_rank + 1) * inter
+                lw.ffn["shared_w1"] = self._put_shard(B + "ffn.shared_experts.w1.weight", 0, a, b, dt)
+                lw.ffn["shared_w2"] = self._put_shard(B + "ffn.shared_experts.w2.weight", 1, a, b, dt)
+                lw.ffn["shared_w3"] = self._put_shard(B + "ffn.shared_experts.w3.weight", 0, a, b, dt)
+            else:
+                for p in ("w1", "w2", "w3"):
+                    lw.ffn["shared_" + p] = self._put(B + f"ffn.shared_experts.{p}.weight", dt)
             lw.hc = {
                 "attn_fn": self._put(B + "hc_attn_fn", torch.float32),
                 "attn_base": self._put(B + "hc_attn_base", torch.float32),
@@ -874,8 +955,12 @@ class Dsv41:
 
     def __init__(self, cfg: TextConfig, weights: Weights, device, dtype=torch.bfloat16, engram=None,
                  index_buckets: IndexerBucketPolicy | None = None, graphs: bool = False,
-                 graph_verify: bool = False):
+                 graph_verify: bool = False, tp_rank: int = 0, tp_size: int = 1):
         self.cfg = cfg
+        # This instance's place in a TP group.  `tp_size == 1` is the single-card engine and takes every
+        # branch below the old way; see `ascend/dsv41/parallel.py` for the driver that steps all ranks.
+        self.tp_rank = int(tp_rank)
+        self.tp_size = int(tp_size)
         self.engram = engram
         self.plan = build_layer_plan(cfg)
         self.weights = weights
@@ -1225,7 +1310,12 @@ class Dsv41:
         cfg, role = self.cfg, self.plan.layer(li)
         lw = self.weights.layers[li]
         T = x.shape[0]
-        H, D, rd = cfg.num_attention_heads, cfg.head_dim, cfg.qk_rope_head_dim
+        # under TP this card owns a contiguous block of heads (`wq_b`'s rows, `attn_sink`'s entries);
+        # every card still builds the *whole* KV latent, because `wkv` is replicated and MLA's latent is
+        # shared by all heads - that is what keeps the KV planes identical on every card and needs no
+        # collective inside attention at all.
+        H = cfg.num_attention_heads // self.tp_size
+        D, rd = cfg.head_dim, cfg.qk_rope_head_dim
         r = role.compress_ratio
         freqs = self.rope.freqs_comp if r else self.rope.freqs_window
 
@@ -1328,10 +1418,14 @@ class Dsv41:
         """wo_a is grouped: group g owns the contiguous head range [8g, 8g+8)."""
         cfg = self.cfg
         lw = self.weights.layers[li]
-        G, T = cfg.o_groups, o.shape[0]
+        # under TP the card owns `o_groups / tp_size` whole groups (8 heads each), so wo_a's rows and
+        # wo_b's columns line up with the heads it computed.  The result is a *partial* output sum; the
+        # caller all-reduces it with the other cards'.
+        G = cfg.o_groups // self.tp_size
+        T = o.shape[0]
         Wa = lw.attn["wo_a"].view(G, cfg.o_lora_rank, cfg.wo_a_in)
         og = o.view(T, G, cfg.wo_a_in).to(Wa.dtype)
-        z = torch.einsum("tgi,gri->tgr", og, Wa).reshape(T, cfg.wo_a_out).float()
+        z = torch.einsum("tgi,gri->tgr", og, Wa).reshape(T, G * cfg.o_lora_rank).float()
         return self.mm(z, lw.attn["wo_b"])
 
     # -- the experts ----------------------------------------------------------------------------
@@ -1393,8 +1487,24 @@ class Dsv41:
         wts = wts / (wts.sum(-1, keepdim=True) + 1e-20) * cfg.routed_scaling_factor
         return idx, wts
 
+    def _ep_owns(self, e: int) -> bool:
+        """Whether this card owns routed expert ``e`` under expert parallelism.
+
+        Strided (``e % tp_size == rank``) rather than contiguous: the router's preference over expert ids
+        is learned and need not be uniform, so a contiguous 96-expert block can hand one card the hot
+        experts of every layer while another idles; ``e % tp_size`` spreads any skew evenly.  Either way
+        the tier's candidate pool is the same 40 x 96 (layer, expert) pairs per card.  One token's six
+        experts can still land on one card (all six the same residue), which is why the combine is a sum
+        over every card rather than a pairwise exchange.
+        """
+        return self.tp_size <= 1 or (e % self.tp_size) == self.tp_rank
+
     def moe(self, li: int, x: torch.Tensor) -> torch.Tensor:
         """The routed experts plus the shared one, for one layer.
+
+        Under TP/EP this returns the card's *partial* sum (its own routed experts plus its column shard of
+        the shared expert); the driver all-reduces it with the other cards' partials and then post-mHCs
+        the full sum.  With ``tp_size == 1`` it is the whole layer, as it always was.
 
         Only the routed branch may run on another card: its weights are 35 MB per expert and that is where
         the room has to be, while the token's rows are a few KB.  The router and the shared expert stay with
@@ -1435,6 +1545,8 @@ class Dsv41:
             return self._routed_one(li, x, idx, wts)
         y = torch.zeros(T, self.cfg.hidden_size, device=x.device, dtype=torch.float32)
         uniq = torch.unique(idx).tolist()
+        if self.tp_size > 1:
+            uniq = [e for e in uniq if self._ep_owns(e)]
         insert = self._tier_holds(x, len(uniq))
         # One quantisation of the layer's activation for all of its experts: `per_token_int8` is per row, so
         # quantising the chunk once and gathering rows is the same arithmetic on the same values as the
@@ -1474,6 +1586,12 @@ class Dsv41:
         """
         ids = [int(e) for e in idx[0].tolist()]          # one small sync per layer, as `unique` also was
         weights = wts[0]
+        # EP: this card computes only its own experts; the top-k slot each came from picks its weight
+        slots = list(range(len(ids)))
+        if self.tp_size > 1:
+            pairs = [(i, e) for i, e in enumerate(ids) if self._ep_owns(e)]
+            slots = [i for i, _ in pairs]
+            ids = [e for _, e in pairs]
         y = torch.zeros(1, self.cfg.hidden_size, device=x.device, dtype=torch.float32)
         xq, xs = (per_token_int8(x, fused=self.fused_quant)
                   if (self.int8_experts and torch_npu is not None) else (None, None))
@@ -1487,19 +1605,24 @@ class Dsv41:
                     u = self.expert_mm_q(xq, xs, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
                     h = F.silu(g) * u
                     y = y + self.expert_mm_q(*per_token_int8(h, fused=self.fused_quant),
-                                             *blocks[i]["w2"]) * weights[start + i]
+                                             *blocks[i]["w2"]) * weights[slots[start + i]]
                 else:
                     g = self.expert_mm(x, *blocks[i]["w1"]).clamp(max=self.lim)
                     u = self.expert_mm(x, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
                     h = F.silu(g) * u
-                    y = y + self.expert_mm(h, *blocks[i]["w2"]) * weights[start + i]
+                    y = y + self.expert_mm(h, *blocks[i]["w2"]) * weights[slots[start + i]]
         return y
 
     # -- one layer, eagerly ---------------------------------------------------------------------
-    def _layer_eager(self, li: int, h: torch.Tensor, pre: torch.Tensor, state: State,
-                     positions: torch.Tensor, host_positions: list[int], engram_rows,
-                     entries_bucket: int | None = None):
-        """Today's layer, expression for expression: the decode path and the graph fallback share it."""
+    def _attn_half(self, li: int, h: torch.Tensor, pre: torch.Tensor, state: State,
+                   positions: torch.Tensor, host_positions: list[int], engram_rows,
+                   entries_bucket: int | None = None):
+        """Layer `li` up to (and including) attention: the first half of `_layer_eager`.
+
+        Split out so the TP driver (`parallel.py`) can put an all-reduce between the two halves without a
+        second copy of this arithmetic.  Under TP the returned attention output is *partial* (this card's
+        heads); with ``tp_size == 1`` it is the whole thing and `_layer_eager` post-MHCs it directly.
+        """
         lw = self.weights.layers[li]
         if engram_rows is not None and self.engram is not None and li in self.engram.slot:
             h = self.engram.apply(li, h, engram_rows[:, self.engram.slot[li]], self.mm)
@@ -1509,13 +1632,30 @@ class Dsv41:
                                                  lw.hc["attn_base"])
             x = rms(self.hc_pre(h, pre), lw.norms["attn_norm"], self.eps)
         with self.phase("attn"):
-            h = self.hc_post(self.attention(li, x, positions, host_positions, state,
-                                            entries_bucket=entries_bucket), res, a_post, a_comb)
+            o = self.attention(li, x, positions, host_positions, state,
+                               entries_bucket=entries_bucket)
+        return o, res, a_pre, a_post, a_comb
+
+    def _ffn_half(self, li: int, o: torch.Tensor, res: torch.Tensor, a_pre: torch.Tensor,
+                  a_post: torch.Tensor, a_comb: torch.Tensor):
+        """The second half: post-MHC of the attention output, the FFN pre-mix, the FFN post-mix."""
+        lw = self.weights.layers[li]
+        with self.phase("attn"):
+            h = self.hc_post(o, res, a_post, a_comb)
         res = h
         with self.phase("hc"):
             f_pre, f_post, f_comb = self.hc_mixes(h, lw.hc["ffn_fn"], lw.hc["ffn_scale"],
                                                  lw.hc["ffn_base"])
             x = rms(self.hc_pre(h, a_pre), lw.norms["ffn_norm"], self.eps)
+        return x, res, f_pre, f_post, f_comb
+
+    def _layer_eager(self, li: int, h: torch.Tensor, pre: torch.Tensor, state: State,
+                     positions: torch.Tensor, host_positions: list[int], engram_rows,
+                     entries_bucket: int | None = None):
+        """Today's layer, expression for expression: the decode path and the graph fallback share it."""
+        o, res, a_pre, a_post, a_comb = self._attn_half(li, h, pre, state, positions, host_positions,
+                                                       engram_rows, entries_bucket=entries_bucket)
+        x, res, f_pre, f_post, f_comb = self._ffn_half(li, o, res, a_pre, a_post, a_comb)
         with self.phase("moe"):
             h = self.hc_post(self.moe(li, x), res, f_post, f_comb)
         return h, f_pre
