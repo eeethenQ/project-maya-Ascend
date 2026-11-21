@@ -45,6 +45,23 @@ def render(tokenizer, question: str, thinking: bool, effort) -> list[int]:
     return tokenizer.encode(prompt, add_special_tokens=False).ids
 
 
+def io_counters() -> dict[str, int]:
+    """What this process has read from storage (``read_bytes``) and asked for (``rchar``).
+
+    ``read_bytes`` is the page-cache evidence: an expert stream that hits the host's page cache moves the
+    same ``rchar`` and (almost) no ``read_bytes``, so the regime is reported instead of guessed.
+    """
+    out = {"read_bytes": 0, "rchar": 0}
+    try:
+        for line in Path("/proc/self/io").read_text().splitlines():
+            key, _, value = line.partition(": ")
+            if key in out and value.strip().isdigit():
+                out[key] = int(value)
+    except OSError:                                           # a kernel without /proc/self/io
+        pass
+    return out
+
+
 def generate(model, tokenizer, state, ids: list[int], max_tokens: int, stop_on_final: bool = True):
     """Greedy decode from `ids`, stopping on eos or on a final `#### <number>` line."""
     t0 = time.perf_counter()
@@ -101,6 +118,7 @@ def main() -> int:
     ap.add_argument("--show", action="store_true", help="print each answer in full")
     a = ap.parse_args()
     t_start = time.perf_counter()
+    io_start = io_counters()
 
     from tokenizers import Tokenizer
     tokenizer = Tokenizer.from_file(a.tokenizer)
@@ -140,10 +158,16 @@ def main() -> int:
     acc = right / max(1, len(questions))
     tps = total_tokens / total_decode if total_decode > 0 else 0.0
     elapsed_s = time.perf_counter() - t_start
+    io_end = io_counters()
+    io = {"read_gb": round((io_end["read_bytes"] - io_start["read_bytes"]) / 1e9, 2),
+          "rchar_gb": round((io_end["rchar"] - io_start["rchar"]) / 1e9, 2)}
     captured = getattr(getattr(run.model, "_decode_graphs", None), "captured", None)
     print(f"\naccuracy: {right}/{len(questions)} = {acc:.0%}")
     print(f"speed   : {total_tokens} tokens in {total_decode:.0f}s decode = {tps:.2f} tok/s; "
           f"{sum(r['prefill_s'] for r in rows) / len(rows):.1f}s mean prefill")
+    print(f"storage : {io['read_gb']:.1f} GB read from the array of {io['rchar_gb']:.1f} GB requested "
+          f"({100 * io['read_gb'] / io['rchar_gb']:.0f}% missed the page cache)"
+          if io["rchar_gb"] else "storage : no io counters")
     print(f"wall    : {elapsed_s:.0f}s from build to last answer"
           + (f"; {captured} graphs live, graphs {'still on' if run.model.graphs else 'turned OFF'}"
              if a.graphs else ""))
@@ -151,7 +175,8 @@ def main() -> int:
         Path(a.out).write_text(json.dumps(
             {"model": a.model, "n": len(questions), "seed": a.seed, "accuracy": acc, "tok_s": tps,
              "graphs": a.graphs, "graph_captures": captured, "graphs_still_on": bool(run.model.graphs),
-             "engram": bool(run.engram), "elapsed_s": round(elapsed_s, 1), "rows": rows}, indent=1))
+             "engram": bool(run.engram), "elapsed_s": round(elapsed_s, 1), "io": io, "rows": rows},
+            indent=1))
         print(f"report: {a.out}")
     run.close()
     return 0

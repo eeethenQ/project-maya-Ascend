@@ -1,0 +1,182 @@
+{
+ "purpose": "GSM8K 10 questions, seed 0, greedy, on the current HEAD (prefill-attention vectorisation, one-chunk prefill default, prefix reuse, graph lease) against the committed baseline. Two-card tier (physical npu:2,3 only): the baseline was measured on a four-card tier, so tok/s is NOT comparable; accuracy and the answers are.",
+ "config": {
+  "sample": "seed 0 of /data/gsm8k-test.jsonl, 10 questions",
+  "model": "/mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8",
+  "device": "npu:0 (physical npu:2)",
+  "expert_devices": "npu:0,npu:1 (physical npu:2,3)",
+  "dtype": "bfloat16",
+  "max_tokens": 384,
+  "max_context": 2048,
+  "engram": false,
+  "thinking": false,
+  "graphs_on": "--graphs",
+  "graphs_off": "the flag absent"
+ },
+ "baseline": {
+  "graphs_on": {
+   "accuracy": 0.9,
+   "tok_s": 1.7685477731605155,
+   "elapsed_s": 1289.1
+  },
+  "graphs_off": {
+   "accuracy": 1.0,
+   "tok_s": 0.8335830262637409,
+   "elapsed_s": 2205.1
+  },
+  "engram_4card": {
+   "accuracy": 0.9,
+   "tok_s": 0.47092861480707837
+  }
+ },
+ "head": {
+  "graphs_on": {
+   "file": "gsm8k-10q-graphs-on-head.json",
+   "accuracy": 0.9,
+   "tok_s": 1.333661448920613,
+   "elapsed_s": 1724.7,
+   "decode_tokens": 1900,
+   "decode_s": 1424.7,
+   "prefill_s": 263.6,
+   "graph_captures": 118,
+   "graphs_still_on": true,
+   "io": {
+    "read_gb": 1.74,
+    "rchar_gb": 7801.22
+   }
+  },
+  "graphs_off": {
+   "file": "gsm8k-10q-graphs-off-head.json",
+   "accuracy": 1.0,
+   "tok_s": 0.7411625514515966,
+   "elapsed_s": 2851.6,
+   "decode_tokens": 1897,
+   "decode_s": 2559.5,
+   "prefill_s": 255.3,
+   "io": {
+    "read_gb": 0.06,
+    "rchar_gb": 7355.14
+   }
+  }
+ },
+ "diff": {
+  "head_on_vs_baseline_on": {
+   "vs": "baseline graphs-on",
+   "differing_questions": [
+    {
+     "i": 4,
+     "gold": 15.0,
+     "baseline_got": 60.0,
+     "baseline_ok": false,
+     "head_got": 5.0,
+     "head_ok": false,
+     "baseline_tokens": 384,
+     "head_tokens": 384,
+     "question": "Comet Halley orbits the sun every 75 years. Bill's dad saw the Comet when he was 30 years old. Bill saw the comet a second time when he was three times the age ",
+     "baseline_tail": "l was born 15 years after Dad saw it.  \nDad was 30 then, so Bill\u2019s birth: Dad was 30 + 15 = 45? Wait, check:  \nIf Dad saw it at 30, and Bill was born 15 years later, Dad was 45 at Bill\u2019s birth.  \nBill\u2019s first sighting at 15 means Dad was 45 + 15 = 60 at that time.  \nThe comet\u2019s next appearance after",
+     "head_tail": "saw it at age 30. That would be the same appearance as when Bill was 15 (if they both saw the same one).  \nThat means: when Bill was 15, his dad was 30. So dad was \\( 30 - 15 = 15 \\) years older than Bill.\n\nThat\u2019s possible \u2014 Dad was 15 when Bill was born.\n\n---\n\n**Step 5 \u2013 Confirm the second sighting"
+    }
+   ],
+   "identical_texts": 0,
+   "n": 10
+  },
+  "head_off_vs_baseline_off": {
+   "vs": "baseline graphs-off",
+   "differing_questions": [],
+   "identical_texts": 0,
+   "n": 10
+  },
+  "head_on_vs_head_off": {
+   "vs": "head graphs-off",
+   "differing_questions": [
+    {
+     "i": 4,
+     "gold": 15.0,
+     "baseline_got": 15.0,
+     "baseline_ok": true,
+     "head_got": 5.0,
+     "head_ok": false,
+     "baseline_tokens": 331,
+     "head_tokens": 384,
+     "question": "Comet Halley orbits the sun every 75 years. Bill's dad saw the Comet when he was 30 years old. Bill saw the comet a second time when he was three times the age ",
+     "baseline_tail": "5 = 90 \\). That matches the \u201cthree times his father\u2019s age at first sighting\u201d (father was 30, 3\u00d730 = 90).\n\n---\n\n**Step 4 \u2013 Answer the question**\n\nThe question: \u201cHow old was Bill when he saw the Comet for the first time?\u201d\n\nFrom above, Bill was **15** years old at first sighting.\n\n---\n\n\\[\n\\boxed{15}\n\\]",
+     "head_tail": "saw it at age 30. That would be the same appearance as when Bill was 15 (if they both saw the same one).  \nThat means: when Bill was 15, his dad was 30. So dad was \\( 30 - 15 = 15 \\) years older than Bill.\n\nThat\u2019s possible \u2014 Dad was 15 when Bill was born.\n\n---\n\n**Step 5 \u2013 Confirm the second sighting"
+    }
+   ],
+   "identical_texts": 3,
+   "n": 10
+  }
+ },
+ "answers": {
+  "q1": {
+   "gold": 16.0,
+   "got_on": 16.0,
+   "ok_on": true,
+   "got_off": 16.0,
+   "ok_off": true
+  },
+  "q2": {
+   "gold": 240.0,
+   "got_on": 240.0,
+   "ok_on": true,
+   "got_off": 240.0,
+   "ok_off": true
+  },
+  "q3": {
+   "gold": 80.0,
+   "got_on": 80.0,
+   "ok_on": true,
+   "got_off": 80.0,
+   "ok_off": true
+  },
+  "q4": {
+   "gold": 15.0,
+   "got_on": 5.0,
+   "ok_on": false,
+   "got_off": 15.0,
+   "ok_off": true
+  },
+  "q5": {
+   "gold": 91.0,
+   "got_on": 91.0,
+   "ok_on": true,
+   "got_off": 91.0,
+   "ok_off": true
+  },
+  "q6": {
+   "gold": 22.0,
+   "got_on": 22.0,
+   "ok_on": true,
+   "got_off": 22.0,
+   "ok_off": true
+  },
+  "q7": {
+   "gold": 8.0,
+   "got_on": 8.0,
+   "ok_on": true,
+   "got_off": 8.0,
+   "ok_off": true
+  },
+  "q8": {
+   "gold": 11.0,
+   "got_on": 11.0,
+   "ok_on": true,
+   "got_off": 11.0,
+   "ok_off": true
+  },
+  "q9": {
+   "gold": 25.0,
+   "got_on": 25.0,
+   "ok_on": true,
+   "got_off": 25.0,
+   "ok_off": true
+  },
+  "q10": {
+   "gold": 482.0,
+   "got_on": 482.0,
+   "ok_on": true,
+   "got_off": 482.0,
+   "ok_off": true
+  }
+ }
+}

@@ -1,0 +1,697 @@
+{
+ "scope": "All numbers are a TWO-CARD tier: physical npu:2 and npu:3 (logical npu:0, npu:1 with ASCEND_RT_VISIBLE_DEVICES=2,3). Nothing here is a four-card number.",
+ "tree": "the working tree as it stood (no engine edits by this measurement; the tree also carries another agent's uncommitted EP work, whose paths are gated on ep_size>1 = 1 here, so the single-rank path these runs take is unchanged)",
+ "commands": {
+  "gsm8k_on": "python3 -u -m ascend.eval_gsm8k ... --n 10 --seed 0 --max-tokens 384 --device npu:0 --expert-devices npu:0,npu:1 --max-context 2048 --graphs --out ascend/results/gsm8k-10q-graphs-on-head.json",
+  "gsm8k_off": "the same command without --graphs, --out .../gsm8k-10q-graphs-off-head.json",
+  "multiturn": "python3 -u -m ascend.bench_serve ... --device npu:0 --cards npu:0,npu:1 --max-context 2048 --serve-multiturn --turns 10 --turn-base-tokens 400 --turn-suffix-tokens 80 --serve-gen 32 --multiturn-scratch all --out ascend/results/serve-multiturn-2card.json",
+  "sustained": "python3 -u -m ascend.bench_serve ... --serve-sustained --sustain-steps 220 --sustain-prompt-tokens 1024 --sustain-graphs --sustain-sample-s 2 --sustain-temp-s 10 --out ascend/results/serve-sustained-2card{,-b}.json",
+  "control": "python3 /tmp/chunk_control.py (one-off; rebuilds the 10-turn run's exact final prompt and prefills it as one 1 808-token forward and as three 512/512/784 forwards)"
+ },
+ "gsm8k": {
+  "sample": "seed 0, 10 questions; prompt token counts match the committed baseline exactly",
+  "head": {
+   "graphs_on": {
+    "accuracy": 0.9,
+    "tok_s": 1.333661448920613,
+    "decode_tokens": 1900,
+    "elapsed_s": 1724.7,
+    "io": {
+     "read_gb": 1.74,
+     "rchar_gb": 7801.22
+    }
+   },
+   "graphs_off": {
+    "accuracy": 1.0,
+    "tok_s": 0.7411625514515966,
+    "decode_tokens": 1897,
+    "elapsed_s": 2851.6,
+    "io": {
+     "read_gb": 0.06,
+     "rchar_gb": 7355.14
+    }
+   }
+  },
+  "baseline_four_card": {
+   "graphs_on": {
+    "accuracy": 0.9,
+    "tok_s": 1.769,
+    "elapsed_s": 1289.1
+   },
+   "graphs_off": {
+    "accuracy": 1.0,
+    "tok_s": 0.834,
+    "elapsed_s": 2205.1
+   }
+  },
+  "answers": {
+   "q1": {
+    "gold": 16.0,
+    "head_on": 16.0,
+    "head_off": 16.0,
+    "baseline_on": 16.0,
+    "baseline_off": 16.0,
+    "head_on_tokens": 141,
+    "head_off_tokens": 177,
+    "baseline_on_tokens": 115,
+    "baseline_off_tokens": 115,
+    "head_on_text_equals_baseline": false,
+    "head_off_text_equals_baseline": false
+   },
+   "q2": {
+    "gold": 240.0,
+    "head_on": 240.0,
+    "head_off": 240.0,
+    "baseline_on": 240.0,
+    "baseline_off": 240.0,
+    "head_on_tokens": 136,
+    "head_off_tokens": 153,
+    "baseline_on_tokens": 112,
+    "baseline_off_tokens": 112,
+    "head_on_text_equals_baseline": false,
+    "head_off_text_equals_baseline": false
+   },
+   "q3": {
+    "gold": 80.0,
+    "head_on": 80.0,
+    "head_off": 80.0,
+    "baseline_on": 80.0,
+    "baseline_off": 80.0,
+    "head_on_tokens": 198,
+    "head_off_tokens": 198,
+    "baseline_on_tokens": 122,
+    "baseline_off_tokens": 122,
+    "head_on_text_equals_baseline": false,
+    "head_off_text_equals_baseline": false
+   },
+   "q4": {
+    "gold": 15.0,
+    "head_on": 5.0,
+    "head_off": 15.0,
+    "baseline_on": 60.0,
+    "baseline_off": 15.0,
+    "head_on_tokens": 384,
+    "head_off_tokens": 331,
+    "baseline_on_tokens": 384,
+    "baseline_off_tokens": 364,
+    "head_on_text_equals_baseline": false,
+    "head_off_text_equals_baseline": false
+   },
+   "q5": {
+    "gold": 91.0,
+    "head_on": 91.0,
+    "head_off": 91.0,
+    "baseline_on": 91.0,
+    "baseline_off": 91.0,
+    "head_on_tokens": 192,
+    "head_off_tokens": 201,
+    "baseline_on_tokens": 163,
+    "baseline_off_tokens": 163,
+    "head_on_text_equals_baseline": false,
+    "head_off_text_equals_baseline": false
+   },
+   "q6": {
+    "gold": 22.0,
+    "head_on": 22.0,
+    "head_off": 22.0,
+    "baseline_on": 22.0,
+    "baseline_off": 22.0,
+    "head_on_tokens": 98,
+    "head_off_tokens": 98,
+    "baseline_on_tokens": 61,
+    "baseline_off_tokens": 63,
+    "head_on_text_equals_baseline": false,
+    "head_off_text_equals_baseline": false
+   },
+   "q7": {
+    "gold": 8.0,
+    "head_on": 8.0,
+    "head_off": 8.0,
+    "baseline_on": 8.0,
+    "baseline_off": 8.0,
+    "head_on_tokens": 262,
+    "head_off_tokens": 258,
+    "baseline_on_tokens": 132,
+    "baseline_off_tokens": 132,
+    "head_on_text_equals_baseline": false,
+    "head_off_text_equals_baseline": false
+   },
+   "q8": {
+    "gold": 11.0,
+    "head_on": 11.0,
+    "head_off": 11.0,
+    "baseline_on": 11.0,
+    "baseline_off": 11.0,
+    "head_on_tokens": 156,
+    "head_off_tokens": 156,
+    "baseline_on_tokens": 146,
+    "baseline_off_tokens": 146,
+    "head_on_text_equals_baseline": false,
+    "head_off_text_equals_baseline": false
+   },
+   "q9": {
+    "gold": 25.0,
+    "head_on": 25.0,
+    "head_off": 25.0,
+    "baseline_on": 25.0,
+    "baseline_off": 25.0,
+    "head_on_tokens": 181,
+    "head_off_tokens": 174,
+    "baseline_on_tokens": 112,
+    "baseline_off_tokens": 111,
+    "head_on_text_equals_baseline": false,
+    "head_off_text_equals_baseline": false
+   },
+   "q10": {
+    "gold": 482.0,
+    "head_on": 482.0,
+    "head_off": 482.0,
+    "baseline_on": 482.0,
+    "baseline_off": 482.0,
+    "head_on_tokens": 152,
+    "head_off_tokens": 151,
+    "baseline_on_tokens": 120,
+    "baseline_off_tokens": 122,
+    "head_on_text_equals_baseline": false,
+    "head_off_text_equals_baseline": false
+   }
+  },
+  "differing_answers_vs_baseline_on": [
+   {
+    "i": 4,
+    "gold": 15.0,
+    "baseline": 60.0,
+    "head": 5.0,
+    "baseline_ok": false,
+    "head_ok": false
+   }
+  ],
+  "differing_answers_vs_baseline_off": [],
+  "identical_texts_vs_baseline_on": 0,
+  "identical_texts_vs_baseline_off": 0
+ },
+ "multiturn": {
+  "config": {
+   "turns": 10,
+   "base_tokens": 400,
+   "fresh_tokens_per_turn": 112,
+   "gen_per_turn": 32,
+   "graphs": false,
+   "prefix_reuse": true,
+   "wall_s": 2284.9,
+   "reuse_phase_s": 971.5,
+   "io": {
+    "read_gb": 1.36,
+    "rchar_gb": 2723.51
+   }
+  },
+  "reused_exact_all": true,
+  "tokens_identical_all": false,
+  "turns": [
+   {
+    "turn": 1,
+    "prompt_tokens": 512,
+    "reused": 0,
+    "fresh_tokens": 112,
+    "ttft_s": 52.171,
+    "scratch_ttft_s": 44.219,
+    "scratch_over_reused": 0.85,
+    "gen_tokens": 32,
+    "decode_tok_s": null,
+    "hit_rate": 0.2877,
+    "tokens_identical": true,
+    "differing_tokens": 0,
+    "common_prefix_tokens": 32
+   },
+   {
+    "turn": 2,
+    "prompt_tokens": 656,
+    "reused": 544,
+    "fresh_tokens": 112,
+    "ttft_s": 27.575,
+    "scratch_ttft_s": 51.001,
+    "scratch_over_reused": 1.85,
+    "gen_tokens": 32,
+    "decode_tok_s": null,
+    "hit_rate": 0.4311,
+    "tokens_identical": false,
+    "differing_tokens": 2,
+    "common_prefix_tokens": 30
+   },
+   {
+    "turn": 3,
+    "prompt_tokens": 800,
+    "reused": 688,
+    "fresh_tokens": 112,
+    "ttft_s": 24.639,
+    "scratch_ttft_s": 53.987,
+    "scratch_over_reused": 2.19,
+    "gen_tokens": 32,
+    "decode_tok_s": null,
+    "hit_rate": 0.4777,
+    "tokens_identical": true,
+    "differing_tokens": 0,
+    "common_prefix_tokens": 32
+   },
+   {
+    "turn": 4,
+    "prompt_tokens": 944,
+    "reused": 832,
+    "fresh_tokens": 112,
+    "ttft_s": 36.231,
+    "scratch_ttft_s": 60.366,
+    "scratch_over_reused": 1.67,
+    "gen_tokens": 32,
+    "decode_tok_s": null,
+    "hit_rate": 0.3568,
+    "tokens_identical": false,
+    "differing_tokens": 1,
+    "common_prefix_tokens": 15
+   },
+   {
+    "turn": 5,
+    "prompt_tokens": 1088,
+    "reused": 976,
+    "fresh_tokens": 112,
+    "ttft_s": 32.631,
+    "scratch_ttft_s": 64.582,
+    "scratch_over_reused": 1.98,
+    "gen_tokens": 32,
+    "decode_tok_s": null,
+    "hit_rate": 0.4152,
+    "tokens_identical": false,
+    "differing_tokens": 24,
+    "common_prefix_tokens": 8
+   },
+   {
+    "turn": 6,
+    "prompt_tokens": 1232,
+    "reused": 1120,
+    "fresh_tokens": 112,
+    "ttft_s": 31.69,
+    "scratch_ttft_s": 67.436,
+    "scratch_over_reused": 2.13,
+    "gen_tokens": 32,
+    "decode_tok_s": null,
+    "hit_rate": 0.4274,
+    "tokens_identical": false,
+    "differing_tokens": 32,
+    "common_prefix_tokens": 0
+   },
+   {
+    "turn": 7,
+    "prompt_tokens": 1376,
+    "reused": 1264,
+    "fresh_tokens": 112,
+    "ttft_s": 34.672,
+    "scratch_ttft_s": 68.638,
+    "scratch_over_reused": 1.98,
+    "gen_tokens": 32,
+    "decode_tok_s": null,
+    "hit_rate": 0.3722,
+    "tokens_identical": false,
+    "differing_tokens": 23,
+    "common_prefix_tokens": 9
+   },
+   {
+    "turn": 8,
+    "prompt_tokens": 1520,
+    "reused": 1408,
+    "fresh_tokens": 112,
+    "ttft_s": 34.116,
+    "scratch_ttft_s": 71.429,
+    "scratch_over_reused": 2.09,
+    "gen_tokens": 32,
+    "decode_tok_s": null,
+    "hit_rate": 0.4023,
+    "tokens_identical": false,
+    "differing_tokens": 10,
+    "common_prefix_tokens": 21
+   },
+   {
+    "turn": 9,
+    "prompt_tokens": 1664,
+    "reused": 1552,
+    "fresh_tokens": 112,
+    "ttft_s": 32.337,
+    "scratch_ttft_s": 73.21,
+    "scratch_over_reused": 2.26,
+    "gen_tokens": 32,
+    "decode_tok_s": null,
+    "hit_rate": 0.396,
+    "tokens_identical": false,
+    "differing_tokens": 30,
+    "common_prefix_tokens": 2
+   },
+   {
+    "turn": 10,
+    "prompt_tokens": 1808,
+    "reused": 1696,
+    "fresh_tokens": 112,
+    "ttft_s": 34.044,
+    "scratch_ttft_s": 76.105,
+    "scratch_over_reused": 2.24,
+    "gen_tokens": 32,
+    "decode_tok_s": null,
+    "hit_rate": 0.3731,
+    "tokens_identical": false,
+    "differing_tokens": 20,
+    "common_prefix_tokens": 12
+   }
+  ]
+ },
+ "control": {
+  "prompt_tokens": 1808,
+  "gen": 32,
+  "whole_vs_chunked_identical": false,
+  "whole_vs_recorded_scratch_identical": true,
+  "chunked_vs_recorded_scratch_identical": false,
+  "note": "All three arms are from-scratch prefills of the same 1 808 tokens; 'whole' is one forward (the shape scratch-turn-10 used), 'chunked512' is three. The multi-turn reuse arm differed from scratch-turn-10; this says whether changing only the prefill shape does the same.",
+  "arms": {
+   "whole": {
+    "prefill_chunk": 0,
+    "ttft_s": 88.887,
+    "prompt_ms": 88553.0,
+    "tokens": [
+     47,
+     15,
+     23,
+     16,
+     21,
+     7505,
+     64528,
+     22604,
+     369,
+     3608,
+     5745,
+     79,
+     15,
+     23,
+     16,
+     21,
+     26608,
+     1844,
+     66,
+     369,
+     223,
+     17561,
+     406,
+     369,
+     11047,
+     4474,
+     14,
+     4086,
+     260,
+     2645,
+     271,
+     94
+    ]
+   },
+   "chunked512": {
+    "prefill_chunk": 512,
+    "ttft_s": 208.28,
+    "prompt_ms": 208273.7,
+    "tokens": [
+     47,
+     15,
+     23,
+     16,
+     21,
+     7505,
+     64528,
+     22604,
+     369,
+     3608,
+     5745,
+     79,
+     15,
+     23,
+     16,
+     21,
+     26608,
+     1844,
+     66,
+     369,
+     223,
+     17561,
+     406,
+     369,
+     11047,
+     4474,
+     7640,
+     94,
+     95498,
+     53091,
+     4374,
+     1465
+    ]
+   }
+  }
+ },
+ "sustained": {
+  "a": {
+   "file": "",
+   "graphs": true,
+   "prompt_tokens": 1024,
+   "steps": 220,
+   "ttft_s": 68.807,
+   "decode_s": 172.833,
+   "decode_tok_s": null,
+   "graph_captures": null,
+   "median_ms": 766.4,
+   "mean_ms": 789.2,
+   "p10_ms": 670.6,
+   "p90_ms": 866.5,
+   "min_ms": 495.2,
+   "max_ms": 4837.7,
+   "windows_ms": [
+    [
+     0,
+     21,
+     838.8
+    ],
+    [
+     21,
+     42,
+     814.3
+    ],
+    [
+     42,
+     63,
+     714.3
+    ],
+    [
+     63,
+     84,
+     764.0
+    ],
+    [
+     84,
+     105,
+     731.6
+    ],
+    [
+     105,
+     126,
+     790.5
+    ],
+    [
+     126,
+     147,
+     757.7
+    ],
+    [
+     147,
+     168,
+     774.2
+    ],
+    [
+     168,
+     189,
+     791.3
+    ],
+    [
+     189,
+     210,
+     741.2
+    ],
+    [
+     210,
+     219,
+     724.1
+    ]
+   ],
+   "drift_ms_per_step": -0.893,
+   "first_quartile_ms": 800.2,
+   "last_quartile_ms": 762.7,
+   "tier_hit_rate": 0.4582,
+   "tier_capacity": [
+    935,
+    935
+   ],
+   "tier_resident": [
+    0,
+    935
+   ],
+   "oom_skips": [
+    0,
+    0
+   ],
+   "hbm_gib": {
+    "npu:0": {
+     "first_gib": 15.72,
+     "last_gib": 22.26,
+     "min_gib": 15.69,
+     "max_gib": 22.44
+    },
+    "npu:1": {
+     "first_gib": 0.0,
+     "last_gib": 25.29,
+     "min_gib": 0.0,
+     "max_gib": 25.32
+    }
+   },
+   "hbm_peak_gib": {
+    "npu:0": 22.49,
+    "npu:1": 25.52
+   },
+   "temperature_c": {
+    "first": 39.0,
+    "last": 40.0,
+    "min": 39.0,
+    "max": 41.0
+   },
+   "io": {
+    "read_gb": 0.88,
+    "rchar_gb": 1186.9
+   },
+   "wall_s": 243.0
+  },
+  "b": {
+   "file": "",
+   "graphs": true,
+   "prompt_tokens": 1024,
+   "steps": 220,
+   "ttft_s": 70.06,
+   "decode_s": 172.836,
+   "decode_tok_s": 1.27,
+   "graph_captures": 98,
+   "median_ms": 769.3,
+   "mean_ms": 789.2,
+   "p10_ms": 669.8,
+   "p90_ms": 861.4,
+   "min_ms": 501.1,
+   "max_ms": 5020.2,
+   "windows_ms": [
+    [
+     0,
+     21,
+     834.7
+    ],
+    [
+     21,
+     42,
+     793.9
+    ],
+    [
+     42,
+     63,
+     724.7
+    ],
+    [
+     63,
+     84,
+     774.6
+    ],
+    [
+     84,
+     105,
+     732.5
+    ],
+    [
+     105,
+     126,
+     791.7
+    ],
+    [
+     126,
+     147,
+     759.1
+    ],
+    [
+     147,
+     168,
+     774.6
+    ],
+    [
+     168,
+     189,
+     788.5
+    ],
+    [
+     189,
+     210,
+     741.5
+    ],
+    [
+     210,
+     219,
+     719.7
+    ]
+   ],
+   "drift_ms_per_step": -0.873,
+   "first_quartile_ms": 793.6,
+   "last_quartile_ms": 761.6,
+   "tier_hit_rate": 0.4588,
+   "tier_capacity": [
+    935,
+    935
+   ],
+   "tier_resident": [
+    0,
+    935
+   ],
+   "oom_skips": [
+    0,
+    0
+   ],
+   "hbm_gib": {
+    "npu:0": {
+     "first_gib": 15.72,
+     "last_gib": 22.36,
+     "min_gib": 15.58,
+     "max_gib": 22.39
+    },
+    "npu:1": {
+     "first_gib": 0.0,
+     "last_gib": 25.29,
+     "min_gib": 0.0,
+     "max_gib": 25.38
+    }
+   },
+   "hbm_peak_gib": {
+    "npu:0": 22.49,
+    "npu:1": 25.52
+   },
+   "temperature_c": {
+    "first": 39.0,
+    "last": 40.0,
+    "min": 39.0,
+    "max": 40.0
+   },
+   "io": {
+    "read_gb": 0.16,
+    "rchar_gb": 1186.9
+   },
+   "wall_s": 244.3
+  }
+ },
+ "notes": [
+  "Two-card tier throughout: physical npu:2,npu:3 (logical npu:0,npu:1). The tier is 996 slots for the serve runs and 1057 for the graphs-off GSM8K arm - not the four-card 2480-slot tier the committed numbers used, so tok/s is not comparable across card counts; accuracy and answers are.",
+  "Page cache was warm for every run: read_bytes was 0.06 GB (gsm8k off), 0.16-0.88 GB (sustained), 1.36 GB (multi-turn) and 1.74 GB (gsm8k on) against 1.2-7.8 TB of rchar. These are warm-array numbers.",
+  "The multi-turn run passed --turn-suffix-tokens 80, but the harness at the time sliced suffix_n+gen = 112 tokens per turn; the code now takes exactly suffix_n. The measured run's per-turn rows carry the true 112 fresh tokens (prompt grows by 144 = 112 + 32 gen per turn, 512 -> 1808).",
+  "Sustained run A was recorded before the harness read graph_captures and decode_tok_s into its summary; its engine log says 'graphs captured 98 in 4677 ms' (the 4.84 s max interval) and its rate is 220 tokens / 172.83 s = 1.27 tok/s. Run B records both fields directly.",
+  "The graph capture is charged to one decode step, so the single largest interval in each sustained run (4.84 s / 5.02 s) is the capture, not a slow token; excluding it the max step was 1.03 s.",
+  "The working tree also carries another agent's uncommitted EP edits (model.py/parallel.py). Its paths are gated on ep_size>1, which is 1 on the single-rank path every run here takes; bench_serve.py and eval_gsm8k.py are the only files this measurement edited."
+ ]
+}

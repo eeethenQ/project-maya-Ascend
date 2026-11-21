@@ -48,6 +48,15 @@ long shared prefix is seeded by one request, resumed by a second with a differen
 the same prompt with reuse off gives both the re-prefill baseline and the token stream the reused arm must
 match exactly.
 
+``--serve-multiturn`` measures the reuse *repeatedly*: a conversation of ``--turns`` turns, each turn
+re-sending the whole history plus a new user suffix exactly as the chat server does, reports every turn's
+TTFT and the ``reused`` count the engine's ``DONE`` line carries, then re-runs the same prompts as
+from-scratch prefills (one conversation drop and one full prefill per turn, ``--multiturn-scratch all``)
+and compares the greedy tokens turn by turn.  ``--serve-sustained`` decodes ``--sustain-steps`` tokens from
+one prompt, time-stamps every token off the protocol's ``T`` lines and samples HBM, the tier's resident
+slots / capacity / hit counters and the cards' temperature while it runs, so a leak or a slow degradation
+shows as a trend instead of hiding in a mean.
+
 Four concurrent one-forward 2 000-token prefills on one card need a larger ``--serve-expert-reserve-gib``
 than the engine's 6.0 (each forward's activation high-water is ~2.7 GiB); the default here is 13.0.
 
@@ -74,6 +83,7 @@ import gc
 import json
 import os
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -141,6 +151,69 @@ def _tier(run) -> dict[str, int]:
             "oom_skips": int(st.get("oom_skips", 0))}
 
 
+def _io_counters() -> dict[str, int]:
+    """What this process actually read from storage (``read_bytes``) and asked for (``rchar``).
+
+    The two are the page-cache evidence: a prefill whose experts are in the host's page cache moves the
+    same ``rchar`` but almost no ``read_bytes``, so the regime a timing was measured in can be stated
+    instead of guessed from the number.
+    """
+    out = {"read_bytes": 0, "rchar": 0}
+    try:
+        for line in Path("/proc/self/io").read_text().splitlines():
+            key, _, value = line.partition(": ")
+            if key in out and value.strip().isdigit():
+                out[key] = int(value)
+    except OSError:                                            # a kernel without /proc/self/io
+        pass
+    return out
+
+
+def _io_delta(before: dict, after: dict) -> dict:
+    return {"read_gb": round((after["read_bytes"] - before["read_bytes"]) / 1e9, 2),
+            "rchar_gb": round((after["rchar"] - before["rchar"]) / 1e9, 2)}
+
+
+def _tier_capacity(engine) -> int:
+    """The tier's slot budget, which can *shrink* mid-run when an insert runs out of HBM.
+
+    ``cache_slots`` is the figure set at build time; the OOM path lowers a card's quota without updating
+    it, so the sum of the live per-card quotas is the honest capacity.
+    """
+    exp = engine.rt.experts
+    slots = getattr(exp, "_slots", None)
+    if isinstance(slots, dict) and slots:
+        return int(sum(slots.values()))
+    return int(getattr(exp, "cache_slots", 0) or 0)
+
+
+def _temp_c(physical: list[int]) -> dict[str, float | None]:
+    """The cards' temperatures from ``npu-smi`` (the container has it); a card it cannot answer for is None."""
+    out: dict[str, float | None] = {}
+    for i in physical:
+        try:
+            got = subprocess.run(["npu-smi", "info", "-t", "temp", "-i", str(i), "-c", "0"],
+                                 capture_output=True, text=True, timeout=10)
+            value = None
+            for line in got.stdout.splitlines():
+                if "Temperature" in line and ":" in line:
+                    tail = line.rsplit(":", 1)[-1].strip()
+                    value = float(tail) if tail.replace(".", "", 1).isdigit() else None
+            out[str(i)] = value
+        except Exception:                                      # noqa: BLE001 - measurement, never fatal
+            out[str(i)] = None
+    return out
+
+
+def _physical_cards() -> list[int]:
+    """The physical ids ``ASCEND_RT_VISIBLE_DEVICES`` maps the logical cards onto (fallback: identity)."""
+    visible = [x for x in os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").split(",") if x.strip()]
+    try:
+        return [int(x) for x in visible] or [0, 1]
+    except ValueError:
+        return [0, 1]
+
+
 def _tier_delta(before: dict, after: dict, requests: int = 1) -> dict:
     hits = after["hits"] - before["hits"]
     misses = after["misses"] - before["misses"]
@@ -153,9 +226,9 @@ def _tier_delta(before: dict, after: dict, requests: int = 1) -> dict:
 
 def _stats_line(label: str, rec: dict) -> None:
     bits = [f"{label:16s}", f"wall {rec.get('wall_s', 0):8.1f}s"]
-    if rec.get("ttft_s") is not None:
+    if isinstance(rec.get("ttft_s"), (int, float)):
         bits.append(f"TTFT {rec['ttft_s']:8.1f}s")
-    if rec.get("decode_tok_s") is not None:
+    if isinstance(rec.get("decode_tok_s"), (int, float)):
         bits.append(f"decode {rec['decode_tok_s']:6.2f} tok/s")
     tier = rec.get("tier", {})
     if tier.get("hit_rate") is not None:
@@ -588,8 +661,13 @@ def serve_parallel(engine, prompts: list[list[int]], gen: int, label: str, devic
                       tier_before=before)
 
 
-def serve_serial(engine, prompts: list[list[int]], gen: int, label: str, devices) -> dict:
-    """The pre-change serve path: requests one at a time, each measured from its own GEN to its DONE."""
+def serve_serial(engine, prompts: list[list[int]], gen: int, label: str, devices,
+                 with_times: bool = False) -> dict:
+    """The pre-change serve path: requests one at a time, each measured from its own GEN to its DONE.
+
+    ``with_times`` adds ``t_tokens_s``: every ``T`` line's arrival instant relative to the submit, which is
+    the per-token latency series a sustained run is read from (the ``T`` lines are one request's, in order).
+    """
     collector = ServeCollector()
     engine.emit = collector
     before = _tier(engine.rt)
@@ -604,6 +682,14 @@ def serve_serial(engine, prompts: list[list[int]], gen: int, label: str, devices
     rec = _serve_rec(label, "serial", collector, submits, prompts, wall, devices, engine,
                      tagged=False, tier_before=before)
     rec["per_request_serial_s"] = [round(x, 2) for x in per]                # no overlap: each request's wall
+    if with_times:
+        for idx, rid in enumerate(sorted(submits)):
+            end = submits[sorted(submits)[idx + 1]] if idx + 1 < len(submits) else float("inf")
+            times = [t for t, line in collector.snapshot()
+                     if line.startswith("T ") and submits[rid] <= t < end]
+            tok = (rec["per_request"][idx] or {}).get("tokens") or []
+            rec.setdefault("t_tokens_s", []).append([round(t - submits[rid], 4) for t in times])
+            rec.setdefault("t_tokens", []).append(tok)
     return rec
 
 
@@ -902,6 +988,303 @@ def serve_prefix(a, tokenizer, rec: Recorder, devices, cards) -> dict:
     return summary
 
 
+# --------------------------------------------------------------------------- 10: multi-turn prefix reuse
+def serve_multiturn(a, tokenizer, rec: Recorder, devices, cards) -> dict:
+    """A ~10-turn conversation through the serve path, with prefix reuse active on every turn.
+
+    Each turn re-sends the whole conversation (the document prefix, every earlier question and every
+    earlier answer) plus a new user suffix, which is exactly what the chat server sends.  The engine finds
+    the longest common prefix with the conversation it holds, rewinds to it and reads only the suffix; the
+    ``DONE`` line's ``reused`` field says how many tokens of the prompt were *not* re-read.
+
+    Reported per turn: prompt tokens, ``reused``, TTFT (submit -> first ``T``), prompt ms, decode ms and
+    rate, the tier delta and the process's peak HBM.  Afterwards the same prompts are re-run as
+    from-scratch prefills - the conversation is dropped first, so ``State`` is rebuilt and every prompt is
+    read from token 0 (``--multiturn-scratch all``; ``final`` does just the last turn) - and the greedy
+    token streams are compared turn by turn.  That is the correctness bar: a KV that was resumed from a
+    different chunking must produce the same tokens as a prefill that never resumed.
+    """
+    turns = max(2, int(a.turns))
+    base_n = int(a.turn_base_tokens)
+    suffix_n = int(a.turn_suffix_tokens)
+    gen = max(2, int(a.serve_gen))
+    span = base_n + turns * (suffix_n + gen) + 8
+    if span + gen + 4 > a.max_context:
+        raise SystemExit(f"a {turns}-turn conversation spans {span} tokens, past --max-context "
+                         f"{a.max_context}; lower --turn-base-tokens, --turn-suffix-tokens or --serve-gen")
+    base = make_prompt(tokenizer, span, Path(a.prompt_source))
+    shared = base[:base_n]
+    # a turn's new text is exactly --turn-suffix-tokens; the `gen` gap in the stride is room the turn's own
+    # generation would take, so a turn's slice never overlaps the next one
+    suffixes = [base[base_n + k * (suffix_n + gen):base_n + k * (suffix_n + gen) + suffix_n]
+                for k in range(turns)]
+    engine = _policy_engine(a, cards, 1, graphs=False)
+    engine.args.max_context = a.max_context
+    engine.args.prefix_reuse = True
+    engine._prefix_reuse = True
+    t_run = time.perf_counter()
+    io0 = _io_counters()
+    rows: list[dict] = []
+    prompts: list[list[int]] = []
+    try:
+        history = list(shared)
+        for k, suffix in enumerate(suffixes, 1):
+            prompt = history + suffix
+            prompts.append(prompt)
+            r = serve_serial(engine, [prompt], gen, f"turn-{k}", devices)
+            p = (r.get("per_request") or [{}])[0]
+            got = p.get("tokens") or []
+            expected = len(history) if k > 1 else 0
+            row = {"scenario": f"turn-{k}", "mode": "multiturn", "turn": k,
+                   "prompt_tokens": len(prompt), "suffix_tokens": len(suffix),
+                   "reused": p.get("reused"), "reused_expected": expected,
+                   "reused_exact": p.get("reused") == expected,
+                   "ttft_s": p.get("ttft_s"), "prompt_ms": p.get("prompt_ms"),
+                   "gen_tokens": len(got), "decode_s": p.get("decode_s"),
+                   "decode_tok_s": p.get("decode_tok_s"), "finish": p.get("finish"),
+                   "wall_s": r.get("wall_s"), "tokens": got,
+                   "tier": r.get("tier"), "peak_gib": r.get("peak_gib")}
+            rows.append(row)
+            rec.add(row | {"cards": cards, "device": a.device,
+                           "note": f"turn {k}: {len(prompt)}-token prompt, "
+                                   f"{len(suffix)} fresh token(s) after the held conversation"})
+            history = prompt + got
+        io1 = _io_counters()
+        multi = {"scenario": "multiturn-reuse", "mode": "multiturn", "cards": cards, "device": a.device,
+                 "turns": turns, "base_tokens": base_n, "suffix_tokens": suffix_n, "gen": gen,
+                 "prompt_tokens": [r["prompt_tokens"] for r in rows],
+                 "reused": [r["reused"] for r in rows],
+                 "ttft_s_list": [r["ttft_s"] for r in rows],
+                 "decode_tok_s_list": [r["decode_tok_s"] for r in rows],
+                 "reused_exact": all(r["reused_exact"] for r in rows),
+                 "tokens": [r["tokens"] for r in rows],
+                 "final_prompt_tokens": len(prompts[-1]),
+                 "io": _io_delta(io0, io1),
+                 "wall_s": round(time.perf_counter() - t_run, 1)}
+        rec.add(multi)
+
+        scratch: dict = {}
+        if a.multiturn_scratch != "none":
+            # From-scratch: the conversation is dropped, so the next prompt's State is new and the whole
+            # prompt is read from token 0.  `_prefix_reuse` is off too, so no path can resume anything.
+            engine._prefix_reuse = False
+            engine.args.prefix_reuse = False
+
+            def from_scratch(k: int) -> dict:
+                engine._drop_conversation("multiturn scratch: a from-scratch prefill, not a resumed one")
+                r = serve_serial(engine, [prompts[k - 1]], gen, f"scratch-turn-{k}", devices)
+                p = (r.get("per_request") or [{}])[0]
+                row = {"scenario": f"scratch-turn-{k}", "mode": "multiturn-scratch", "turn": k,
+                       "prompt_tokens": len(prompts[k - 1]), "reused": p.get("reused"),
+                       "ttft_s": p.get("ttft_s"), "prompt_ms": p.get("prompt_ms"),
+                       "gen_tokens": len(p.get("tokens") or []), "decode_tok_s": p.get("decode_tok_s"),
+                       "wall_s": r.get("wall_s"), "tokens": p.get("tokens") or [],
+                       "peak_gib": r.get("peak_gib")}
+                rec.add(row | {"cards": cards, "device": a.device,
+                               "note": "the same prompt read from token 0 in a fresh State (reuse off)"})
+                return row
+
+            if a.multiturn_scratch == "all":
+                matches = []
+                for k in range(1, turns + 1):
+                    row = from_scratch(k)
+                    same = row["tokens"] == rows[k - 1]["tokens"]
+                    matches.append({"turn": k, "prompt_tokens": row["prompt_tokens"],
+                                    "scratch_ttft_s": row["ttft_s"], "reused": row["reused"],
+                                    "tokens_identical": same,
+                                    "reuse_tokens": rows[k - 1]["tokens"],
+                                    "scratch_tokens": row["tokens"]})
+                    print(f"  turn {k:2d}: reused {rows[k - 1]['reused']} vs 0, scratch TTFT "
+                          f"{row['ttft_s']}s, tokens {'identical' if same else 'DIFFER'}", flush=True)
+                first_bad = next((m["turn"] for m in matches if not m["tokens_identical"]), None)
+                scratch = {"mode": "all", "per_turn": matches,
+                           "tokens_identical_all": first_bad is None,
+                           "first_differing_turn": first_bad}
+            else:
+                row = from_scratch(turns)
+                same = row["tokens"] == rows[-1]["tokens"]
+                scratch = {"mode": "final", "prompt_tokens": row["prompt_tokens"],
+                           "scratch_ttft_s": row["ttft_s"], "reused": row["reused"],
+                           "tokens_identical_final": same,
+                           "reuse_tokens": rows[-1]["tokens"], "scratch_tokens": row["tokens"]}
+    finally:
+        engine.stop_workers()
+        engine.shutdown()
+
+    reuse_ttfts = [r["ttft_s"] for r in rows if r["ttft_s"] is not None]
+    summary = {
+        "turns": turns, "base_tokens": base_n, "suffix_tokens": suffix_n, "gen": gen,
+        "suffix_tokens_measured": rows[0]["suffix_tokens"],
+        "mean_ttft_s": round(statistics.mean(reuse_ttfts), 2) if reuse_ttfts else None,
+        "median_ttft_s": round(statistics.median(reuse_ttfts), 2) if reuse_ttfts else None,
+        "max_ttft_s": max(reuse_ttfts) if reuse_ttfts else None,
+        "ttft_s_list": reuse_ttfts,
+        "reused": [r["reused"] for r in rows],
+        "reused_exact_all": all(r["reused_exact"] for r in rows),
+        "final_turn_ttft_s": rows[-1]["ttft_s"], "final_turn_reused": rows[-1]["reused"],
+        "scratch": scratch,
+        "tokens_identical_all": scratch.get("tokens_identical_all",
+                                           scratch.get("tokens_identical_final")),
+        "io": _io_delta(io0, io1),
+        "wall_s": round(time.perf_counter() - t_run, 1),
+    }
+    print("\nmultiturn summary:", json.dumps({k: v for k, v in summary.items() if k != "scratch"},
+                                             indent=1), flush=True)
+    rec.add({"scenario": "multiturn-summary", "cards": cards, "device": a.device, "wall_s": 0.0,
+             **{k: v for k, v in summary.items()}})
+    return summary
+
+
+# --------------------------------------------------------------------------- 11: sustained decode
+def _ms_stats(iv: list[float]) -> dict:
+    """Where a ms/token series sits and whether it moves: quartiles, windows, and a least-squares slope."""
+    if not iv:
+        return {}
+    n = len(iv)
+    ordered = sorted(iv)
+    q = lambda f: ordered[min(len(ordered) - 1, max(0, int(f * (len(ordered) - 1))))]  # noqa: E731
+    w = max(5, n // 10)
+    windows = [{"from_step": i, "to_step": min(n, i + w),
+                "median_ms": round(statistics.median(iv[i:i + w]), 1),
+                "mean_ms": round(statistics.mean(iv[i:i + w]), 1)}
+               for i in range(0, n, w)]
+    def slope(ys: list[float]) -> float:
+        xs = list(range(len(ys)))
+        mx = sum(xs) / len(xs)
+        my = sum(ys) / len(ys)
+        den = sum((x - mx) ** 2 for x in xs)
+        return (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den) if den else 0.0
+    head = iv[:max(1, n // 4)]
+    tail = iv[-max(1, n // 4):]
+    return {"steps": n, "median_ms": round(statistics.median(iv), 1),
+            "mean_ms": round(statistics.mean(iv), 1),
+            "min_ms": round(ordered[0], 1), "max_ms": round(ordered[-1], 1),
+            "p10_ms": round(q(0.10), 1), "p90_ms": round(q(0.90), 1),
+            "first_quartile_ms": round(statistics.median(head), 1),
+            "last_quartile_ms": round(statistics.median(tail), 1),
+            "drift_ms_per_step": round(slope(iv), 3),
+            "drift_over_run_ms": round(slope(iv) * (n - 1), 1),
+            "windows": windows}
+
+
+def serve_sustained(a, tokenizer, rec: Recorder, devices, cards) -> dict:
+    """``--sustain-steps`` decode steps from one prompt, with the cards watched while it runs.
+
+    The per-token series comes from the protocol's own ``T`` lines (arrival instants), so it is the latency
+    the server's client would see.  A sampler thread records, every ``--sustain-sample-s``: allocated HBM
+    per card, the allocator's high-water, the tier's resident experts, its *live* slot budget (the OOM path
+    can lower it mid-run), its hit/miss counters and the cards' temperature every ``--sustain-temp-s``.
+    A leak shows as allocated HBM that rises without the tier growing; a cache or thermal drift shows as a
+    slope in the ms/token series; a shed tier shows as capacity falling.
+    """
+    steps = max(2, int(a.sustain_steps))
+    prompt_n = int(a.sustain_prompt_tokens)
+    if prompt_n + steps + 4 > a.max_context:
+        raise SystemExit(f"{prompt_n} prompt tokens + {steps} decode steps pass --max-context "
+                         f"{a.max_context}")
+    prompt = make_prompt(tokenizer, prompt_n, Path(a.prompt_source))
+    graphs = bool(a.sustain_graphs)
+    engine = _policy_engine(a, cards, 1, graphs=graphs)
+    engine.args.max_context = a.max_context
+    engine.say_ready()
+    physical = _physical_cards()
+    samples: list[dict] = []
+    stop = threading.Event()
+    t_run = time.perf_counter()
+
+    def sampler() -> None:
+        t0 = time.perf_counter()
+        next_temp = 0.0
+        while not stop.wait(max(0.2, float(a.sustain_sample_s))):
+            now = time.perf_counter()
+            st = engine.rt.experts.stats() if hasattr(engine.rt.experts, "stats") else {}
+            row = {"t_s": round(now - t0, 1),
+                   "alloc_gib": _allocated_gib(devices), "peak_gib": _peak_gib(devices),
+                   "tier_resident": int(st.get("expert_slots", 0)),
+                   "tier_capacity": _tier_capacity(engine),
+                   "hits": int(st.get("expert_hits", 0)), "misses": int(st.get("expert_misses", 0)),
+                   "oom_skips": int(st.get("oom_skips", 0)), "temp_c": None}
+            if now - next_temp >= max(1.0, float(a.sustain_temp_s)):
+                row["temp_c"] = _temp_c(physical)
+                next_temp = now
+            samples.append(row)
+
+    io0 = _io_counters()
+    thread = None
+    try:
+        thread = threading.Thread(target=sampler, name="sustain-sampler", daemon=True)
+        thread.start()
+        r = serve_serial(engine, [prompt], steps, "sustained", devices, with_times=True)
+        io1 = _io_counters()
+        # read the capture count *before* the shutdown tears the domain down (a replayed run after a
+        # teardown has no `_decode_graphs` left to read, which is how this came back null once)
+        captured = getattr(getattr(engine.rt.model, "_decode_graphs", None), "captured", None)
+        graphs_live = engine.graphs_live() if hasattr(engine, "graphs_live") else None
+    finally:
+        stop.set()
+        if thread is not None:
+            thread.join(10)
+        engine.stop_workers()
+        engine.shutdown()
+
+    times = (r.get("t_tokens_s") or [[0.0]])[0]
+    tokens = (r.get("t_tokens") or [[]])[0]
+    intervals = [(times[i] - times[i - 1]) * 1000.0 for i in range(1, len(times))]
+    stats_iv = _ms_stats(intervals)
+    first, last = (samples[0] if samples else {}), (samples[-1] if samples else {})
+    peaks = {}
+    for d in devices:
+        try:
+            peaks[str(d)] = round(torch.npu.max_memory_allocated(int(str(d).split(":")[-1])) / GIB, 2)
+        except Exception:                                      # noqa: BLE001
+            peaks[str(d)] = None
+    temps = [v for s in samples if s.get("temp_c") for v in s["temp_c"].values() if v is not None]
+    alloc_series = {}
+    for d in devices:
+        vals = [s["alloc_gib"].get(str(d)) for s in samples if s.get("alloc_gib")]
+        vals = [v for v in vals if v is not None]
+        if vals:
+            alloc_series[str(d)] = {"first_gib": vals[0], "last_gib": vals[-1],
+                                    "min_gib": min(vals), "max_gib": max(vals)}
+    tier_first, tier_last = first.get("tier_capacity"), last.get("tier_capacity")
+    hits = (last.get("hits", 0) - first.get("hits", 0)) if samples else 0
+    misses = (last.get("misses", 0) - first.get("misses", 0)) if samples else 0
+    summary = {
+        "scenario": "sustained", "cards": cards, "device": a.device, "graphs": graphs,
+        "prompt_tokens": len(prompt), "steps_requested": steps,
+        "steps_decoded": len(tokens), "gen_tokens": len(tokens),
+        "ttft_s": r.get("ttft_s"),
+        "decode_s": (r.get("per_request") or [{}])[0].get("decode_s"),
+        "decode_tok_s": r.get("decode_tok_s"),
+        "finish": (r.get("per_request") or [{}])[0].get("finish"),
+        "graph_captures": captured, "graphs_live_at_end": graphs_live,
+        "ms_per_token": stats_iv,
+        "tokens": tokens,
+        "t_tokens_s": [round(t, 3) for t in times],
+        "hbm": {"peak_allocator_gib": peaks, "allocated_series": alloc_series,
+                "tier_resident_first": first.get("tier_resident"),
+                "tier_resident_last": last.get("tier_resident"),
+                "tier_capacity_first": tier_first, "tier_capacity_last": tier_last,
+                "oom_skips_first": first.get("oom_skips"), "oom_skips_last": last.get("oom_skips")},
+        "tier": {"hits": hits, "misses": misses,
+                 "hit_rate": round(hits / (hits + misses), 4) if (hits + misses) else None,
+                 "samples": len(samples)},
+        "temperature_c": {"first": temps[0] if temps else None, "last": temps[-1] if temps else None,
+                          "min": min(temps) if temps else None, "max": max(temps) if temps else None},
+        "sampler": {"every_s": float(a.sustain_sample_s), "rows": len(samples),
+                    "physical_cards": physical},
+        "samples": samples,            # the whole series: HBM, tier resident/capacity, hits, temperature
+        "io": _io_delta(io0, io1),
+        "wall_s": round(time.perf_counter() - t_run, 1),
+    }
+    print("\nsustained: " + json.dumps({k: v for k, v in summary.items()
+                                        if k not in ("tokens", "t_tokens_s")}, indent=1), flush=True)
+    print("  ms/token per window: " + "  ".join(f"{w['from_step']}-{w['to_step']}:{w['median_ms']}"
+                                                for w in stats_iv.get("windows", [])), flush=True)
+    rec.add({**summary, "note": "one conversation, one prompt; every T line time-stamped"})
+    return summary
+
+
 # --------------------------------------------------------------------------- main
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -945,6 +1328,30 @@ def main() -> int:
                     help="the shared prompt prefix in the --serve-prefix arms (default 2000)")
     ap.add_argument("--prefix-tail-tokens", type=int, default=8,
                     help="the different suffix of the reused/scratch arm in --serve-prefix (default 8)")
+    ap.add_argument("--serve-multiturn", action="store_true",
+                    help="run ONLY a multi-turn conversation with prefix reuse on every turn: each turn "
+                         "re-sends the whole history plus a new suffix, and every turn is then re-run as a "
+                         "from-scratch prefill for a token-for-token comparison")
+    ap.add_argument("--turns", type=int, default=10, help="turns in --serve-multiturn (default 10)")
+    ap.add_argument("--turn-base-tokens", type=int, default=400,
+                    help="the document prefix every turn's prompt starts with (default 400)")
+    ap.add_argument("--turn-suffix-tokens", type=int, default=80,
+                    help="the new user text a turn appends after the held conversation (default 80)")
+    ap.add_argument("--multiturn-scratch", choices=["all", "final", "none"], default="all",
+                    help="which turns are re-run from scratch: all (default), the last one, or none")
+    ap.add_argument("--serve-sustained", action="store_true",
+                    help="run ONLY a sustained decode: --sustain-steps tokens from one prompt, every token "
+                         "time-stamped, with HBM/tier/temperature sampled while it runs")
+    ap.add_argument("--sustain-steps", type=int, default=220,
+                    help="decode steps in --serve-sustained (default 220)")
+    ap.add_argument("--sustain-prompt-tokens", type=int, default=1024,
+                    help="the prompt --serve-sustained decodes from (default 1024)")
+    ap.add_argument("--sustain-graphs", action="store_true",
+                    help="let the sustained conversation take the graph lease (the shipped fast path)")
+    ap.add_argument("--sustain-sample-s", type=float, default=2.0,
+                    help="how often the sampler records HBM and the tier (default 2 s)")
+    ap.add_argument("--sustain-temp-s", type=float, default=10.0,
+                    help="how often the sampler reads the cards' temperature (default 10 s)")
     ap.add_argument("--parallel", type=int, default=4,
                     help="serve_engine --parallel for the after arms (default 4)")
     ap.add_argument("--parallel-streams", action="store_true",
@@ -976,7 +1383,7 @@ def main() -> int:
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(a.tokenizer)
     src = Path(a.prompt_source)
-    if a.serve_policy or a.serve_prefix:
+    if a.serve_policy or a.serve_prefix or a.serve_multiturn or a.serve_sustained:
         rec = Recorder(a.jsonl)
         t_run = time.perf_counter()
         if a.serve_policy:
@@ -984,12 +1391,24 @@ def main() -> int:
             serve_policy(a, tok, rec, devices, cards)
         if a.serve_prefix:
             serve_prefix(a, tok, rec, devices, cards)
+        if a.serve_multiturn:
+            serve_multiturn(a, tok, rec, devices, cards)
+        if a.serve_sustained:
+            serve_sustained(a, tok, rec, devices, cards)
         total_s = time.perf_counter() - t_run
+        modes = [name for name, on in (("serve-policy", a.serve_policy),
+                                       ("serve-prefix", a.serve_prefix),
+                                       ("serve-multiturn", a.serve_multiturn),
+                                       ("serve-sustained", a.serve_sustained)) if on]
         summary = {"run_s": round(total_s, 1), "cards": cards, "visible": visible, "device": a.device,
-                   "mode": "serve-policy" if a.serve_policy else "serve-prefix",
+                   "mode": "+".join(modes),
                    "parallel": a.parallel, "max_context": a.max_context,
                    "prompt_tokens": a.prompt_tokens, "serve_gen": a.serve_gen,
                    "prefix_shared_tokens": a.prefix_shared_tokens,
+                   "turns": a.turns, "turn_base_tokens": a.turn_base_tokens,
+                   "turn_suffix_tokens": a.turn_suffix_tokens,
+                   "sustain_steps": a.sustain_steps, "sustain_prompt_tokens": a.sustain_prompt_tokens,
+                   "sustain_graphs": a.sustain_graphs,
                    "expert_reserve_gib": a.expert_reserve_gib, "scenarios": len(rec.records)}
         print(f"\ntotal wall: {total_s / 60:.1f} min; {len(rec.records)} scenarios", flush=True)
         if a.out:
