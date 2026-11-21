@@ -874,7 +874,14 @@ held ten layers' experts (§9, §14).  That is the right shape for *four convers
 path sharded 4 ways (TP) and the routed experts split by expert (EP) - and it starts with the number that
 decides it, which nothing in the repo had measured.
 
-### 18.1 The wire: 20.7 GB/s, and 250 us per cross-card copy whatever its size
+> **This section is provisional, and its headline conclusion is not established.**  `npu-smi info -t topo`
+> reports **HCCS between every pair of NPUs** on this host - it is not PCIe.  A `copy_` at 20.7 GB/s with a
+> fixed ~250 us per transfer is the signature of a **host-staged copy** (D2H then H2D), not a peer-to-peer
+> transfer, so §18.1 most likely measured the wrong path and the tensor-parallel verdict that rests on it has
+> to be re-derived.  The re-measurement is in flight; treat everything below as the record of an experiment
+> whose bandwidth input was wrong rather than as a conclusion about the hardware.
+
+### 18.1 The wire, as measured: 20.7 GB/s, and 250 us per cross-card copy whatever its size
 
 `ascend/bench_hccs.py` measures a `copy_` between cards on this box (`0-3`), both directions, at six sizes,
 and two hand-rolled all-reduces (sum on rank 0 then broadcast = `root`; every rank pulls every peer =
