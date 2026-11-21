@@ -871,10 +871,12 @@ def serve_prefix(a, tokenizer, rec: Recorder, devices, cards) -> dict:
         rec.add(results["reused"] | {"cards": cards, "device": a.device,
                                      "note": "same shared prefix, a different suffix: only the suffix is read"})
         engine.args.prefix_reuse = False
+        engine._prefix_reuse = False       # the request path reads the engine's flag, not args
         results["scratch"] = serve_serial(engine, [prompt_b], gen, "prefix-scratch", devices)
         rec.add(results["scratch"] | {"cards": cards, "device": a.device,
                                       "note": "the same prompt with reuse off: a full re-prefill"})
         engine.args.prefix_reuse = True
+        engine._prefix_reuse = True
     finally:
         engine.stop_workers()
         engine.shutdown()
