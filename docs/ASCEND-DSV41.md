@@ -312,6 +312,15 @@ machine holding still.
 
 ## 9. The other three cards: the expert tier, not the layers
 
+**What the four cards were for, and what they turned out to be good for.**  The intent was tensor and expert
+parallelism for a *single* instance - one request's work spread across four cards.  That was built and
+measured in §18, and on this node it loses by 5x: inter-card copies run at **20.7 GB/s with a fixed ~250 us a
+copy** (PCIe-class, not the 392 GB/s HCCS the design assumed), a 20 KB four-card all-reduce costs **1.50 ms**,
+and two per layer over 40 layers is 117 ms of collectives in a 409.6 ms step.  So the four cards are used as
+**expert capacity and cross-layer fetch parallelism**, which is what this section describes, and not as a
+tensor-parallel group.  §18 has the numbers and the parity failure; the code is behind `tp_size` (default 1)
+for hardware that really has HCCS.
+
 The first question was which part of the model to split, and the measurement answered it: **the expert tier
 is what needs room, and the layers need very little.**  Spreading the *layers* would have meant replicating
 the shared caches across the new card boundaries (layer 20's compressed KV is read by layers 21-39, which do
