@@ -40,6 +40,14 @@ build, the same prompts, all on the cards given):
   waits in the engine's queue.
 * ``isolation``        - the same prompts alone against together, token for token.
 
+``--serve-policy`` measures the ``--graphs`` x ``--parallel`` composition on one engine build and tier:
+``policy-eager-*`` is the pre-change path (graphs forced off), ``policy-graphs-lone`` the graph lease on a
+single live conversation, ``policy-graphs-two`` the revoke when a second conversation arrives, and
+``policy-graphs-lone-again`` the re-capture after the burst.  ``--serve-prefix`` measures prefix reuse: a
+long shared prefix is seeded by one request, resumed by a second with a different suffix (its TTFT), and
+the same prompt with reuse off gives both the re-prefill baseline and the token stream the reused arm must
+match exactly.
+
 Four concurrent one-forward 2 000-token prefills on one card need a larger ``--serve-expert-reserve-gib``
 than the engine's 6.0 (each forward's activation high-water is ~2.7 GiB); the default here is 13.0.
 
@@ -458,6 +466,9 @@ class ServeCollector:
                 dones = [l for _, l in self.items if l.startswith("DONE ")]
                 if len(dones) >= n:
                     return dones
+                errs = [l for _, l in self.items if l.startswith("ERR ")]
+                if errs:
+                    raise RuntimeError(f"the engine refused a request: {errs[-1]}")
                 left = end - time.perf_counter()
                 if left <= 0:
                     raise TimeoutError(f"{n} DONE line(s) did not arrive; saw {[l for _, l in self.items[-8:]]}")
@@ -502,7 +513,8 @@ def _serve_rec(label: str, mode: str, collector: ServeCollector, submits: dict[i
                     "end_s": round(done[0] - submits[rid], 3) if done[0] is not None else None,
                     "finish": f[5 + b] if len(f) > 5 + b else None,
                     "prompt_ms": float(f[3 + b]) if len(f) > 3 + b else None,
-                    "decode_ms": float(f[4 + b]) if len(f) > 4 + b else None})
+                    "decode_ms": float(f[4 + b]) if len(f) > 4 + b else None,
+                    "reused": int(f[8 + b]) if len(f) > 8 + b and f[8 + b].isdigit() else None})
     ttfts = [r["ttft_s"] for r in per if r["ttft_s"] is not None]
     firsts = [r["ttft_s"] for r in per if r["ttft_s"] is not None]        # relative to each submit
     total_tokens = sum(len(r["tokens"]) for r in per)
@@ -538,8 +550,14 @@ def _serve_rec(label: str, mode: str, collector: ServeCollector, submits: dict[i
     }
 
 
-def serve_parallel(engine, prompts: list[list[int]], gen: int, label: str, devices) -> dict:
-    """N requests submitted at once to the `--parallel` engine (the after arm): one State and stream each."""
+def serve_parallel(engine, prompts: list[list[int]], gen: int, label: str, devices,
+                   timeout: float = 3600, stagger: bool = False) -> dict:
+    """N requests submitted to the `--parallel` engine (the after arm): one State and stream each.
+
+    ``stagger`` submits the second request only after the first's first token: that is what makes it a
+    *second* live conversation (a second admission) rather than two requests racing the scheduler's
+    admission loop, and it is the shape the graph-lease revoke is specified for.
+    """
     collector = ServeCollector()
     engine.emit = collector
     before = _tier(engine.rt)
@@ -547,10 +565,22 @@ def serve_parallel(engine, prompts: list[list[int]], gen: int, label: str, devic
     submits: dict[int, float] = {}
     t0 = time.perf_counter()
     for rid, ids in enumerate(prompts, 1):
+        if stagger and rid == 2:
+            # A second conversation is admitted once the first has answered AND, when graphs are in use,
+            # has actually captured its decoded step - otherwise the revoke would have no domain to
+            # release and the arm would not measure the policy's cost.
+            end = time.perf_counter() + 120
+            while time.perf_counter() < end:
+                answered = any(l.startswith("T 1 ") for _, l in collector.snapshot())
+                captured = (not engine._graphs_wanted
+                            or getattr(engine.rt.model, "_decode_graphs", None) is not None)
+                if answered and captured:
+                    break
+                time.sleep(0.01)
         submits[rid] = time.perf_counter()
         engine.submit(f"GEN {gen} rid={rid} " + ",".join(str(int(t)) for t in ids))
     try:
-        collector.wait_done(len(prompts), timeout=3600)
+        collector.wait_done(len(prompts), timeout=timeout)
         wall = time.perf_counter() - t0
     finally:
         engine.wait_idle(timeout=3600)
@@ -688,6 +718,188 @@ def serve_compare(a, tokenizer, rec: Recorder, devices, cards) -> None:
     rec.add({"scenario": "isolation", "cards": cards, "device": a.device, "wall_s": 0.0, **isolation})
 
 
+# --------------------------------------------------------------------------- 8: graphs x parallel
+def _policy_engine(a, cards, n: int, graphs: bool):
+    """One serve engine for the policy arms: the tier and the landing-zone reserve are built once."""
+    from . import serve_engine
+
+    ns = argparse.Namespace(
+        model=a.model, tokenizer=a.tokenizer, device=a.device, dtype="bfloat16",
+        hbm_share=a.hbm_share, expert_slots=None, io_threads=a.io_threads,
+        expert_batch=a.expert_batch, expert_reserve_gib=a.expert_reserve_gib,
+        expert_devices=",".join(cards), engram_tokenizer="", verbose=False,
+        max_context=a.max_context, prefill_chunk=0,
+        serve=True, graphs=graphs, graph_verify=False, graph_max_conversations=1, parallel=n,
+        parallel_streams=getattr(a, "parallel_streams", False), prefix_reuse=True)
+    engine = serve_engine.Engine(ns)
+    print(f"policy engine: tier {engine.rt.expert_slots} slots, "
+          f"{engine.rt.weights.resident_bytes() / GIB:.2f} GiB resident, graphs "
+          f"{'built' if graphs else 'off'}", flush=True)
+    engine.say_ready()
+    return engine
+
+
+def serve_policy(a, tokenizer, rec: Recorder, devices, cards) -> dict:
+    """The composition policy, measured before and after on two engines with the same warm-up.
+
+    The before engine is built with ``graphs=False`` (the pre-change build, with the extra 1 GiB the graph
+    reserve would take left in the expert tier); the after engine with ``graphs=True``.  Both are driven
+    the same way and with distinct prompts, so no arm inherits a prefix (which would hide the prefill):
+
+    * ``policy-eager-lone``   - one live conversation, eager (the pre-change ``--parallel N --graphs`` path).
+    * ``policy-graphs-lone``  - the lease: one live conversation captures and replays its decode.
+    * ``policy-eager-two``    - two conversations: the first decodes, the second is submitted after its
+      first token (staggered, not at once).
+    * ``policy-graphs-two``   - the same stagger: the second admission revokes the lease, both go eager.
+    * ``policy-graphs-lone-again`` - after the burst the lease re-arms and the lone conversation captures.
+
+    The lone arms' token streams must match (the captured decode changes no token).
+    """
+    n = max(2, a.parallel)
+    gen = max(8, a.serve_gen)
+    base = make_prompt(tokenizer, 640, Path(a.prompt_source))
+    warm = base[512:516]
+    lone_prompt = base[0:8]
+    two_prompts = [base[64:72], base[128:136]]
+    again_prompt = base[192:200]
+    results: dict[str, dict] = {}
+
+    def run(label: str, graphs: bool, stagger: bool, prompts: list[list[int]]) -> dict | None:
+        engine = _policy_engine(a, cards, n, graphs=graphs)
+        try:
+            engine.start_workers()
+            # The warm-up request must not take the graph lease: it leaves a conversation on slot 0, and the
+            # measured prompt then diverges from it - a lease would be released and the measured arm would
+            # run eagerly.  Warm the tier with the captured path disabled, then enable it for the arm.
+            if graphs:
+                engine._graphs_wanted = False
+                engine.rt.model.graphs = False
+            serve_parallel(engine, [warm], 2, f"{label}-warm", devices, timeout=900)   # tier warm, discarded
+            if graphs:
+                engine._graphs_wanted = True
+                engine.rt.model.graphs = True
+            r = serve_parallel(engine, prompts, gen, label, devices, timeout=900, stagger=stagger)
+            r.pop("tier", None)                    # tier deltas are per engine build; the warm-up spans them
+            r["graphs_build"] = graphs
+            r["staggered"] = stagger
+            r["note"] = ("one live conversation, captured decode" if graphs
+                         else "one live conversation, eager (the pre-change path)") if len(prompts) == 1 else \
+                        ("two conversations, second admitted after the first's first token; the lease is "
+                         "revoked" if graphs else
+                         "two conversations, second admitted after the first's first token; eager throughout")
+            rec.add(r | {"cards": cards, "device": a.device})
+            return r
+        except Exception:                                              # noqa: BLE001 - report, go on
+            err = traceback.format_exc()
+            print(f"{label} failed:\n{err}", flush=True)
+            rec.add({"scenario": label, "error": err, "cards": cards, "device": a.device})
+            return None
+        finally:
+            engine.stop_workers()
+            engine.shutdown()
+
+    results["eager-lone"] = run("policy-eager-lone", graphs=False, stagger=False, prompts=[lone_prompt])
+    results["graphs-lone"] = run("policy-graphs-lone", graphs=True, stagger=False, prompts=[lone_prompt])
+    results["eager-two"] = run("policy-eager-two", graphs=False, stagger=True, prompts=two_prompts)
+    results["graphs-two"] = run("policy-graphs-two", graphs=True, stagger=True, prompts=two_prompts)
+    results["graphs-lone-again"] = run("policy-graphs-lone-again", graphs=True, stagger=False,
+                                       prompts=[again_prompt])
+    lone, eager = results.get("graphs-lone"), results.get("eager-lone")
+    two, two_eager = results.get("graphs-two"), results.get("eager-two")
+    streams = {}
+    for key in ("eager-lone", "graphs-lone", "eager-two", "graphs-two"):
+        streams[key] = (results.get(key) or {}).get("token_streams")
+    summary = {
+        "lone_graphs_decode_tok_s": lone and lone.get("decode_tok_s"),
+        "lone_eager_decode_tok_s": eager and eager.get("decode_tok_s"),
+        "lone_ratio": (round(lone["decode_tok_s"] / eager["decode_tok_s"], 3)
+                       if lone and eager and eager.get("decode_tok_s") else None),
+        "lone_graphs_ttft_s": lone and lone.get("ttft_s"),
+        "lone_eager_ttft_s": eager and eager.get("ttft_s"),
+        "two_graphs_wall_tok_s": two and two.get("wall_tok_s"),
+        "two_eager_wall_tok_s": two_eager and two_eager.get("wall_tok_s"),
+        "two_ratio": (round(two["wall_tok_s"] / two_eager["wall_tok_s"], 3)
+                      if two and two_eager and two_eager.get("wall_tok_s") else None),
+        "two_graphs_second_ttft_s": two and (two.get("ttft_s_list") or [None, None])[1],
+        "two_eager_second_ttft_s": two_eager and (two_eager.get("ttft_s_list") or [None, None])[1],
+        "lone_again_decode_tok_s": (results.get("graphs-lone-again") or {}).get("decode_tok_s"),
+        "lone_tokens_identical": streams["eager-lone"] == streams["graphs-lone"],
+        "two_tokens_identical": streams["eager-two"] == streams["graphs-two"],
+    }
+    print("\npolicy summary:", json.dumps(summary), flush=True)
+    rec.add({"scenario": "policy-summary", "cards": cards, "device": a.device, "wall_s": 0.0, **summary})
+    return summary
+
+
+# --------------------------------------------------------------------------- 9: prefix reuse
+def serve_prefix(a, tokenizer, rec: Recorder, devices, cards) -> dict:
+    """Prefix reuse across two conversations sharing a long prompt prefix.
+
+    Arms, one engine, one tier:
+
+    * ``prefix-seed``   - the shared prefix arrives with one suffix; its KV is what the next request finds.
+    * ``prefix-reused`` - the same shared prefix with a different suffix: only the suffix is read.  This is
+      the TTFT the reuse buys.
+    * ``prefix-scratch`` - the same prompt as ``prefix-reused`` with reuse off: a full re-prefill.  Its
+      tokens are the correctness bar the reused arm must match.
+    """
+    src = Path(a.prompt_source)
+    shared_n = int(a.prefix_shared_tokens)
+    tail_n = int(a.prefix_tail_tokens)
+    span = shared_n + 4 * (tail_n + 16) + 8
+    base = make_prompt(tokenizer, span, src)
+    shared = base[:shared_n]
+    # The seed's prompt is longer than the resumed one on purpose: a scratch prefill of the seeded prompt
+    # and one of the resumed prompt do not end on the same ATTN_BLOCK boundary, so the prefix's last block
+    # is computed with a different shape.  That is the numerical case a reused prefix has to survive.
+    tail_a = base[shared_n:shared_n + tail_n + 16]
+    tail_b = base[shared_n + tail_n + 16:shared_n + 2 * tail_n + 16]
+    prompt_a = shared + tail_a
+    prompt_b = shared + tail_b
+    if prompt_a[:shared_n] != shared or prompt_b[:shared_n] != shared:
+        raise SystemExit("the prefix arms did not get a shared prefix")
+    engine = _policy_engine(a, cards, 1, graphs=False)
+    engine.args.max_context = a.max_context
+    engine.args.prefix_reuse = True
+    gen = max(4, a.serve_gen)
+    results: dict[str, dict] = {}
+    try:
+        results["seed"] = serve_serial(engine, [prompt_a], gen, "prefix-seed", devices)
+        rec.add(results["seed"] | {"cards": cards, "device": a.device,
+                                   "note": f"{shared_n}-token shared prefix + {len(tail_a)}-token suffix"})
+        results["reused"] = serve_serial(engine, [prompt_b], gen, "prefix-reused", devices)
+        rec.add(results["reused"] | {"cards": cards, "device": a.device,
+                                     "note": "same shared prefix, a different suffix: only the suffix is read"})
+        engine.args.prefix_reuse = False
+        results["scratch"] = serve_serial(engine, [prompt_b], gen, "prefix-scratch", devices)
+        rec.add(results["scratch"] | {"cards": cards, "device": a.device,
+                                      "note": "the same prompt with reuse off: a full re-prefill"})
+        engine.args.prefix_reuse = True
+    finally:
+        engine.stop_workers()
+        engine.shutdown()
+    reused, scratch = results.get("reused"), results.get("scratch")
+    reused_tokens = (reused or {}).get("token_streams") or [[]]
+    scratch_tokens = (scratch or {}).get("token_streams") or [[]]
+    per = (reused or {}).get("per_request") or [{}]
+    reused_n = per[0].get("reused")
+    summary = {
+        "shared_tokens": shared_n, "suffix_tokens": len(tail_b), "gen": gen,
+        "reused_ttft_s": (reused or {}).get("ttft_s"),
+        "scratch_ttft_s": (scratch or {}).get("ttft_s"),
+        "seed_ttft_s": (results.get("seed") or {}).get("ttft_s"),
+        "ttft_ratio": (round(scratch["ttft_s"] / reused["ttft_s"], 2)
+                       if reused and scratch and reused.get("ttft_s") and scratch.get("ttft_s") else None),
+        "reused_tokens_reported": reused_n,
+        "tokens_identical": reused_tokens == scratch_tokens,
+        "reused_stream": reused_tokens[0], "scratch_stream": scratch_tokens[0],
+        "reused_prompt_ms": per[0].get("prompt_ms"),
+    }
+    print("\nprefix summary:", json.dumps(summary), flush=True)
+    rec.add({"scenario": "prefix-summary", "cards": cards, "device": a.device, "wall_s": 0.0, **summary})
+    return summary
+
+
 # --------------------------------------------------------------------------- main
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -719,6 +931,18 @@ def main() -> int:
                     help="run ONLY the before/after serve measurement: the old serial serve path and 4-thread "
                          "drive against --parallel conversations, at 4 x 2 000 tokens and 4 x short prompts, "
                          "plus the isolation check.  Builds a serve_engine.Engine instead of a bare runtime.")
+    ap.add_argument("--serve-policy", action="store_true",
+                    help="run ONLY the graphs x parallel composition measurement: the pre-change eager path, "
+                         "the lone-conversation graph lease, the two-conversation revoke, and the re-arm, all "
+                         "on one engine build and tier")
+    ap.add_argument("--serve-prefix", action="store_true",
+                    help="run ONLY the prefix-reuse measurement: a long shared prefix with one suffix seeds "
+                         "it, a second request with a different suffix resumes from it, and the same prompt "
+                         "with reuse off is the re-prefill baseline whose tokens the reused arm must match")
+    ap.add_argument("--prefix-shared-tokens", type=int, default=2000,
+                    help="the shared prompt prefix in the --serve-prefix arms (default 2000)")
+    ap.add_argument("--prefix-tail-tokens", type=int, default=8,
+                    help="the different suffix of the reused/scratch arm in --serve-prefix (default 8)")
     ap.add_argument("--parallel", type=int, default=4,
                     help="serve_engine --parallel for the after arms (default 4)")
     ap.add_argument("--parallel-streams", action="store_true",
@@ -750,6 +974,28 @@ def main() -> int:
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(a.tokenizer)
     src = Path(a.prompt_source)
+    if a.serve_policy or a.serve_prefix:
+        rec = Recorder(a.jsonl)
+        t_run = time.perf_counter()
+        if a.serve_policy:
+            a.expert_reserve_gib = a.serve_short_reserve_gib      # short prompts: the engine's usual tier
+            serve_policy(a, tok, rec, devices, cards)
+        if a.serve_prefix:
+            serve_prefix(a, tok, rec, devices, cards)
+        total_s = time.perf_counter() - t_run
+        summary = {"run_s": round(total_s, 1), "cards": cards, "visible": visible, "device": a.device,
+                   "mode": "serve-policy" if a.serve_policy else "serve-prefix",
+                   "parallel": a.parallel, "max_context": a.max_context,
+                   "prompt_tokens": a.prompt_tokens, "serve_gen": a.serve_gen,
+                   "prefix_shared_tokens": a.prefix_shared_tokens,
+                   "expert_reserve_gib": a.expert_reserve_gib, "scenarios": len(rec.records)}
+        print(f"\ntotal wall: {total_s / 60:.1f} min; {len(rec.records)} scenarios", flush=True)
+        if a.out:
+            Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+            Path(a.out).write_text(json.dumps({"summary": summary, "records": rec.records}, indent=1))
+            print(f"report: {a.out}", flush=True)
+        print("summary:", json.dumps(summary), flush=True)
+        return 0
     if a.serve_compare:
         rec = Recorder(a.jsonl)
         t_run = time.perf_counter()

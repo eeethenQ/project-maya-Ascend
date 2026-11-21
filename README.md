@@ -411,22 +411,35 @@ python3 -m ascend.run_dsv41 --model /mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-10
 with the spread tier, because each layer's `g_post` is captured on the card its experts live on. The serve
 engine (`ascend/strata-ascend`) takes the same `--graphs` (and `--graph-verify`): the graphs bake the
 conversation State's buffers, so the server captures them per conversation, keeps them across that
-conversation's turns, and releases them when it ends; the capture cost is reported in the engine log
-(measured: 80 graphs in 1.87-2.06 s on `npu:0`). `--graph-max-conversations` (default 1) is the bound, and
-a teardown that cannot destroy a graph is logged and served eagerly rather than taking the engine down. Add
+conversation's turns and across a rewind to a shared prefix, and releases them when the conversation is
+replaced; the capture cost is reported in the engine log (measured: 80 graphs in 1.87-2.06 s on `npu:0`).
+`--graph-max-conversations` (default 1) is the bound, and a teardown that cannot destroy a graph is logged
+and served eagerly rather than taking the engine down. `--graphs` now composes with `--parallel N` as a
+**lease**: the model holds one graph domain, so one conversation captures while it is the only live one, a
+second conversation revokes the lease (one in-flight step, then both run eagerly), and the lease returns
+when every conversation is idle - so the next lone conversation re-captures (1.8-1.9 s, charged to its
+decode). Grant, revoke and re-arm are all logged; with `--parallel > 1` the effective graph bound is one.
+The serve engine also reuses a **shared prompt prefix**: a request sharing `L` tokens with the conversation
+it lands on is rewound to `L` and reads only its suffix (`DONE`'s `reused` reports `L`), instead of
+re-reading the whole prompt; `--no-prefix-reuse` restores the old path. The tokens are unchanged - the
+tests pin them against a from-scratch prefill - and `docs/ASCEND-DSV41.md` §19 has the design and the
+measurement commands.
+
+Add
 `--engram-tokenizer <the model's tokenizer.json>` to
 enable Engram (it works on the captured path too); `--expert-devices npu:0,npu:1,npu:2,npu:3` spreads the
 tier. The engine sizes the tier from the HBM actually left after the resident weights, less a reserve;
 `--expert-slots` overrides it, and a card that runs out of room drops an expert from the tier instead of
 failing the request.
 
-`--prompt-chunk N` reads the prompt in pieces of at most N tokens (default 512, the old `--prefill-chunk`
-name still works; `0` is the whole prompt). Each piece is its own eager forward, and a piece of any length
-routes almost the whole expert set, so every extra piece re-reads it from the array: on `npu:0` a
-2 000-token prompt measured 233.5 s as one forward against 440.0 s as four, and the one-forward case was
-also the lower HBM risk (peak activations 2.7 GiB against 1.9 GiB, inside the `--expert-reserve-gib` 6 GiB).
-For a long prompt, raise it; the trade is that a one-forward prompt prints a single `PP` progress line at
-the end. `--io-threads` (default 6) is the expert fetch's thread count and `--expert-batch` (default 8) is
+`--prompt-chunk N` reads the prompt in pieces of at most N tokens (default **2 048**, changed from 512; the
+old `--prefill-chunk` name still works; `0` is the whole prompt). Each piece is its own eager forward, and a
+piece of any length routes almost the whole expert set, so every extra piece re-reads it from the array: on
+`npu:0` a 2 000-token prompt measured 233.5 s as one forward against 440.0 s as four, and the one-forward
+case was also the lower HBM risk (peak activations 2.7 GiB against 1.9 GiB, inside the
+`--expert-reserve-gib` 6 GiB). 2 048 is one forward for a typical prompt and still fits the reserve at
+4 096, which is why it is the default; `0` is not (an 8 192-token forward's indexer T² tensor alone is
+~4 GiB). The trade is that a one-forward prompt prints a single `PP` progress line at the end. `--io-threads` (default 6) is the expert fetch's thread count and `--expert-batch` (default 8) is
 the pinned ring's capacity and the model's read batch; 32 was measured to give no fetch gain and to cost
 1.6 GiB more peak HBM, so leave the batch at 8 (`docs/ASCEND-DSV41.md` §15).
 

@@ -302,6 +302,27 @@ class TheConversationGraphLifecycle(unittest.TestCase):
         from ascend import serve_engine
         return serve_engine.Engine(engine_args(self.model.root, **overrides))
 
+    def test_a_rewind_to_a_shared_prefix_keeps_the_captured_graphs(self):
+        """Prefix reuse is a rewind of the same State, so the graph domain (and its capture) survives it.
+
+        The old path dropped and reallocated the State on a diverging prompt, which released the graphs and
+        made the new conversation pay the 1.8-1.9 s capture again.  A rewind keeps the State, so it keeps
+        the graphs.
+        """
+        engine = self.engine()
+        try:
+            quiet_generate(engine, "GEN 2 3,5,7,11,13,17")
+            graphs = engine.rt.model._decode_graphs
+            self.assertIsNotNone(graphs)
+            out, err = quiet_generate(engine, "GEN 1 3,5,7,19,23")   # shares 3 tokens, then diverges
+            self.assertIn("dsv41 prefix: the prompt shares 3", err)
+            self.assertIs(engine.rt.model._decode_graphs, graphs,
+                          "the State was rewound, not replaced: the captured domain is still valid")
+            self.assertNotIn("released", err, "no teardown on a prefix rewind")
+            self.assertEqual(int([l for l in out.splitlines() if l.startswith("DONE ")][0].split()[8]), 3)
+        finally:
+            engine.shutdown()
+
     def test_a_conversation_captures_on_its_first_decode_and_keeps_the_graphs(self):
         engine = self.engine()
         try:
@@ -431,12 +452,13 @@ class ThePromptChunkArguments(unittest.TestCase):
         from ascend import serve_engine
         return serve_engine.build_parser()
 
-    def test_the_default_is_the_old_constant_and_both_names_parse(self):
+    def test_the_default_is_the_measured_one_forward_value_and_both_names_parse(self):
         base = self.parser().parse_args(["--serve", "--model", "/tmp/model"])
-        self.assertEqual(base.prefill_chunk, 512, "the current default, unchanged")
-        new = self.parser().parse_args(["--serve", "--model", "/tmp/model", "--prompt-chunk", "2048"])
+        self.assertEqual(base.prefill_chunk, 2048,
+                         "2048 is one forward for a typical prompt and -47% TTFT against 4 x 512")
+        new = self.parser().parse_args(["--serve", "--model", "/tmp/model", "--prompt-chunk", "4096"])
         old = self.parser().parse_args(["--serve", "--model", "/tmp/model", "--prefill-chunk", "1024"])
-        self.assertEqual(new.prefill_chunk, 2048)
+        self.assertEqual(new.prefill_chunk, 4096)
         self.assertEqual(old.prefill_chunk, 1024, "--prefill-chunk keeps working")
         zero = self.parser().parse_args(["--serve", "--model", "/tmp/model", "--prompt-chunk", "0"])
         self.assertEqual(zero.prefill_chunk, 0, "0 is the one-forward case")
@@ -555,7 +577,7 @@ class TheParallelArguments(unittest.TestCase):
         self.assertEqual(ready, ["READY 64 stop pause"], "a single-conversation engine must not say multi=")
         self.assertNotIn("multi=", err.getvalue())
 
-    def test_multi_is_the_number_the_scheduler_holds_and_the_conflict_is_logged(self):
+    def test_multi_is_the_number_the_scheduler_holds_and_the_lease_is_logged(self):
         from ascend import serve_engine
         from types import SimpleNamespace
 
@@ -572,9 +594,10 @@ class TheParallelArguments(unittest.TestCase):
         finally:
             serve_engine.rt.build = real
         try:
-            self.assertIs(seen["graphs"], False,
-                          "graphs must not reserve a landing zone the multi path cannot use")
-            self.assertTrue(engine._graphs_conflict)
+            self.assertIs(seen["graphs"], True,
+                          "graphs now compose with --parallel under a lease, so the reserve is taken")
+            self.assertTrue(engine._graphs_wanted)
+            self.assertFalse(engine._graphs_conflict, "there is no static conflict to report any more")
         finally:
             engine.shutdown()
 
@@ -587,8 +610,7 @@ class TheParallelArguments(unittest.TestCase):
             finally:
                 engine.shutdown()
         self.assertIn("READY 64 stop pause multi=4", out.getvalue())
-        self.assertIn("graphs: OFF - --graphs was asked for with --parallel 4", err.getvalue(),
-                      "the conflict is stated, not silently resolved")
+        self.assertIn("is a *lease*", err.getvalue(), "the composition is stated, not silently resolved")
         self.assertIn("4 conversations at once", err.getvalue())
 
     def test_parallel_parses(self):
@@ -807,7 +829,301 @@ class TheParallelScheduler(unittest.TestCase):
 
 
 @NEEDS_TORCH
-class ParallelOverTheProtocol(unittest.TestCase):
+class ThePrefixReuse(unittest.TestCase):
+    """A prompt that shares a prefix with a resident conversation resumes from its KV.
+
+    The bar is exact: the tokens a reused conversation produces must be the tokens a conversation that
+    prefilled the same prompt from scratch produces (greedy, same sampling).
+    """
+
+    SHARED = [3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 4, 6, 8, 10, 12, 14]     # 16 tokens
+    A_TAIL = [16, 18, 20, 22]                                              # request A's own suffix
+    B_TAIL = [9, 15, 21, 27, 25, 26]                                       # request B's own suffix
+    A = SHARED + A_TAIL
+    B = SHARED + B_TAIL
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = TinyModel()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model.close()
+
+    def engine(self, **overrides):
+        from ascend import serve_engine
+        base = {"parallel": 1, "graphs": False, "prefill_chunk": 512}
+        base.update(overrides)
+        return serve_engine.Engine(engine_args(self.model.root, **base))
+
+    @staticmethod
+    def tokens(out: str) -> list[int]:
+        return [int(l.split()[1]) for l in out.splitlines() if l.startswith("T ")]
+
+    @staticmethod
+    def done(out: str) -> list[str]:
+        return [l for l in out.splitlines() if l.startswith("DONE ")][0].split()
+
+    def test_a_divergent_prompt_reads_only_its_new_suffix(self):
+        engine = self.engine()
+        try:
+            out_a, _ = quiet_generate(engine, "GEN 4 " + ",".join(str(t) for t in self.A))
+            self.assertIn("DONE 4", out_a)
+            out_b, err_b = quiet_generate(engine, "GEN 6 " + ",".join(str(t) for t in self.B))
+        finally:
+            engine.shutdown()
+        done = self.done(out_b)
+        self.assertEqual(int(done[8]), len(self.SHARED),
+                         "DONE's reused field reports the shared prefix, so the server sees the hit")
+        self.assertIn("dsv41 prefix: the prompt shares 16", err_b, "the reuse is stated in the log")
+        pp = [l for l in out_b.splitlines() if l.startswith("PP ")]
+        self.assertEqual(len(pp), 1, "one eager forward: the 6-token suffix, not the 22-token prompt")
+        self.assertEqual(int(pp[0].split()[2]), 16 + len(self.B_TAIL))
+
+    def test_resumed_tokens_equal_a_scratch_prefill(self):
+        """The correctness bar: same prompt, same greedy tokens, reused or read from token 0."""
+        reused_engine = self.engine()
+        try:
+            quiet_generate(reused_engine, "GEN 4 " + ",".join(str(t) for t in self.A))
+            out_reused, _ = quiet_generate(reused_engine, "GEN 6 " + ",".join(str(t) for t in self.B))
+        finally:
+            reused_engine.shutdown()
+        scratch = self.engine(prefill_chunk=512, prefix_reuse=False)     # a fresh State, token 0
+        try:
+            out_scratch, err = quiet_generate(scratch, "GEN 6 " + ",".join(str(t) for t in self.B))
+        finally:
+            scratch.shutdown()
+        self.assertEqual(int(self.done(out_scratch)[8]), 0, "the control really prefilled from token 0")
+        self.assertNotIn("dsv41 prefix:", err)
+        self.assertEqual(self.tokens(out_reused), self.tokens(out_scratch),
+                         "a resumed-from-prefix conversation must produce the same tokens")
+
+    def test_a_prompt_that_is_a_prefix_of_the_held_conversation_rewinds(self):
+        """A re-sent shorter prompt: the tail is discarded and only the last token is read again."""
+        engine = self.engine()
+        try:
+            quiet_generate(engine, "GEN 4 " + ",".join(str(t) for t in self.A))
+            shorter = self.A[:12]
+            out, _ = quiet_generate(engine, "GEN 2 " + ",".join(str(t) for t in shorter))
+        finally:
+            engine.shutdown()
+        self.assertEqual(int(self.done(out)[8]), len(shorter) - 1,
+                         "everything but the token whose logits are needed was reused")
+        self.assertEqual(len([l for l in out.splitlines() if l.startswith("PP ")]), 1)
+
+    def test_prefix_reuse_can_be_turned_off(self):
+        engine = self.engine(prefix_reuse=False)
+        try:
+            quiet_generate(engine, "GEN 4 " + ",".join(str(t) for t in self.A))
+            out, err = quiet_generate(engine, "GEN 6 " + ",".join(str(t) for t in self.B))
+        finally:
+            engine.shutdown()
+        self.assertEqual(int(self.done(out)[8]), 0, "the flag restores the re-prefill-everything path")
+        self.assertNotIn("dsv41 prefix:", err)
+
+    def test_the_eos_is_not_claimed_by_the_state_it_never_entered(self):
+        """The emitted eos is not fed (the loop breaks first), so it must not be in `held`.
+
+        Otherwise the next turn's prompt - which usually does contain the eos - starts one position early,
+        and a rewind to a shared prefix is off by one.  The resumed turn must equal a fresh prefill.
+        """
+        engine = self.engine()
+        try:
+            engine.sample = lambda *a, **k: 1                 # the first sampled token is the tiny eos
+            out_eos, _ = quiet_generate(engine, "GEN 2 3,5,7")
+            self.assertEqual(self.done(out_eos)[1], "1")
+            self.assertIn("stop", out_eos)
+            self.assertEqual(engine.held, [3, 5, 7], "the emitted eos is not covered by the State")
+            self.assertEqual(engine.state.next_pos, 3, "cursor and held agree")
+            del engine.sample
+            out, _ = quiet_generate(engine, "GEN 2 3,5,7,1,5")   # the next turn carries the eos
+        finally:
+            engine.shutdown()
+        scratch = self.engine()
+        try:
+            out_scratch, _ = quiet_generate(scratch, "GEN 2 3,5,7,1,5")
+        finally:
+            scratch.shutdown()
+        self.assertEqual(self.tokens(out), self.tokens(out_scratch),
+                         "a turn after an eos must match a fresh prefill of the same prompt")
+
+    def test_a_parallel_slot_reuses_the_prefix_of_another_conversation(self):
+        """Cross-conversation reuse: the second request lands on the slot holding its prefix."""
+        engine = self.engine(parallel=2)
+        try:
+            engine.say_ready()
+            lines = []
+            engine.emit = lines.append
+            engine.start_workers()
+            engine.submit("GEN 4 rid=1 " + ",".join(str(t) for t in self.A))
+            self.assertTrue(self.wait_done(lines, 1))
+            engine.submit("GEN 6 rid=2 " + ",".join(str(t) for t in self.B))
+            self.assertTrue(self.wait_done(lines, 2))
+            self.assertTrue(engine.wait_idle(timeout=30))
+        finally:
+            engine.stop_workers()
+            engine.shutdown()
+        done = [l for l in lines if l.startswith("DONE 2 ")][0].split()
+        self.assertEqual(int(done[9]), len(self.SHARED),
+                         "the second conversation resumed from the resident one's KV")
+        self.assertEqual(engine._queued_seen, 0)
+        scratch = self.engine(parallel=1, prefix_reuse=False)
+        try:
+            out_scratch, _ = quiet_generate(scratch, "GEN 6 " + ",".join(str(t) for t in self.B))
+        finally:
+            scratch.shutdown()
+        self.assertEqual([int(l.split()[2]) for l in lines if l.startswith("T 2 ")],
+                         self.tokens(out_scratch), "the parallel reuse is exact too")
+
+    @staticmethod
+    def wait_done(lines, n: int, timeout: float = 60.0) -> bool:
+        end = time.time() + timeout
+        while time.time() < end:
+            if len([l for l in lines if l.startswith("DONE ")]) >= n:
+                return True
+            time.sleep(0.01)
+        raise AssertionError(f"{n} DONE line(s) did not arrive; saw {lines[-12:]}")
+
+
+@NEEDS_TORCH
+class TheGraphsParallelLease(unittest.TestCase):
+    """`--graphs --parallel N`: one conversation holds the graph lease, a second revokes it, idle re-arms."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = TinyModel()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model.close()
+
+    def engine(self, **overrides):
+        from ascend import serve_engine
+        base = {"parallel": 2, "graphs": True}
+        base.update(overrides)
+        return serve_engine.Engine(engine_args(self.model.root, **base))
+
+    @staticmethod
+    def collector(engine):
+        lines: list[str] = []
+        engine.emit = lines.append
+        return lines
+
+    @staticmethod
+    def wait_done(lines, n: int, timeout: float = 60.0) -> list[str]:
+        end = time.time() + timeout
+        while time.time() < end:
+            dones = [l for l in lines if l.startswith("DONE ")]
+            if len(dones) >= n:
+                return dones
+            time.sleep(0.01)
+        raise AssertionError(f"{n} DONE line(s) did not arrive; saw {lines[-12:]}")
+
+    def test_the_flags_compose_and_the_engine_reserves_the_graph_landing_zone(self):
+        """The old path forced graphs off; now the lease means graphs can be built and used."""
+        from ascend import serve_engine
+        from types import SimpleNamespace
+
+        seen: dict = {}
+        real = serve_engine.rt.build
+
+        def fake(**kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(cfg=SimpleNamespace(num_hidden_layers=4))
+
+        try:
+            serve_engine.rt.build = fake
+            engine = serve_engine.Engine(engine_args(Path("/tmp/not-loaded"), parallel=4, graphs=True))
+        finally:
+            serve_engine.rt.build = real
+        try:
+            self.assertIs(seen["graphs"], True,
+                          "the multi path now uses the captured decode under a lease, so it reserves it")
+            self.assertTrue(engine._graphs_wanted)
+            self.assertFalse(engine._graphs_conflict, "there is no static conflict to report any more")
+        finally:
+            engine.shutdown()
+
+        with TinyModel() as model:
+            engine = serve_engine.Engine(engine_args(model.root, parallel=4, graphs=True,
+                                                     graph_max_conversations=3))
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    engine.say_ready()
+            finally:
+                engine.shutdown()
+        self.assertIn("READY 64 stop pause multi=4", out.getvalue())
+        self.assertIn("is a *lease*", err.getvalue(), "the composition policy is stated at start")
+        self.assertIn("effective bound 1", err.getvalue())
+        self.assertIn("--graph-max-conversations 3 cannot be honoured", err.getvalue(),
+                      "a bound that cannot be honoured is called out")
+
+    def test_one_conversation_leases_a_second_revokes_and_idle_rearms(self):
+        """One conversation captures; admitting a second revokes, both run eagerly, idle re-arms."""
+        engine = self.engine()
+        real_sample = engine.sample
+
+        def slow_sample(*a, **kw):
+            time.sleep(0.05)                       # give the second request time to arrive mid-decode
+            return real_sample(*a, **kw)
+
+        engine.sample = slow_sample
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                engine.say_ready()
+                lines = self.collector(engine)
+                engine.start_workers()
+                engine.submit("GEN 12 rid=1 3,5,7")
+                end = time.time() + 20
+                while not any(l.startswith("T 1 ") for l in lines) and time.time() < end:
+                    time.sleep(0.01)               # the lease is granted before the first T
+                self.assertIsNotNone(engine.rt.model._decode_graphs,
+                                     "the lone conversation captured its decode (the lease was granted)")
+                self.assertEqual(engine.graphs_live(), 1)
+                engine.submit("GEN 12 rid=2 11,13,17")      # request 1 is still decoding: a second slot
+                self.wait_done(lines, 2)
+                self.assertTrue(engine.wait_idle(timeout=30))
+                first = [l for l in lines if l.startswith("DONE 1 ")][0].split()
+        finally:
+            engine.stop_workers()
+        log, graphs = err.getvalue(), engine.rt.model.graphs
+        held = engine.rt.model._decode_graphs
+        engine.shutdown()
+        self.assertGreaterEqual(int(first[1]), 1)
+        self.assertIn("lease granted", log)
+        self.assertIn("lease revoked", log, "the second conversation took the graph domain back")
+        self.assertIn("every conversation is idle again", log, "the lease is available again afterwards")
+        self.assertIsNone(held, "the revoked domain was released")
+        self.assertTrue(graphs, "the engine re-armed the captured path when idle")
+
+    def test_a_lone_conversation_after_a_burst_captures_again(self):
+        engine = self.engine()
+        try:
+            engine.say_ready()
+            lines = self.collector(engine)
+            engine.start_workers()
+            engine.submit("GEN 2 rid=1 3,5,7")
+            self.wait_done(lines, 1)
+            self.assertTrue(engine.wait_idle(timeout=10))
+            self.assertIsNotNone(engine.rt.model._decode_graphs)
+            engine.submit("GEN 2 rid=2 11,13,17")
+            self.wait_done(lines, 2)
+            self.assertTrue(engine.wait_idle(timeout=10))
+            # the second request may have landed on the same slot (a different conversation there
+            # re-captures) or another one (a revoke); either way the next lone conversation captures.
+            engine.submit("GEN 2 rid=3 19,23,29")
+            self.wait_done(lines, 3)
+            self.assertTrue(engine.wait_idle(timeout=10))
+            self.assertIsNotNone(engine.rt.model._decode_graphs,
+                                 "the lease is usable again after every conversation went idle")
+        finally:
+            engine.stop_workers()
+            engine.shutdown()
+
+
+
     """The real executable: READY multi=N, a rid-tagged GEN, tagged T/DONE, and a clean QUIT."""
 
     def test_a_parallel_engine_tags_its_lines_and_quits(self):
@@ -816,9 +1132,10 @@ class ParallelOverTheProtocol(unittest.TestCase):
             ready = engine.read_until("READY")[-1]
             self.assertIn("multi=2", ready.split())
             end = time.time() + 20
-            while not any("graphs: OFF" in l for l in engine.log) and time.time() < end:
+            while not any("is a *lease*" in l for l in engine.log) and time.time() < end:
                 time.sleep(0.02)
-            self.assertIn("graphs: OFF", "\n".join(engine.log), "graphs/parallel conflict is stated")
+            self.assertIn("is a *lease*", "\n".join(engine.log),
+                          "the graphs/parallel composition policy is stated at start")
             engine.send("GEN 2 rid=7 3,5,7")
             lines = engine.read_until("DONE ")
             self.assertTrue([l for l in lines if l.startswith("T 7 ")], lines)

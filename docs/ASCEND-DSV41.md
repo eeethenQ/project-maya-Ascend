@@ -126,7 +126,7 @@ at a time (the serve engine does expose the captured decode now, §6). The four-
 
 ## 5. Testing
 
-Everything runs as `python -m unittest discover -s ascend -p "test_*.py" -t .`. The suite is **177 tests**;
+Everything runs as `python -m unittest discover -s ascend -p "test_*.py" -t .`. The suite is **216 tests**;
 10 of them skip in this checkout when the NPU tests are not opted in (`DSV41_RUN_NPU_TESTS=1`) or when no
 card is present, and the CPU tests run in CI.
 
@@ -166,10 +166,16 @@ card is present, and the CPU tests run in CI.
   defaults, the flags reaching `runtime.build`, capture on a conversation's first decode, release when the
   conversation ends, release when a prompt is abandoned, and a teardown failure being logged, counted
   against the bound, and served eagerly instead of taking the engine down. The prompt chunk too:
-  `--prompt-chunk` and its old `--prefill-chunk` name, the default still 512, `prompt_chunks()`'s split,
-  `0` meaning the whole prompt, the clamp to `--max-context`, and one PP line per forward over the real
-  protocol. And the two streaming flags: their CLI defaults, that they reach `runtime.build`, and that
-  `ExpertStreamer` ends up with that many read threads and the model with that read batch.
+  `--prompt-chunk` and its old `--prefill-chunk` name, the measured 2 048 default, `prompt_chunks()`'s
+  split, `0` meaning the whole prompt, the clamp to `--max-context`, and one PP line per forward over the
+  real protocol. Prefix reuse has its own class: a diverging prompt that shares a prefix reports the shared
+  count in DONE's `reused`, reads only its suffix, and produces the **same tokens** as a scratch prefill of
+  the same prompt; a parallel slot reuses another conversation's prefix; `--no-prefix-reuse` restores the
+  old path. The graphs x `--parallel` lease has one too: the reserve is taken, a lone conversation captures,
+  a second admission revokes and releases the domain, idle re-arms, and a capture/teardown failure pins the
+  process to the eager path. And the two streaming flags: their CLI defaults, that they reach
+  `runtime.build`, and that `ExpertStreamer` ends up with that many read threads and the model with that
+  read batch.
 * `test_env.py` — the four hardware facts the design rests on.
 
 ## 6. The engine behind the serve protocol
@@ -190,9 +196,9 @@ OpenAI/Anthropic APIs, SSE, tools and the web UI over this engine:
 The repository's own copy is [`ascend/serve-config.example.json`](../ascend/serve-config.example.json). The
 serve engine takes `--graphs` and `--graph-verify`, exactly as `run_dsv41` does: the one-token decode is
 captured per layer, prompt chunks (`T > 1`) stay eager. A graph bakes the buffers of the conversation's
-`State`, so the engine captures for the held conversation, keeps the graphs across that conversation's
-turns (prefix reuse), releases them before a diverging prompt builds its new State, and drops them when a
-request is abandoned part-way through its prompt. The capture is lazy - the first one-token step after the
+`State`, so the engine captures for the conversation that holds the graph *lease*: it keeps the graphs
+across that conversation's turns and across a rewind to a shared prefix, releases them when the
+conversation is replaced, and drops them when a request is abandoned part-way through its prompt. The capture is lazy - the first one-token step after the
 prompt - and its cost is reported in the engine log (measured on `npu:0`: 80 graphs in 1.87-2.06 s); the
 first token is read from the prompt's own logits before that, so a request never waits on the capture to
 answer. A teardown that cannot destroy a graph is logged and counted against `--graph-max-conversations`
@@ -200,7 +206,10 @@ answer. A teardown that cannot destroy a graph is logged and counted against `--
 costs a 405.7 MiB landing zone plus registers on every card the experts live on; four measured 1.62 GiB in
 total and put the process at 27.1 GiB of its 32 GiB share on one card at 2 048 context. With `--parallel 1` (the default) the
 server holds one conversation, and the tier reserves 1 GiB per card for that one; `--parallel N` gives it N
-conversations (and the server's FIFO N places), and it runs eagerly - see §16.
+conversations (and the server's FIFO N places).  `--graphs` and `--parallel N` compose as a lease (§19): a
+conversation captures while it is the only live one, a second admission revokes the lease (release, then
+eager for both), and the lease returns when every conversation is idle.  A request that shares a prompt
+prefix with the conversation it lands on resumes from that KV instead of re-prefilling it (§18).
 
 `ascend/setup_tokenizer.sh` builds that tokenizer directory: the export ships no tokenizer, V4.1 and V4
 share the vocabulary, `serve/` reads its own pack layout rather than Hugging Face's `tokenizer.json`, and
@@ -574,11 +583,16 @@ that day or the page cache held part of the set from the run that preceded this 
 therefore optimistic for a cold start; the *ratio* is the transferable number, and it grows when the array
 is cold because the non-byte term (attention and MoE dispatch) is then a smaller share.
 
-**Default.** `--prompt-chunk 2048` is the recommendation for long prompts (or `0`). The flag's default stays
-512, as it was introduced, because a one-forward prompt prints a single `PP` line at the end and the
-server's dashboard reads `PP` for progress; the engine now logs the plan on stderr at the start
-(`dsv41 prompt: 2000 fresh tokens in 1 forward(s) ...`), but a UI watching `PP` sees nothing until the
-prefill finishes. That is the trade, and it is the operator's to make.
+**Default: 2 048** (changed from 512 in §19; the old default was a constant nobody had measured against).
+2 048 is one forward for a typical prompt - the measured -47% TTFT - and it stays inside the 6 GiB
+activation reserve at 4 096 (the indexer's T² term is ~1 GiB there), so it is safe for a prompt up to the
+flag's own clamp. `0` (the whole prompt) is *not* a safe default: at 8 192 the T² term alone is ~4 GiB and
+the forward is not inside the reserve. The trade against the old value is the `PP` progress line: a
+one-forward prompt prints a single `PP` at the end, where 512 printed one every ~110 s, and a `STOP`
+during the prompt is honoured only after the chunk (one forward) ends. The engine logs the plan on stderr
+at the start (`dsv41 prompt: 2000 fresh tokens in 1 forward(s) ...`) and serve/server.py has a 900 s
+request-quiet limit and its own engine-stall watchdog, so a long silent chunk is not mistaken for a lost
+engine. The operator can still set `--prompt-chunk` to trade the other way.
 
 ### The two streaming flags (O7)
 
@@ -682,9 +696,13 @@ forwards, not one** - which is exactly what the old 4-thread drive did.
   bytes to the card - a silent wrong answer. With `--parallel > 1` the engine wraps `fetch_int8` in one
   lock (host read + H2D only, and only while the scheduler runs); attention, the router and the expert
   matmuls still overlap across the request threads.
-* **Graphs are off when `--parallel > 1`**, and the conflict is logged at start, not silently resolved: a
-  captured decode is one `State` at `T == 1` and one graph domain per model, so N conversations would
-  recapture on every step (the thrash `bench_serve` measures). `--graphs` is effective with `--parallel 1`.
+* **Graphs and `--parallel N` compose as a lease** (§19), where §16's snapshot had them mutually exclusive:
+  a captured decode is one `State` at `T == 1` and the model holds one graph domain, so a conversation
+  captures only while it is the only live one; a second admission revokes the lease (release, then eager
+  for both) and the lease returns when every conversation is idle.  The cost is one decoded step on
+  revoke and one 1.8-1.9 s re-capture on the next lone conversation after a burst - logged, never silent.
+  N captured domains would need a domain per `State` in `model.py`, which this engine does not own, and N
+  landing zones per card (the tier reserves one, §6).
 * **Per-conversation NPU streams are opt-in** (`--parallel-streams`) and default off: measured on one
   910B3, four streams were ~10-15% slower than the device's default stream at the same expert tier - the
   staging ring's per-slot events then couple the streams, so the independence the streams buy is given
@@ -838,3 +856,307 @@ So the ~1 300 lines were reverted rather than kept behind a flag: a feature that
 replaces and wrong in the case that matters is not something to leave switched off in the tree. What is kept
 is the measurement, this note, and one small fix: `test_env` read a multi-index `ASCEND_RT_VISIBLE_DEVICES`
 as logical ids, which broke the suite whenever the cards were taken in a non-contiguous set.
+
+## 18. Tensor and expert parallelism: what the wire costs, and why one request does not decode faster
+
+The multi-card work so far split the **experts by layer**: one card did all the dense compute and each card
+held ten layers' experts (§9, §14).  That is the right shape for *four conversations*, and the wrong one for
+*one*: a single request still runs every layer on one card.  This section is the other split - the dense
+path sharded 4 ways (TP) and the routed experts split by expert (EP) - and it starts with the number that
+decides it, which nothing in the repo had measured.
+
+### 18.1 The wire: 20.7 GB/s, and 250 us per cross-card copy whatever its size
+
+`ascend/bench_hccs.py` measures a `copy_` between cards on this box (`0-3`), both directions, at six sizes,
+and two hand-rolled all-reduces (sum on rank 0 then broadcast = `root`; every rank pulls every peer =
+`flat`):
+
+| copy | median | GB/s |
+|---|---:|---:|
+| 20 KB, 0->1 | 310 us | 0.07 |
+| 256 KB | 257 us | 1.02 |
+| 1 MiB | 257 us | 4.08 |
+| 16 MiB | 1 039 us | 16.2 |
+| 100 MiB | 5 261 us | 19.9 |
+| 512 MiB | 25 991 us | **20.7** |
+
+**The vendor's 392 GB/s HCCS figure is not what this box delivers**: a bulk copy runs at 20.7 GB/s, the same
+number as the host link, and the direction and the destination card do not matter.  More important for TP:
+**a cross-card copy costs ~250 us up to 1 MiB** - it is host-synchronous, and `non_blocking=True` and
+per-destination streams do not change it (three 20 KB fan-out copies: 765 us sequential, **1 263 us on three
+streams**).  So a collective is a sync point *and* a fixed ~250 us per hop:
+
+| 20 KB all-reduce (fp32), four cards | median |
+|---|---:|
+| root (3 copies in + 3 out) | **1.50 ms** |
+| flat (3 copies + adds per rank, all ranks) | 3.00 ms |
+| 80 of them (2 per layer x 40) | **117 ms** (root) / 231 ms (flat) |
+
+The 1.6 MB a decode token moves through the collectives is nothing; the 80 *sync points* are everything.
+The measured unit is also the design constraint: a kernel cannot take a cross-device operand (the first
+probe wrote `dst.add_(src_on_another_card)` and took an `MTE accesses an invalid GM address` fault on every
+vector core), so every collective copies into a local buffer and adds locally.
+
+### 18.2 The split that was built
+
+`ascend/dsv41/parallel.py` (driver) and the `tp_rank`/`tp_size` branches in `model.py`:
+
+* **TP, dense.** `wq_b` and `wo_a` rows, `wo_b` columns and `attn_sink` entries are split; each card
+  computes 16 of 64 heads and its 2 of 8 `wo_a` groups, returning a **partial** output that is all-reduced.
+  The shared expert is column-parallel in `w1/w3` and row-parallel in `w2`, one more partial.  `wq_a` (13
+  MB/layer) and `wkv` (5 MB/layer) stay replicated on purpose: MLA's q latent and KV latent are needed whole
+  by every head, so splitting them would add an all-gather to save 18 MB.  The **KV planes are replicated**
+  for the same reason - each card builds the same latent and writes its own identical cache, so attention
+  contains no collective at all.  The router and the norms are replicated (every card must select the same
+  experts); `embed` and `head` are sharded by vocabulary (a gather of 20 KB a step, rather than 2.6 GiB
+  replicated on every card - replication would cost the expert tier ~30 slots a card).
+* **EP, experts.** Expert `e` is owned by card `e % 4` (**strided**, not contiguous: the router's
+  preference over ids is learned and need not be uniform, and a contiguous 96-block can hand one card every
+  layer's hot experts; `e % 4` spreads any id-based skew).  Each card fetches and multiplies only its own
+  experts, so its tier is 40 layers x 96 experts instead of 10 x 384 - the same 3 840 (layer, expert)
+  candidates, partitioned.
+* **Two collectives per layer**: one on the attention partial and one on the MoE partial (routed + shared
+  together).  Both are eager.  `ascend/bench_tp.py` has the two arms.
+
+### 18.3 The tier under EP: hit rate did not fall, it rose
+
+`--arm baseline` is today's layout (dense on npu:0, tier by layer, captured decode); `--arm tp` is the new
+one.  Same prompt (8 tokens), same 40-step warm-up, same fixed 8-step decode stream, so a pair is the same
+position at the same KV length.  `npu:0-3`, 32 GiB share, reserve 6 GiB.
+
+| arm | tier | fetch hit | GB/step | ms/token (median of 8) |
+|---|---:|---:|---:|---:|
+| baseline, captured decode | 2 480 | 71.2 % | 2.443 | **787.4** |
+| baseline, eager (graphs off) | 2 603 | 71.8 % | 2.397 | 1 299.6 |
+| TP+EP, eager | 2 396 | **73.2 %** | **2.277** | 3 042.5 |
+
+I expected the hit rate to be **roughly unchanged** - same candidate pool per card, same slots per card,
+same 60 expert draws a token - and it came out 2.0 points *better* at 84 fewer slots.  The shape does not
+hurt: under EP a card's per-layer capacity is ~15 of the 96 it owns against 1.5 draws a token (10.3 tokens
+of locality), against 62 of 384 against 6 draws (10.3 tokens) in the layer split.  The 84-slot loss is the
+replicated dense tensors: 4.70 GiB of weights per card against the ideal 3.77, 18.81 GiB across the group
+against 15.09.  Decode is neutral on the tier (it reads 7 % *fewer* bytes) and slower for other reasons.
+
+### 18.4 Does one request get faster?  At T=1, no: 3.87x slower
+
+Two alternating rounds, each arm measured after the same 40-step warm-up on the same fixed token stream
+(a pair is the same position at the same KV length); medians over the 16 paired steps:
+
+| decode, one request, 8-token prompt + 40 warm steps | ms/token | ratio |
+|---|---:|---:|
+| today: four-card tier, 80 captured graphs | **631.6** (787.4 / 540.0 in the two rounds) | 1.00 |
+| today's layout, eager (one round) | 1 299.6 | 2.06 |
+| TP+EP, eager | **3 017.4** (3 042.5 / 2 986.1) | **5.01x** |
+
+Paired per-step ratio (tp/baseline, ms): **5.007 [4.181, 5.476] 95 % CI**, 16 pairs.  Like-for-like with
+both arms eager: **2.343 [2.319, 2.472]** (8 pairs).  The baseline's two rounds differ by 1.46x and the
+TP arm's by 1.9 %: the baseline ran second in each pair, right after the TP arm had read the same 320 GB of
+experts, so its 540 ms round is the page-cache-warm one.  TP does not move with the cache because its cost
+is host-side, not the array - which is the finding, not a nuisance.
+
+The honest decomposition, because two effects are stacked:
+
+1. **The collectives cost 117 ms a step** (80 x 1.50 ms, measured), 15 % of the 787 ms baseline on their
+   own.  Even at the same fetch bytes TP could not be faster than 787 + 117 = 904 ms.
+2. **The rest of the 1.74 s is host dispatch, not the wire.**  TP has no captured graphs: a cross-card
+   collective inside a capture is a hard error (measured in the last round), and the captured bodies bake
+   one State and one card.  So TP runs eager, and one host thread now dispatches the *dense* path for four
+   cards - 4x the aten calls of the eager single-card path - while the expert calls are shared out.  The
+   eager-baseline arm isolates this: TP is **2.34x the same layout eager** (3 042.5 / 1 299.6), and only
+   117 ms of that 1.74 s is collective time.
+
+The decode step is expert-stream bound and TP does not reduce the stream: one token still fetches the same
+240 experts (0.774 GB at the doc's 90.9 % hit; 2.28 GB at this window's 73.2 % - the machine's array ran at
+~2.5 GB/s in these runs, so the absolute numbers are twice the doc's 409.6 ms).  EP does not divide the
+bytes, only the cards they land on, and the array is one resource.  **At T=1 TP loses**, by the collective
+latency plus a dispatch tax that a captured per-card TP graph would have to remove entirely - and even then
+it would be 8-15 % behind (117 ms of collectives, against a TP tier that reads 7 % fewer bytes).  It is not
+kept as the decode path.
+
+### 18.5 Prefill does not pay either: four fetch streams are slower than one
+
+The hope was that prefill, being compute-bound, is where four cards' Cube pays.  One 2 000-token prompt,
+one forward, same ids:
+
+| 2 000-token prefill, one forward | wall | ms/token | expert bytes | read rate |
+|---|---:|---:|---:|---:|
+| today: four-card tier, eager prefill | **79.2 s** | 39.6 | ~354 GB | ~4.4 GB/s |
+| TP+EP, eager, page-cache warm | 94.6 s | 47.3 | 320 GB (measured) | **3.38 GB/s** |
+| TP+EP, eager, cold array (first run) | 141.6 s | 70.8 | - | ~2.5 GB/s |
+
+The prompt is the same wall as decode in a different dress: 354 GB of expert bytes, and the array is one
+resource.  EP does not divide the bytes between the cards - it divides *who asks for them*, and four
+`ExpertStreamer`s reading four sub-batches of the same layer concurrently get **3.38 GB/s where the
+single-stream baseline gets ~4.4 GB/s** on the same warm array.  The prefill is 1.19x slower, not faster.
+The collectives are not the issue at this width: 40 MB each, ~19 ms, 80 of them ~1.5 s - 1.6 % of the
+prefill.  (The first TP run, on a cold array, read at 2.5 GB/s and took 141.6 s; the machine's array
+varies by 2x between runs, which is why the two warm runs above are the comparison that counts.)
+
+### 18.6 The graphs, and what is left in the tree
+
+The captured decode stays **single-card**.  A `g_post` bakes its card and its addresses and a cross-card
+copy cannot be captured; a captured TP step would need 4x80 = 320 graphs plus 80 eager collectives between
+replays, and the collectives alone are 117 ms against a 409.6 ms step.  TP/EP therefore runs eager, and
+`bench_tp.py --arm tp` says so in its JSON (`graphs: false`).  The single-card path is unchanged
+(`tp_size == 1` takes every old branch; `test_the_single_card_path_is_unchanged`), and the tiny-model test
+(`ascend/tests/test_parallel.py`, 8 tests) pins the split to the single-card path to 2e-3 on a prompt and on
+decode-equals-chunk.
+
+**The real 40-layer model does not meet that bar** (`bench_tp --parity`, same 8-token prompt, both arms on
+the NPU): the dense path alone is **8.1e-3 relative** (|delta| 9.4e-2) and the full path **3.1e-1**
+(|delta| 6.6).  That is not a wiring error: `test_the_dense_weights_are_split_and_add_back_up` shows every
+shard is the exact slice, so the difference is the fp32 accumulation order of the bf16 Cube matmuls - a
+`F.linear` with 8192 columns does not accumulate in the order four 2048-column calls do - which at 40
+layers and 8 positions is enough to flip a router top-k tie and send the two arms down different (both
+plausible) trajectories.  §12 records the same mechanism for the mHC branch.  TP would need fp32 matmuls
+(2-4x the Cube time) to hold 2e-3 on this checkpoint.  A second independent reason, then, not to keep it.
+
+The 48-step decode comparison in §18.4 is not a parity check for the same reason; it is a timing A/B on a
+fixed token stream, and both arms are fed the same positions.
+
+The one number to carry forward: **if TP is to stay for decode, it needs a collective that is not 250 us a
+hop.**  That means one process per card and a real HCCL group (`torch.distributed` reports HCCL available;
+it wants one rank per process, which this engine is not today), not 80 hand-rolled `copy_`s.
+
+
+## 19. Graphs and conversations compose as a lease; a shared prefix is not read twice
+
+Two serve-layer features did not compose.  `--graphs` captured the one-token decode for *the* held
+conversation, and `--parallel N` needed N conversations; the engine resolved that by logging the conflict
+and running eagerly whenever `--parallel > 1` (§16.3).  Separately, the scheduler already placed a request
+on the idle conversation sharing the longest prefix, but when the prompt then diverged it **dropped that
+conversation's State and re-read the prompt from token 0** - the slot was reused, its KV was not.  At the
+2 000-token prefill of §15 (233.5 s in one forward, 440.0 s in four 512-token pieces) the second is the
+largest serve win available: a share-the-system-prompt workload pays it once per request today.
+
+### 19.1 The conflict, precisely
+
+`Dsv41` holds **one** graph domain (`model._decode_graphs`), and a domain's buffers bake the `State` it was
+captured against; `_graph_decode` releases a domain whose `State` is not the current one.  Per-slot capture
+would therefore need N domains inside `model.py` plus N landing zones (405.7 MiB plus registers *per card*
+each, against the 1 GiB per card `runtime.build(graphs=True)` reserves), and `model.py` is not this
+change's to edit.  The measured alternative - recapturing whenever two conversations alternate - is the
+`thrash` arm of `bench_serve`: a capture is 1.8-1.9 s, so alternating conversations pay it repeatedly.
+
+### 19.2 The lease
+
+`--graphs --parallel N` now grants the graph domain as a **lease**:
+
+* **Grant.**  A conversation may capture only while it is the *sole live* one: its request was admitted
+  with every other slot idle, and no domain is held.  The grant and the capture are logged.  Capture stays
+  lazy (the first `T == 1` step; the first token already came from the prompt's logits), and `DONE's`
+  `reused`/PP lines are unaffected.
+* **Revoke.**  Admitting a conversation while the lease is held (second slot busy, or a request placed on
+  another slot) sets `model.graphs = False`, orders the bookkeeping against a concurrent grant under
+  `_sched`, waits on `_graph_lock` for the step that may be in flight, releases the domain, and logs
+  `lease revoked from <slot>`.  Both conversations then run eagerly.  The engine's forwards are wrapped in
+  that lock only *while a lease is active*, so the eager path keeps §16's cross-thread overlap.
+* **Re-arm.**  When the last conversation finishes (every slot idle), the engine turns the captured path
+  back on - only if it was *this engine* that turned it off, never overruling a capture/replay failure the
+  model reported - and logs it.  The next lone conversation captures again, paying 1.8-1.9 s charged to its
+  decode after the first token.
+* **Bounds.**  With `--parallel > 1` the effective bound is one domain whatever `--graph-max-conversations`
+  says; a larger value is called out in the start log.  A teardown that leaks a domain, or a model that
+  disables the captured path, pins the process to eager for its life (as before), and the log says so.
+
+The cost is concrete and logged: **one in-flight decode step plus one release at the revoke** (an eager step
+is 816.5 ms on the four-card tier, 409.6 ms captured - the revoke takes the eager step's length, not the
+conversation's), and **one 1.8-1.9 s re-capture on the next lone conversation after a burst**.  A server
+that usually has one user at a time therefore keeps the captured decode; a burst pays the re-capture once,
+not per step.  Nothing is silent: grant, revoke and re-arm each write a line.
+
+### 19.3 Prefix reuse: rewind the State, do not copy it
+
+The primitives the brief mentions are not in the tree: `copy_row_from`/`copy_row_to` went with the reverted
+batched decode (§17), and `grep copy_row` finds nothing.  What survived is `State.rewind`, and it is
+enough, because a request *lands on* the conversation that holds the prefix - no cross-`State` move is
+needed.  On a divergent prompt whose common prefix is `L > 0`, `serve_engine` now:
+
+1. calls `state.rewind(len(held) - L)` and truncates `held`/`token_ids` to `L` (`token_ids` matters: Engram
+   hashes the history), and
+2. reads only `ids[L:]` as the prompt, reporting `reused = L` in `DONE` so `serve/server.py`'s context bar
+   and prefill rate see the hit.  `--no-prefix-reuse` restores the old drop-and-re-read path.
+
+**Why the rows past `L` can be stale and still correct.**  Every read is by absolute position and every
+row is written before it is read by the chunk that reads it: a window read at `p` touches
+`p-W+1 .. p`, all rewritten by the current chunk (window rows are written before attention, §model); a
+compressed entry for a group that overlaps the prefix is read only through `entries = (p+1)//r`, i.e.
+**completed** groups, and the suffix closes such a group again before any query can see it, writing the
+pooled entry from raw rows the suffix rewrote first; the compressor's raw ring keeps only the group being
+closed, and the suffix rewrites its rows before the close.  The `State.rewind` contract is exactly this
+statement ("the next pass rewrites the positions past it").  A prefix rewind is also *the same `State`*, so
+a captured graph domain stays valid - tested, and unlike the old path it saves the 1.8-1.9 s recapture too.
+
+**Cross-conversation.**  With `--parallel`, the longest-prefix placement was already choosing the slot; the
+reuse now applies to its KV, so a request built on a resident history (a shared system prompt, a chat's
+next turn, a re-sent history) starts at `L`.  It does **not** fork from a conversation that is still
+decoding: that `State` is being written, and copying it would race the owner.  A request arriving while the
+conversation holding its prefix is busy gets a different (or no) prefix, and if all slots are busy it waits
+in the engine's queue - the limitation to state, not a hidden cost.
+
+**The bar is exact output.**  On the four-layer synthetic model (`ascend/tests/test_serve_engine.py`,
+`ThePrefixReuse`) a request that resumes a 16-token prefix and reads a 6-token suffix produces **exactly**
+the greedy tokens of a fresh `State` prefilled from token 0 for the same 22-token prompt, including when the
+seeding prompt and the resumed prompt had different total lengths (the last `ATTN_BLOCK` differs, §19.5).
+The CPU suite is green; the real-model check is the `--serve-prefix` run below.
+
+**A protocol/state bug this exposed and fixed.**  The decode loop appended the sampled end-of-sequence
+token to `held` and then broke *before* the forward that would have read it, so `held` claimed one token
+the KV did not cover: `DONE` counted it (correctly - it was streamed), but the next turn's prompt began at
+`next_pos = len(held) - 1`, one position early, and a rewind to a shared prefix was off by one.  The chat
+template normally puts the eos in the next prompt, which is exactly the case that hit it.  The engine now
+removes the emitted eos from `held` (the next prompt reads it as a fresh token at its own position), and
+the test forces an eos and compares the following turn's tokens against a fresh prefill.
+
+### 19.4 `--prompt-chunk` default: 2 048
+
+Changed from 512.  §15's table is the argument: on `npu:0`, a 2 000-token prompt measured **233.5 s** TTFT
+as one 2 048-token forward against **440.0 s** as four 512-token pieces (-47%), with *lower* peak
+activations (2.7 against 1.9 GiB of high-water, both inside the 6 GiB reserve).  2 048 is one forward for a
+typical prompt, is one forward for anything up to 4 096 (the indexer's T² term is ~1 GiB there and still
+fits the reserve), and is clamped by `--max-context`.  `0` (the whole prompt) was rejected as the default:
+at an 8 192-token prompt the T² term alone is ~4 GiB and the forward no longer fits the reserve.  The trade
+is the `PP` heartbeat: a one-forward prompt prints one `PP` at the end instead of every ~110 s.  The
+server's request-quiet limit is 900 s and its stall watchdog reads CPU/disk, not `PP`, so a silent chunk is
+not mistaken for a lost engine, and the engine logs the plan on stderr as the read starts.
+
+### 19.5 Measurements: done, and waiting on the card
+
+**Done (no card needed):** `python3 -m unittest discover -s ascend -p "test_*.py" -t .` - **216 tests, 10
+skipped, green** on the CPU path, including the new prefix-reuse exactness and the graph-lease tests.  A
+**pilot** `--serve-policy` run was made and **discarded**: its arms reused each other's prompts (prefix
+reuse) and its first arm paid a cold tier, so the lone and two-conversation numbers were not comparable.
+The harness was rewritten to build **one engine per policy** (`graphs=False` for the before arm, `true` for
+the after arm), warm the tier identically, use distinct prompts, and stagger the second request until the
+first's first token - that is what makes it a *second* admission, which is the event the revoke is defined
+on.
+
+**Not yet measured:** the two timing runs below.  The four 910B3s were held by the TP/EP experiment (§18)
+for the whole of this round; a single card is required, and the runs must not overlap another tenant's
+prefill or their numbers are noise.  Commands (from the host, card 0 only; ~5 min and ~10 min):
+
+    rsync -az --exclude=.git --exclude=.ascend-work ascend/ blue-910b3:/home/q00999609/project-maya-Ascend/ascend/
+    # composition policy, ~5 min: two builds, three arms each (warm-up + lone + staggered pair)
+    ssh blue-910b3 'docker exec -e ASCEND_RT_VISIBLE_DEVICES=0 -w /workspace/project-maya-Ascend \
+      maya-ascend-dev python3 -u -m ascend.bench_serve \
+        --model /mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8 \
+        --tokenizer /mnt/weights/DeepSeek-V4-Flash-0731-w8a8/tokenizer.json \
+        --device npu:0 --cards npu:0 --serve-policy --parallel 4 --serve-gen 8 \
+        --max-context 2048 --jsonl ascend/results/serve-policy-npu0.jsonl'
+    # prefix reuse, ~10 min: two 2 000-token prefills + a suffix, tokens compared
+    ssh blue-910b3 'docker exec -e ASCEND_RT_VISIBLE_DEVICES=0 -w /workspace/project-maya-Ascend \
+      maya-ascend-dev python3 -u -m ascend.bench_serve \
+        --model /mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8 \
+        --tokenizer /mnt/weights/DeepSeek-V4-Flash-0731-w8a8/tokenizer.json \
+        --device npu:0 --cards npu:0 --serve-prefix --prefix-shared-tokens 2000 --prefix-tail-tokens 8 \
+        --serve-gen 8 --max-context 2048 --jsonl ascend/results/serve-prefix-npu0.jsonl'
+
+What each will show: `policy-summary` carries `lone_graphs_decode_tok_s` against `lone_eager_decode_tok_s`
+(the lease's decode ratio, expected near the captured/eager ratio of §14: 0.660 single-card, i.e. ~1.5x),
+`two_eager_wall_tok_s` against `two_graphs_wall_tok_s` (after the revoke both are eager, so ~1.0x is the
+cost statement), the two arms' *second* TTFT (the revoke's one-step cost), and
+`lone_tokens_identical`/`two_tokens_identical` (the captured path must not change a token).
+`prefix-summary` carries `reused_ttft_s` (the requested number), `scratch_ttft_s`, `ttft_ratio`,
+`reused_tokens_reported` (should be 2 000) and **`tokens_identical`** - the bar.  If that last field is
+false, the finding is that KV resumed from a different chunking is not numerically identical at the
+$2\times10^{-3}$ tolerance, and the reuse must be withdrawn (leaving the lease and the 2 048 default).
