@@ -41,6 +41,8 @@ above plus the graph launch cost.
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import ctypes.util
 from dataclasses import dataclass
 
 import torch
@@ -70,6 +72,40 @@ class TPComm:
         self._scratch: dict[int, torch.Tensor] = {}
         self.collectives = 0
         self.bytes_moved = 0
+        # A kernel may only read another card's HBM once AscendCL's peer access is enabled; without it a
+        # cross-device operand is an `MTE accesses an invalid GM address` fault (bench_peer.py reproduces
+        # both sides).  Enabling it turns the combine from two host-synchronous copies into one add that
+        # reads the peer's HBM directly.  CPU tests have no peer axis and take the copy path.
+        self.peer = False
+        self._peer_events: list = []
+        if self.size == 2 and all(d.startswith("npu") for d in self.devices):
+            try:
+                self.peer = self._enable_peer()
+            except Exception:                                  # noqa: BLE001 - fall back, do not fail
+                self.peer = False
+
+    def _enable_peer(self) -> bool:
+        """Turn on peer access for every ordered pair; False if this stack will not have it.
+
+        ``torch.npu.set_device`` is used rather than a raw ``aclrtSetDevice`` so the backend's own idea of
+        the current card stays in step.  A pair that fails (older firmware, a driver without p2p) leaves
+        the collective on the copy path rather than failing the build.
+        """
+        lib = ctypes.CDLL(ctypes.util.find_library("ascendcl") or "libascendcl.so")
+        lib.aclrtDeviceEnablePeerAccess.argtypes = [ctypes.c_int32, ctypes.c_uint32]
+        lib.aclrtDeviceEnablePeerAccess.restype = ctypes.c_int
+        saved = torch.npu.current_device()
+        try:
+            for i, src in enumerate(self._indices):
+                for j, dst in enumerate(self._indices):
+                    if i == j:
+                        continue
+                    torch.npu.set_device(src)
+                    if lib.aclrtDeviceEnablePeerAccess(ctypes.c_int32(dst), 0) != 0:
+                        return False
+            return True
+        finally:
+            torch.npu.set_device(saved)
 
     @contextlib.contextmanager
     def _on(self, rank: int):
@@ -102,6 +138,8 @@ class TPComm:
             raise ValueError(f"{len(parts)} parts for a group of {self.size}")
         base = parts[0]
         self.collectives += 1
+        if self.peer and n == 2:
+            return self._peer_sum(parts)
         for r in range(1, n):
             buf = self._buffer(r, base)
             with self._on(0):
@@ -113,6 +151,32 @@ class TPComm:
                 parts[r].copy_(base)            # broadcast the sum back
             self.bytes_moved += base.numel() * base.element_size()
         return parts
+
+    def _peer_sum(self, parts: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Two-rank all-reduce as one peer-reading add per card, with no copy and no host stage.
+
+        Each card writes the sum into a *fresh* buffer, so neither source is overwritten while the other
+        card is still reading it; the two adds may then run concurrently.  Ordering is a recorded event
+        on the stream that produced each partial and a wait on the peer's event: a device-stream
+        *synchronise* also works but stalls the two cards' pipelines in lockstep (817 vs 792 ms/token in
+        the dense-only EP probe), while an event costs ~70 us of host time and nothing on the device.
+        Returns new tensors; the sources stay valid.
+        """
+        if not self._peer_events:
+            for i in range(2):
+                with self._on(i):
+                    self._peer_events.append(torch.npu.Event())
+        for i in range(2):
+            with self._on(i):
+                self._peer_events[i].record()
+        outs = []
+        for i in range(2):
+            with self._on(i):
+                torch.npu.current_stream().wait_event(self._peer_events[1 - i])
+                outs.append(torch.empty_like(parts[i]))
+                torch.add(parts[i], parts[1 - i], out=outs[i])
+            self.bytes_moved += parts[i].numel() * parts[i].element_size() * 2
+        return outs
 
     def gather_rows(self, parts: list[torch.Tensor], out: torch.Tensor) -> torch.Tensor:
         """Concatenate per-rank vocabulary shards along the last axis into ``out`` (on rank 0)."""
@@ -182,6 +246,12 @@ class TPEngine:
         self.comm = TPComm(self.devices)
         self.device = self.devices[0]                  # the caller's device: rank 0's
         self.dtype = ranks[0].dtype
+        # EP-only: the dense path is replicated on every card, so there is no attention collective and no
+        # vocabulary gather - only the routed experts are split, and one all-reduce combines them per
+        # layer.  `tp_size == 1` keeps every sharded branch in `model.py` inert, byte for byte.
+        self.dense_replicated = bool(len(ranks) > 1 and ranks[0].tp_size == 1
+                                     and ranks[0].ep_size > 1)
+        self.shared_is_mine = bool(ranks[0].shared_is_mine)
         self.graphs = False
         self.timers: dict[str, float] | None = None
         self.host_mixes = True
@@ -219,19 +289,24 @@ class TPEngine:
         host_positions = list(range(start, start + T))
         positions = [torch.tensor(host_positions, device=r.device, dtype=torch.long) for r in ranks]
 
-        # -- embedding, sharded by vocabulary: each rank looks up the ids it owns into zero rows and the
-        # all-reduce sums the one non-zero contribution per token.  One collective a chunk.
-        rows_v = cfg.vocab_size // W
-        h = []
-        for r, model in enumerate(ranks):
-            lo, hi = r * rows_v, (r + 1) * rows_v
-            ids_r = torch.tensor(host_ids, device=model.device, dtype=torch.long)
-            mask = (ids_r >= lo) & (ids_r < hi)
-            hr = torch.zeros(T, cfg.hidden_size, device=model.device, dtype=torch.float32)
-            if bool(mask.any()):
-                hr[mask] = model.weights.embed[ids_r[mask] - lo].float()
-            h.append(hr)
-        h = self.comm.all_reduce(h)
+        # -- embedding.  TP: sharded by vocabulary, each rank looks up the ids it owns into zero rows and
+        # the all-reduce sums the one non-zero contribution per token.  EP-only: the embedding is
+        # replicated, so every card looks the whole id up and there is nothing to combine.
+        if self.dense_replicated:
+            h = [model.weights.embed[torch.tensor(host_ids, device=model.device,
+                                                  dtype=torch.long)].float() for model in ranks]
+        else:
+            rows_v = cfg.vocab_size // W
+            h = []
+            for r, model in enumerate(ranks):
+                lo, hi = r * rows_v, (r + 1) * rows_v
+                ids_r = torch.tensor(host_ids, device=model.device, dtype=torch.long)
+                mask = (ids_r >= lo) & (ids_r < hi)
+                hr = torch.zeros(T, cfg.hidden_size, device=model.device, dtype=torch.float32)
+                if bool(mask.any()):
+                    hr[mask] = model.weights.embed[ids_r[mask] - lo].float()
+                h.append(hr)
+            h = self.comm.all_reduce(h)
         h = [hr.unsqueeze(1).repeat(1, cfg.hc_mult, 1) for hr in h]
 
         # -- Engram is a host lookup keyed by the token history: hashed once, applied per rank with the
@@ -249,13 +324,18 @@ class TPEngine:
             # first half: mHC, norm, attention - each rank on its own heads, partial output
             halves = [r._attn_half(li, h[i], pre[i], state.states[i], positions[i], host_positions,
                                    engram_rows) for i, r in enumerate(ranks)]
-            o = self.comm.all_reduce([hd[0] for hd in halves])
+            if self.dense_replicated:
+                # each card computed the whole attention; the outputs are the same on every card
+                o = [hd[0] for hd in halves]
+            else:
+                o = self.comm.all_reduce([hd[0] for hd in halves])
             # second half: post-MHC, the FFN pre-mix and norm
             ffns = []
             for i, r in enumerate(ranks):
                 oi, res, a_pre, a_post, a_comb = halves[i]
                 ffns.append(r._ffn_half(li, o[i], res, a_pre, a_post, a_comb))
-            # experts: each rank its own 96-of-384 subset plus its shared-expert shard
+            # experts: each rank its own 1/W subset of the routed experts (rank 0 also the shared one
+            # when the dense path is replicated); one all-reduce is the entire combine
             y = self.comm.all_reduce([r.moe(li, f[0]) for i, (r, f) in enumerate(zip(ranks, ffns))])
             nxt = []
             for i, r in enumerate(ranks):
@@ -272,6 +352,11 @@ class TPEngine:
         # replicated but the result must live on the card whose head shard multiplies it, so each rank
         # normalises its own copy of the same row (same values, four small elementwise calls).
         sl = slice(-1, None) if logits_last_only else slice(None)
+        if self.dense_replicated:
+            # the head is replicated too: rank 0's row is the answer, no gather; the other cards already
+            # did their (identical) attention work and have nothing left to contribute
+            x0 = rms(ranks[0].hc_pre(h[0][sl], pre[0][sl]), ranks[0].weights.final_norm, ranks[0].eps)
+            return ranks[0].mm(x0, ranks[0].weights.head)
         xs = [rms(r.hc_pre(h[i][sl], pre[i][sl]), ranks[i].weights.final_norm, ranks[i].eps)
               for i, r in enumerate(ranks)]
         logits = [r.mm(xs[i], r.weights.head) for i, r in enumerate(ranks)]
@@ -316,12 +401,17 @@ class ParallelRuntime:
 def build(*, model: str, devices: list[str], hbm_share: float = 0.5, dtype: str = "bfloat16",
           expert_slots_per_card: int | None = None, expert_reserve_gib: float = 6.0,
           io_threads: int = 6, expert_batch: int = 8, verbose: bool = False,
-          no_experts: bool = False) -> ParallelRuntime:
+          no_experts: bool = False, dense_replicated: bool = False) -> ParallelRuntime:
     """Build a TP/EP group: one sharded `Weights` and one expert streamer per card.
 
     ``expert_slots_per_card`` pins the tier (an A/B needs the two arms to see the same tier); left None,
     each card's tier is sized from what is left of its HBM share after its dense shard, exactly as
     `runtime.build` does for one card.
+
+    ``dense_replicated`` builds the **EP-only** layout: each card holds the whole dense path (all 15.09 GiB
+    of non-MoE weights) and only the routed experts are partitioned (`shard=None`, `tp_size=1`).  Every
+    dense/attention/vocabulary branch in `model.py` stays on the single-card code path; the only collective
+    is one all-reduce of the MoE partial per layer.
     """
     from . import runtime as rt
 
@@ -339,10 +429,15 @@ def build(*, model: str, devices: list[str], hbm_share: float = 0.5, dtype: str 
             from .model import NullExpertSource
             src = NullExpertSource(ckpt, cfg, dt)
         else:
+            # EP-only: this card holds its expert subset for *every* layer, so `layer_devices` names the
+            # card once per layer.  That is what `tier_slots_per_layer` divides the tier by (the real
+            # per-layer capacity), which is what keeps a 2 000-token prompt from evicting the decode set.
             src = ExpertStreamer(ckpt, cfg, dev, dt, cache_slots=0, io_threads=io_threads,
-                                 max_batch=expert_batch, layer_devices=None, landing_blocks=False)
+                                 max_batch=expert_batch,
+                                 layer_devices=([dev] * cfg.num_hidden_layers) if dense_replicated else None,
+                                 landing_blocks=False)
         weights = Weights(ckpt, cfg, dev, dt, expert_source=src, verbose=verbose,
-                          shard=(r, W)).load()
+                          shard=None if dense_replicated else (r, W)).load()
         if expert_slots_per_card is None:
             per_expert = 3 * cfg.moe_intermediate_size * cfg.hidden_size
             free = rt.free_hbm_bytes(dev) - int(expert_reserve_gib * GIB)
@@ -351,7 +446,14 @@ def build(*, model: str, devices: list[str], hbm_share: float = 0.5, dtype: str 
             slots = int(expert_slots_per_card)
         if not no_experts:
             src.set_slots({dev: slots})
-        ranks.append(Dsv41(cfg, weights, dev, dt, graphs=False, tp_rank=r, tp_size=W))
+        if dense_replicated:
+            ranks.append(Dsv41(cfg, weights, dev, dt, graphs=False, tp_rank=0, tp_size=1,
+                               ep_rank=r, ep_size=W))
+        else:
+            ranks.append(Dsv41(cfg, weights, dev, dt, graphs=False, tp_rank=r, tp_size=W))
+        if verbose:
+            alloc = [f"{torch.npu.memory_allocated(i) / GIB:.2f}" for i in range(torch.npu.device_count())]
+            print(f"  rank {r} on {dev} loaded: HBM allocated per card {alloc} GiB", flush=True)
         if verbose:
             print(f"  tp rank {r} on {dev}: {slots} tier slots", flush=True)
     return ParallelRuntime(cfg=cfg, engine=TPEngine(cfg, ranks, resolved), ckpt=ckpt, dtype=dt,

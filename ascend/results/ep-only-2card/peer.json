@@ -1,0 +1,153 @@
+{
+ "rows": [
+  {
+   "kiB": 20.4794921875,
+   "mechanism": "local copy_ npu:0->npu:0",
+   "median_us": 119.99532580375671,
+   "best_us": 117.15013533830643,
+   "GBs_median": 0.17476514072136845,
+   "GBs_best": 0.1790096096725787
+  },
+  {
+   "kiB": 20.4794921875,
+   "mechanism": "copy_ npu:0->npu:1 (default)",
+   "median_us": 233.17569866776466,
+   "best_us": 227.80057042837143,
+   "GBs_median": 0.08993647331096914,
+   "GBs_best": 0.09205859300775555
+  },
+  {
+   "kiB": 20.4794921875,
+   "mechanism": "copy_ non_blocking on npu:1 stream",
+   "median_us": 335.09498462080956,
+   "best_us": 323.2201561331749,
+   "GBs_median": 0.06258225566619743,
+   "GBs_best": 0.06488147351602483
+  },
+  {
+   "kiB": 20.4794921875,
+   "mechanism": "pinned host stage 0->cpu->1",
+   "median_us": 117.01509356498718,
+   "best_us": 112.48979717493057,
+   "GBs_median": 0.17921619648454362,
+   "GBs_best": 0.18642579617588276
+  },
+  {
+   "kiB": 20.4794921875,
+   "mechanism": "aclrtMemcpyAsync D2D 0->1",
+   "median_us": 82.5999304652214,
+   "best_us": 80.70934563875198,
+   "GBs_median": 0.2538864122752478,
+   "GBs_best": 0.25983360209441386
+  },
+  {
+   "kiB": 20.4794921875,
+   "mechanism": "aclrtMemcpy D2D 0->1 (sync)",
+   "median_us": 101.47038847208023,
+   "best_us": 99.79028254747391,
+   "GBs_median": 0.20667113150720037,
+   "GBs_best": 0.21015072274220012
+  },
+  {
+   "kiB": 20480.0,
+   "mechanism": "local copy_ npu:0->npu:0",
+   "median_us": 106.88509792089462,
+   "best_us": 98.1893390417099,
+   "GBs_median": 196.20621029435708,
+   "GBs_best": 213.58245411033369
+  },
+  {
+   "kiB": 20480.0,
+   "mechanism": "copy_ npu:0->npu:1 (default)",
+   "median_us": 1151.304692029953,
+   "best_us": 1146.5400457382202,
+   "GBs_median": 18.215438662916867,
+   "GBs_best": 18.291136081947414
+  },
+  {
+   "kiB": 20480.0,
+   "mechanism": "copy_ non_blocking on npu:1 stream",
+   "median_us": 1242.110040038824,
+   "best_us": 1231.449656188488,
+   "GBs_median": 16.883785915895587,
+   "GBs_best": 17.029945068895337
+  },
+  {
+   "kiB": 20480.0,
+   "mechanism": "pinned host stage 0->cpu->1",
+   "median_us": 1288.2202863693237,
+   "best_us": 1240.0299310684204,
+   "GBs_median": 16.27945175363246,
+   "GBs_best": 16.912107905275125
+  },
+  {
+   "kiB": 20480.0,
+   "mechanism": "aclrtMemcpyAsync D2D 0->1",
+   "median_us": 1050.3102093935013,
+   "best_us": 1045.1199486851692,
+   "GBs_median": 19.966977196298934,
+   "GBs_best": 20.066136931347998
+  },
+  {
+   "kiB": 20480.0,
+   "mechanism": "aclrtMemcpy D2D 0->1 (sync)",
+   "median_us": 919.1599674522877,
+   "best_us": 916.2798523902893,
+   "GBs_median": 22.815963208372214,
+   "GBs_best": 22.887679943296607
+  }
+ ],
+ "comm_rows": [
+  {
+   "kiB": 20,
+   "kind": "old: pull+add+push (copy_)",
+   "median_us": 500.25060772895813,
+   "best_us": 456.90033584833145
+  },
+  {
+   "kiB": 20,
+   "kind": "peer: add reads peer HBM",
+   "median_us": 561.4403635263443,
+   "best_us": 559.9493160843849
+  },
+  {
+   "kiB": 800,
+   "kind": "peer: 40 layers x 20 KiB",
+   "median_us": 20982.960239052773,
+   "best_us": 18442.440778017044
+  },
+  {
+   "kiB": 20480,
+   "kind": "old: pull+add+push (copy_)",
+   "median_us": 2223.2001647353172,
+   "best_us": 2215.939573943615
+  },
+  {
+   "kiB": 20480,
+   "kind": "peer: add reads peer HBM",
+   "median_us": 1603.8501635193825,
+   "best_us": 1578.2304108142853
+  },
+  {
+   "kiB": 524288,
+   "kind": "old: pull+add+push (copy_)",
+   "median_us": 53142.11454242468,
+   "best_us": 53136.929869651794
+  },
+  {
+   "kiB": 524288,
+   "kind": "peer: add reads peer HBM",
+   "median_us": 27849.62533041835,
+   "best_us": 27793.659828603268
+  }
+ ],
+ "sync_floor_us": 52.73055285215378,
+ "peer_enable_rc": {
+  "0->1": 0,
+  "1->0": 0
+ },
+ "can_access": [
+  true,
+  true
+ ]
+}

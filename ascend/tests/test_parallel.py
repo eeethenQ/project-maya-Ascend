@@ -44,6 +44,19 @@ def sharded(ckpt, cfg, world: int, device="cpu", cache_slots: int = 0):
     return TPEngine(cfg, ranks, [device] * world)
 
 
+def ep_only(ckpt, cfg, world: int, device="cpu", cache_slots: int = 0):
+    """EP-only: the dense weights are **replicated** (`shard=None`) and only the experts are split."""
+    ranks = []
+    for r in range(world):
+        src = ExpertStreamer(ckpt, cfg, device, DTYPE, cache_slots=cache_slots)
+        if cache_slots:
+            src.set_slots({device: cache_slots})
+        weights = Weights(ckpt, cfg, device, DTYPE, expert_source=src).load()
+        ranks.append(Dsv41(cfg, weights, device, DTYPE, tp_rank=0, tp_size=1,
+                           ep_rank=r, ep_size=world))
+    return TPEngine(cfg, ranks, [device] * world)
+
+
 @NEEDS_TORCH
 class TensorParallel(unittest.TestCase):
     @classmethod
@@ -136,6 +149,36 @@ class TensorParallel(unittest.TestCase):
         a = one.forward(ids, State(self.cfg, one.plan, "cpu", DTYPE, max_context=64))
         b = self.once.forward(ids, State(self.cfg, self.once.plan, "cpu", DTYPE, max_context=64))
         self.assertTrue(torch.equal(a, b))
+
+    def test_ep_only_reproduces_the_single_card_path(self):
+        """Dense replicated, experts split, one all-reduce of the MoE partial: the sum must be the same.
+
+        This is the layout part 2 asks about: every card holds the whole dense path and its strided
+        subset of each layer's routed experts; rank 0 alone adds the (replicated) shared expert so the
+        all-reduce cannot count it twice.  The only arithmetic difference is the order of the routed sum.
+        """
+        split = ep_only(self.ckpt, self.cfg, 2)
+        try:
+            ids = [3, 5, 7, 11, 13, 17, 19, 23]
+            want = self.once.forward(ids, State(self.cfg, self.once.plan, "cpu", DTYPE, max_context=64))
+            got = split.forward(ids, ParallelState(self.cfg, ["cpu", "cpu"], DTYPE, max_context=64))
+            rel = (got - want).abs().max() / want.abs().max().clamp_min(1e-6)
+            self.assertLess(rel.item(), 2e-3, f"EP prompt vs single card: max rel err {rel.item():.2e}")
+            self.assertEqual(int(got[0].argmax()), int(want[0].argmax()))
+            # one token at a time must match the whole chunk under EP too (the KV path is per rank)
+            whole = ParallelState(self.cfg, ["cpu", "cpu"], DTYPE, max_context=64)
+            w = split.forward(ids, whole)
+            piece = ParallelState(self.cfg, ["cpu", "cpu"], DTYPE, max_context=64)
+            for i in ids[:-1]:
+                split.forward([i], piece)
+            g = split.forward([ids[-1]], piece)
+            rel = (g - w).abs().max() / w.abs().max().clamp_min(1e-6)
+            self.assertLess(rel.item(), 2e-3, f"EP decode vs chunk: max rel err {rel.item():.2e}")
+            # the shared expert is added once, not once per rank
+            self.assertTrue(split.ranks[0].shared_is_mine)
+            self.assertFalse(split.ranks[1].shared_is_mine)
+        finally:
+            split.close()
 
     def test_the_collective_is_exact(self):
         """The hand-rolled all-reduce must be a plain sum, not an approximation: fp32 in, fp32 out."""

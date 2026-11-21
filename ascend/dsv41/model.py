@@ -955,12 +955,22 @@ class Dsv41:
 
     def __init__(self, cfg: TextConfig, weights: Weights, device, dtype=torch.bfloat16, engram=None,
                  index_buckets: IndexerBucketPolicy | None = None, graphs: bool = False,
-                 graph_verify: bool = False, tp_rank: int = 0, tp_size: int = 1):
+                 graph_verify: bool = False, tp_rank: int = 0, tp_size: int = 1,
+                 ep_rank: int | None = None, ep_size: int | None = None):
         self.cfg = cfg
         # This instance's place in a TP group.  `tp_size == 1` is the single-card engine and takes every
         # branch below the old way; see `ascend/dsv41/parallel.py` for the driver that steps all ranks.
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
+        # Expert parallelism is a *separate* axis: `ep_size > 1` with `tp_size == 1` is the EP-only layout
+        # (dense replicated on every card, each card's tier holding `1/ep_size` of every layer's experts).
+        # Defaulting the EP axis to the TP one keeps the existing TP+EP split byte for byte.
+        self.ep_rank = self.tp_rank if ep_rank is None else int(ep_rank)
+        self.ep_size = self.tp_size if ep_size is None else int(ep_size)
+        # With the dense path replicated, every card computes the shared expert; only rank 0 may add it or
+        # the all-reduce would sum it `ep_size` times.  With a sharded shared expert (TP), every rank adds
+        # its own shard.
+        self.shared_is_mine = not (self.ep_size > 1 and self.tp_size == 1 and self.ep_rank != 0)
         self.engram = engram
         self.plan = build_layer_plan(cfg)
         self.weights = weights
@@ -1490,14 +1500,14 @@ class Dsv41:
     def _ep_owns(self, e: int) -> bool:
         """Whether this card owns routed expert ``e`` under expert parallelism.
 
-        Strided (``e % tp_size == rank``) rather than contiguous: the router's preference over expert ids
+        Strided (``e % ep_size == ep_rank``) rather than contiguous: the router's preference over expert ids
         is learned and need not be uniform, so a contiguous 96-expert block can hand one card the hot
-        experts of every layer while another idles; ``e % tp_size`` spreads any skew evenly.  Either way
+        experts of every layer while another idles; ``e % ep_size`` spreads any skew evenly.  Either way
         the tier's candidate pool is the same 40 x 96 (layer, expert) pairs per card.  One token's six
         experts can still land on one card (all six the same residue), which is why the combine is a sum
         over every card rather than a pairwise exchange.
         """
-        return self.tp_size <= 1 or (e % self.tp_size) == self.tp_rank
+        return self.ep_size <= 1 or (e % self.ep_size) == self.ep_rank
 
     def moe(self, li: int, x: torch.Tensor) -> torch.Tensor:
         """The routed experts plus the shared one, for one layer.
@@ -1516,6 +1526,8 @@ class Dsv41:
 
         if isinstance(self.weights.experts, NullExpertSource):
             # no expert source: the routed branch is skipped, which is what a shape or dense-only check wants
+            if not self.shared_is_mine:
+                return torch.zeros(T, cfg.hidden_size, device=x.device, dtype=torch.float32)
             shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
             return self.mm(shared, lw.ffn["shared_w2"])
 
@@ -1524,6 +1536,8 @@ class Dsv41:
             y = self._routed_sum(li, x.to(dev), idx.to(dev), wts.to(dev)).to(x.device)
         else:
             y = self._routed_sum(li, x, idx, wts)
+        if not self.shared_is_mine:
+            return y
         shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
         return y + self.mm(shared, lw.ffn["shared_w2"])
 
@@ -1545,7 +1559,7 @@ class Dsv41:
             return self._routed_one(li, x, idx, wts)
         y = torch.zeros(T, self.cfg.hidden_size, device=x.device, dtype=torch.float32)
         uniq = torch.unique(idx).tolist()
-        if self.tp_size > 1:
+        if self.ep_size > 1:
             uniq = [e for e in uniq if self._ep_owns(e)]
         insert = self._tier_holds(x, len(uniq))
         # One quantisation of the layer's activation for all of its experts: `per_token_int8` is per row, so
@@ -1588,7 +1602,7 @@ class Dsv41:
         weights = wts[0]
         # EP: this card computes only its own experts; the top-k slot each came from picks its weight
         slots = list(range(len(ids)))
-        if self.tp_size > 1:
+        if self.ep_size > 1:
             pairs = [(i, e) for i, e in enumerate(ids) if self._ep_owns(e)]
             slots = [i for i, _ in pairs]
             ids = [e for _, e in pairs]

@@ -880,6 +880,14 @@ decides it, which nothing in the repo had measured.
 > transfer, so §18.1 most likely measured the wrong path and the tensor-parallel verdict that rests on it has
 > to be re-derived.  The re-measurement is in flight; treat everything below as the record of an experiment
 > whose bandwidth input was wrong rather than as a conclusion about the hardware.
+>
+> **Re-measured in §20.**  The 20.7 GB/s *is* the peer link (a kernel read of the other card's HBM, with
+> `aclrtDeviceEnablePeerAccess` on, also runs at 20.9 GB/s; an explicit pinned host stage is slower), and the
+> 250 us was the host-synchronous copy, not a host bounce.  What was missing is peer *access*: with it on,
+> the combine is a peer-reading add, 0.38-0.49 ms at 20 KB (the add is ~30 us; the event/sync ordering is
+> the rest) and 1.25 ms at 20 MB against 2.05 ms with copies.  The per-pair link is ~20 GB/s one way, not
+> 392; the vendor figure is the chip's aggregate.  §18's TP verdict stands for a different reason (§20.2),
+> and EP-only was built and measured there too: it loses 2.51x at decode.
 
 ### 18.1 The wire, as measured: 20.7 GB/s, and 250 us per cross-card copy whatever its size
 
@@ -1176,3 +1184,107 @@ cost statement), the two arms' *second* TTFT (the revoke's one-step cost), and
 `reused_tokens_reported` (should be 2 000) and **`tokens_identical`** - the bar.  If that last field is
 false, the finding is that KV resumed from a different chunking is not numerically identical at the
 $2\times10^{-3}$ tolerance, and the reuse must be withdrawn (leaving the lease and the 2 048 default).
+
+
+## 20. The wire, re-measured: 20.7 GB/s is the peer link, the 250 us was the copy; EP-only is 2.51x slower
+
+All numbers in this section are on **npu:0 and npu:1** (`ASCEND_RT_VISIBLE_DEVICES=0,1`; logical 0 and 1).
+Cards 2 and 3 were held by another process, so there is no four-card collective here; the four-card numbers
+in §18 are not re-measured, and the EP A/B is today's two-card layer-blocked layout (20 layers of
+experts a card) against EP-only.
+
+### 20.1 What the copy path actually did
+
+`aclrtDeviceCanAccessPeer(0,1)` reports **true**, and `aclrtDeviceEnablePeerAccess` succeeds, but the engine
+had never called it.  Without it a vector kernel whose operand lives on another card is an
+`MTE accesses an invalid GM address` fault - the fault recorded in `bench_hccs.py` - and `copy_` still works
+because it is a transfer, not a kernel.  `ascend/bench_peer.py` enables peer access and separates the paths:
+
+| mechanism | 20 KB | 20 MB | 512 MiB |
+|---|---:|---:|---:|
+| local `copy_` (same card, control) | 121 us | 104 us / 201 GB/s | 951 us / 564 GB/s |
+| cross `copy_`, destination current (the old probe) | 239 us | 1 154 us / 18.2 GB/s | 26.0 ms / **20.7 GB/s** |
+| cross `copy_`, `non_blocking=True`, destination stream | 337 us | 1 244 us / 16.9 GB/s | 26.0 ms / 20.6 GB/s |
+| pinned host stage (explicit D2H then H2D) | 121 us | 1 786 us / 11.8 GB/s | 31.9-38.4 ms / 14-17 GB/s |
+| `aclrtMemcpyAsync` D2D, peer access on | 78 us | 1 051 us / 20.0 GB/s | 25.7 ms / 20.9 GB/s |
+| `aclrtMemcpy` D2D sync, peer access on | 102 us | 919 us / 22.8 GB/s | 20.8 ms / **25.8 GB/s** |
+| kernel reads the peer's HBM (`add` with a peer operand) | 72 us | 1 076 us / **20.9 GB/s** | 25.7 ms / 20.9 GB/s |
+| HCCL 2-process all-reduce | 238 us (156 amortised) | 1 346 us / 31.2 GB/s bus | 29.5 ms / 36.5 GB/s bus |
+| HCCL 2-process broadcast (one hop) | 259 us | 1 320 us / 15.9 GB/s | 27.9 ms / **19.2 GB/s** |
+
+The harness floor (empty call + synchronise both cards) is 47 us, so the small-size figures are inflated by
+about that much.  Four independent facts say the 20.7 was **not** host-staged:
+
+1. **Peer access is the gate.**  With it off, `x.add_(y)` across cards faults on every vector core and
+   `y.copy_` into a peer still runs; with it on, the add runs and is exact (`1 + 2 = 3`).  A kernel read of
+   peer HBM cannot be a host bounce, and it measures **20.9 GB/s** - the same number.
+2. **The explicit host stage is slower, not faster.**  At 20 MB it costs 1 786 us against the copy's
+   1 154 us; at 512 MiB 31.9-38.4 ms against 26.0 ms.  A D2H+H2D copy cannot be faster than the copy it is
+   supposed to implement.
+3. **The transfer rate matches the link, not the host.**  `npu-smi info -t hccs -i 0 -c 0` reports 7 HCCS
+   links, lane mode 4, link speed 224; one peer link is about 28 GB/s raw, and every direct mechanism here
+   delivers 19-26 GB/s one way (HCCL broadcast, the cleanest one-hop number, is 19.2).  The vendor's
+   392 GB/s is the chip's aggregate over its HCCS ports, not what one pair gets.
+4. **HCCL, which surely uses HCCS, is the same order.**  A 20 MB two-rank all-reduce is 1.35 ms
+   (31.2 GB/s bus = 15.6 GB/s a direction); the fixed 250 us was a host-synchronous copy plus two device
+   synchronises, which is why `non_blocking=True` and a destination stream did not move it.
+
+So the wire is real and per-pair ~20 GB/s; the old probe's *mechanism* label was wrong, and its **collective
+price** was wrong because it copied instead of computing: a two-card 20 KB all-reduce is **450 us** as
+`copy_` pull+add+push and **480-560 us** as one peer-reading add per card - the add itself is ~30 us and the
+event/sync ordering and two device switches are the rest, so peer access does not help at decode width.
+It does help at prefill width: 20 MB is **1.25 ms** peer against **2.05 ms** by copy, and a real HCCL
+all-reduce (two processes) is **156-238 us** at 20 KB and **1.35 ms** at 20 MB.  Forty decode layers
+therefore cost **18-21 ms/token** in one process (15 ms with a stream sync, 5.9 ms with HCCL), not 117 ms -
+and at 0.8 % of the EP step the combine is not what decides it.
+
+### 20.2 EP-only: dense replicated, 192 experts a card, one all-reduce a layer
+
+`parallel.build(..., dense_replicated=True)` builds it on the existing `tp_size` machinery: `shard=None` on
+every card (the whole 15.09 GiB dense path, including embed and head), `tp_size=1` so every sharded branch
+in `model.py` is inert, `ep_size=W`, `ep_rank=r` and the tier's expert subset owned by `e % W`.  The one new
+collective is `TPComm._peer_sum`: each card's `torch.add(own, peer, out=fresh)` reads the other's partial
+over peer HBM, with a recorded event ordering it after the peer's MoE.  Rank 0 alone adds the replicated
+shared expert, or the all-reduce would count it twice.  `--no-experts` pins the floor.  EP runs **eager**: a
+capture cannot hold a cross-device operand, and per-card graphs with eager collectives between replays are
+the only way to remove the dispatch (not built here; what it would buy is in the last paragraph).
+
+Interleaved paired A/B, same fixed token stream, same positions, two rounds, cards 0-1, `hbm_share=0.5`,
+reserve 6 GiB:
+
+| arm (two cards) | tier | fetch hit | GB/step | decode ms/token | 2 000-token prefill |
+|---|---:|---:|---:|---:|---:|
+| today: layer-blocked, dense on npu:0, captured decode | 996 (254 + 742) | **55.8 %** | 3.75 | **969.5** (1 026.6 / 924.5) | **78.3 s** |
+| EP-only: dense replicated, 284 slots a card, eager | 568 (284 + 284) | **46.0 %** | 4.60 | **2 463.4** (2 414.9 / 2 484.0) | 83.8 s |
+
+Paired per-step ratio EP/baseline (ms, >1 = EP slower): **2.514 [2.378, 2.664] 95 % CI, n=20**; prefill
+**1.070x** (n=1 pair).  The token streams diverge after ~3 steps, as expected: the routed sum is
+`(a+b+c)+(d+e+f)` under EP against a single running accumulator, and at 40 bf16 layers that is enough to
+flip a router tie (§18.6's mechanism).
+
+Answers, in the order asked:
+
+1. **No, not at either size.**  Decode is 2.51x slower and the 2 000-token prefill is 1.07x slower.
+2. **The all-reduce is not the problem.**  40 layers of 20 KB cost ~19 ms/token in one process (15 ms with
+   a stream sync; the old copy combine is the same 18 ms at this size), 0.8 % of the 2 463 ms step; a real
+   two-process HCCL group would be 5.9 ms.  At 20 MB, the prefill width, the peer combine pays: 1.25 ms
+   against 2.05 ms by copy, but 40 of them are still under 1 % of the 80 s prompt.
+3. **The tier's hit rate falls, and the estimate got the direction right.**  From the router's actual top-k
+   on the same 12-step stream, a per-(card, layer) LRU at each layout's own slots estimates 45.4 % for the
+   layer split and 40.1 % for EP (measured: 55.8 % and 46.0 %).  The mechanism: a card's slots now split
+   over 40 layers instead of 20, so per-layer capacity is 7.1 slots of 192 (EP) against 12.7 of 384 on
+   card 0 and 37.1 on card 1; each card sees only ~3 of the 6 draws (2.92 / 3.08), and the median reuse gap
+   is 1 step, so a handful of slots still works - just not as well.  Misses rise 23 % (4.60 vs 3.75 GB/step).
+4. **The dense replication costs 15.09 GiB a card and, at runtime, the dispatch.**  The tier drops from 996
+   to 568 slots (-43 %) because 15.09 GiB of every card's 30.48 is now the same weights; that is the hit-rate
+   cost above.  The bigger cost is that EP cannot use the captured decode: its **no-expert floor is 792
+   ms/token** (two eager dense paths + 40 peer collectives) against 301 ms for the single-card eager path,
+   i.e. 82 % of the baseline's whole 969.5 ms step before a single expert byte is read.
+
+**The number that kills it** is that 792 ms floor, not the wire.  And removing it would not be enough: the
+two fetch streams do not aggregate the array (prefill: 3.68 GB/s for EP against 3.74 GB/s for one stream,
+and §18.5 saw the same with four), so with the dispatch removed EP would still read 23 % more bytes at the
+same rate - about 1.25 s against the baseline's 969 ms.  EP-only would need per-card captured graphs *and*
+either a better tier (no dense replication: one dense driver, the other card just its experts over peer
+reads) or a routing split that does not cost 10 hit-rate points.  The wire is no longer the excuse: a 20 KB
+combine is 0.4-0.6 ms (mostly host ordering, not the link), and the peer link is 20.9 GB/s.
