@@ -874,12 +874,19 @@ held ten layers' experts (§9, §14).  That is the right shape for *four convers
 path sharded 4 ways (TP) and the routed experts split by expert (EP) - and it starts with the number that
 decides it, which nothing in the repo had measured.
 
-> **This section is provisional, and its headline conclusion is not established.**  `npu-smi info -t topo`
-> reports **HCCS between every pair of NPUs** on this host - it is not PCIe.  A `copy_` at 20.7 GB/s with a
-> fixed ~250 us per transfer is the signature of a **host-staged copy** (D2H then H2D), not a peer-to-peer
-> transfer, so §18.1 most likely measured the wrong path and the tensor-parallel verdict that rests on it has
-> to be re-derived.  The re-measurement is in flight; treat everything below as the record of an experiment
-> whose bandwidth input was wrong rather than as a conclusion about the hardware.
+> **What the re-measurement settled.**  The topology is HCCS on every pair, and the 20.7 GB/s is nevertheless
+> real - it is **peer-to-peer, not host-staged**, which a first reading of "250 us per copy" got wrong.  Three
+> proofs: a kernel with a cross-device operand faults `MTE invalid GM address` until
+> `aclrtDeviceEnablePeerAccess` and then computes exactly; a *kernel read* of peer HBM runs at 20.9 GB/s, and a
+> kernel read cannot be a host bounce; and an explicit pinned D2H+H2D stage is 1.5-1.8x **slower**, so the copy
+> is not doing that.  `npu-smi info -t hccs` shows 7 links of 224 Gbps - ~28 GB/s a link, which the direct paths
+> deliver; the 392 GB/s figure is the chip's aggregate across links, not one transfer's rate.
+>
+> **But the collective is far cheaper than this section charged it.**  A 20 KB two-rank all-reduce by HCCL is
+> **156-238 us**, so 40 layers is **6-21 ms a token**, not 117 ms.  So the 5x loss below is *not* explained by
+> the wire: it is eager host dispatch (a capture cannot hold a cross-device operand) plus a numerical parity
+> failure.  Read §18.2 onwards with that correction - the measured ratios stand, the attribution does not, and
+> the untested route is per-card graphs with HCCL collectives between the replays.
 >
 > **Re-measured in §20.**  The 20.7 GB/s *is* the peer link (a kernel read of the other card's HBM, with
 > `aclrtDeviceEnablePeerAccess` on, also runs at 20.9 GB/s; an explicit pinned host stage is slower), and the
