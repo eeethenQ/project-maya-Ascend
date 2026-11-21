@@ -78,7 +78,7 @@ class TPComm:
         # reads the peer's HBM directly.  CPU tests have no peer axis and take the copy path.
         self.peer = False
         self._peer_events: list = []
-        if self.size == 2 and all(d.startswith("npu") for d in self.devices):
+        if self.size >= 2 and all(d.startswith("npu") for d in self.devices):
             try:
                 self.peer = self._enable_peer()
             except Exception:                                  # noqa: BLE001 - fall back, do not fail
@@ -372,6 +372,89 @@ class TPEngine:
         self.ranks.clear()
 
 
+class SplitEngine:
+    """One dense driver plus experts-only ranks: the *other* expert split, stepped from one process.
+
+    The driver (rank 0) holds the whole dense path, the KV and its own residue class of every layer's
+    routed experts; every other rank holds **experts only** - `Weights(dense=False)` never allocates the
+    15.09 GiB of attention/shared/head weights, which is what keeps the tier at its full size.  A layer's
+    six routed ids are split by `e % ep_size`, so each card owns 96 of the 384 experts of *every* layer -
+    40 x 96 = 3 840 candidates, the same number today's 10-layer x 384 split gives a card.
+
+    Decode stays captured: the driver's `g_pre`/`g_post` per layer, and one partial-expert graph per card
+    per layer.  The hand-off between them is outside every graph (a capture cannot read a peer's live
+    HBM), and `advance`/`gather_partials` keep it to a peer-read kernel for the activation and one for
+    each partial - `perf` reports the measured per-step bill.
+    """
+
+    def __init__(self, cfg: TextConfig, ranks: list[Dsv41], devices: list[str], graphs: bool):
+        self.cfg = cfg
+        self.ranks = ranks
+        self.driver = ranks[0]
+        self.workers = ranks[1:]
+        self.devices = [str(d) for d in devices]
+        # enables peer access for every ordered pair; the activation and the partial sums are read with a
+        # kernel, not copied, so this is load-bearing rather than an optimisation
+        self.comm = TPComm(self.devices)
+        self.device = self.driver.device
+        self.dtype = self.driver.dtype
+        self.graphs = bool(graphs)
+        self.timers: dict[str, float] | None = None
+        self.expert_cards = None
+        self.shared_is_mine = True
+
+    def state(self, max_context: int = 8192):
+        return State(self.cfg, build_layer_plan(self.cfg), self.device, self.dtype,
+                     max_context=max_context)
+
+    def forward(self, ids, state, logits_last_only: bool = True, compute_logits: bool = True,
+                entries_bucket: int | None = None):
+        return self.driver.forward(ids, state, logits_last_only=logits_last_only,
+                                   compute_logits=compute_logits, entries_bucket=entries_bucket,
+                                   workers=self.workers)
+
+    # -- the interface the engine's callers use ------------------------------------------------
+    def release_graphs(self) -> None:
+        self.driver.release_graphs()
+
+    def graph_summary(self, state) -> str:
+        g = self.driver._decode_graphs
+        if g is not None:
+            return g.describe()
+        return (f"graphs: {'on' if self.graphs else 'off'} - one dense driver ({self.driver.device}) with "
+                f"{len(self.workers)} experts-only cards; the split hand-off is outside every graph")
+
+    def expert_stats(self) -> dict[str, int]:
+        total: dict[str, int] = {}
+        for r in self.ranks:
+            stats = r.weights.experts.stats() if hasattr(r.weights.experts, "stats") else {}
+            for k, v in stats.items():
+                total[k] = total.get(k, 0) + int(v)
+        return total
+
+    def split_timers(self) -> dict[str, float]:
+        """The hand-off's own bill for the last captured step, in ms (empty when the eager path ran)."""
+        g = self.driver._decode_graphs
+        if g is None:
+            return {}
+        return {k: v * 1e3 for k, v in g.split_timers.items()}
+
+    def reset_split_timers(self) -> None:
+        g = self.driver._decode_graphs
+        if g is not None:
+            for k in g.split_timers:
+                g.split_timers[k] = 0.0
+
+    def close(self) -> None:
+        self.driver.release_graphs()
+        for r in self.ranks:
+            try:
+                r.weights.experts.close()
+            except Exception:                               # noqa: BLE001 - teardown is best effort
+                pass
+        self.ranks.clear()
+
+
 @dataclass
 class ParallelRuntime:
     cfg: TextConfig
@@ -401,7 +484,8 @@ class ParallelRuntime:
 def build(*, model: str, devices: list[str], hbm_share: float = 0.5, dtype: str = "bfloat16",
           expert_slots_per_card: int | None = None, expert_reserve_gib: float = 6.0,
           io_threads: int = 6, expert_batch: int = 8, verbose: bool = False,
-          no_experts: bool = False, dense_replicated: bool = False) -> ParallelRuntime:
+          no_experts: bool = False, dense_replicated: bool = False,
+          expert_split: bool = False, graphs: bool = False) -> ParallelRuntime:
     """Build a TP/EP group: one sharded `Weights` and one expert streamer per card.
 
     ``expert_slots_per_card`` pins the tier (an A/B needs the two arms to see the same tier); left None,
@@ -422,6 +506,11 @@ def build(*, model: str, devices: list[str], hbm_share: float = 0.5, dtype: str 
     # claim the share of every card first, so the tier arithmetic sees the same numbers one card would
     resolved = [rt.resolve_device(d, hbm_share) for d in devices]
     ckpt = Checkpoint(model_dir)
+    if expert_split:
+        return _build_expert_split(cfg=cfg, ckpt=ckpt, dt=dt, resolved=resolved, graphs=graphs,
+                                   expert_reserve_gib=expert_reserve_gib, io_threads=io_threads,
+                                   expert_batch=expert_batch, verbose=verbose,
+                                   expert_slots_per_card=expert_slots_per_card)
     ranks: list[Dsv41] = []
     for r in range(W):
         dev = resolved[r]
@@ -458,3 +547,48 @@ def build(*, model: str, devices: list[str], hbm_share: float = 0.5, dtype: str 
             print(f"  tp rank {r} on {dev}: {slots} tier slots", flush=True)
     return ParallelRuntime(cfg=cfg, engine=TPEngine(cfg, ranks, resolved), ckpt=ckpt, dtype=dt,
                            devices=resolved)
+
+
+def _build_expert_split(*, cfg: TextConfig, ckpt: Checkpoint, dt, resolved: list[str], graphs: bool,
+                        expert_reserve_gib: float, io_threads: int, expert_batch: int, verbose: bool,
+                        expert_slots_per_card: int | None) -> ParallelRuntime:
+    """The one-driver split: dense + KV on rank 0, a 96-expert slice of *every* layer on each card.
+
+    The tier arithmetic is `runtime.build`'s, per card: the driver's is what is left of its share after
+    the 15.09 GiB dense path and a 6 GiB (+1 with graphs) reserve; an experts-only card has only the
+    in-flight batch and its landing zone to reserve (5 GiB, +1 with graphs).  Both arms of the A/B are
+    sized by the same code, so neither gets a tier the other could not have.
+    """
+    from . import runtime as rt
+
+    W = len(resolved)
+    ranks: list[Dsv41] = []
+    streamers: list = []
+    for r, dev in enumerate(resolved):
+        src = ExpertStreamer(ckpt, cfg, dev, dt, cache_slots=0, io_threads=io_threads,
+                             max_batch=expert_batch, landing_blocks=graphs, split_layers=True)
+        weights = Weights(ckpt, cfg, dev, dt, expert_source=src, verbose=verbose,
+                          dense=(r == 0)).load()
+        ranks.append(Dsv41(cfg, weights, dev, dt, graphs=graphs, tp_rank=0, tp_size=1,
+                           ep_rank=r, ep_size=W))
+        streamers.append((dev, src))
+        if verbose:
+            used = torch.npu.memory_allocated(int(dev.split(":")[-1])) / GIB
+            print(f"  rank {r} on {dev} loaded: {used:.2f} GiB resident", flush=True)
+    per_expert = 3 * cfg.moe_intermediate_size * cfg.hidden_size
+    cap = cfg.num_hidden_layers * cfg.n_routed_experts
+    graph_reserve = 1.0 if graphs else 0.0
+    reserve = int((expert_reserve_gib + graph_reserve) * GIB)
+    for r, (dev, src) in enumerate(streamers):
+        if expert_slots_per_card is not None:
+            slots = int(expert_slots_per_card)
+        elif r == 0:
+            slots = int(max(0, rt.free_hbm_bytes(dev) - reserve) // per_expert)
+        else:
+            slots = int(max(0, rt.free_hbm_bytes(dev) - int((5.0 + graph_reserve) * GIB)) // per_expert)
+        src.set_slots({dev: min(slots, cap)})
+        if verbose:
+            print(f"  rank {r} on {dev}: {src.cache_slots} tier slots for 40 layers "
+                  f"({src.cache_slots / cfg.num_hidden_layers:.1f} per layer, of 96 owned)", flush=True)
+    return ParallelRuntime(cfg=cfg, engine=SplitEngine(cfg, ranks, resolved, graphs), ckpt=ckpt,
+                           dtype=dt, devices=resolved)

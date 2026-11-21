@@ -283,12 +283,16 @@ class Weights:
 
     def __init__(self, ckpt: Checkpoint, cfg: TextConfig, device, dtype=torch.bfloat16,
                  expert_source: "ExpertSource | None" = None, verbose: bool = False,
-                 shard: "tuple[int, int] | None" = None):
+                 shard: "tuple[int, int] | None" = None, dense: bool = True):
         self.ckpt = ckpt
         self.cfg = cfg
         self.device = device
         self.dtype = dtype
         self.verbose = verbose
+        # ``dense=False`` is the split-EP worker: this card holds routed experts only.  The dense tensors
+        # are not allocated (that is the whole point - 15.09 GiB of HBM is what buys the tier), and a
+        # worker is only ever asked for the experts of a layer the driver routed.
+        self.dense = bool(dense)
         # Tensor parallelism: this copy holds rank `r` of a `w`-way split.  The dense weights are the only
         # thing split here - the routed experts are the expert tier's business (`ExpertStreamer`), and a
         # TP forward asks each card only for the experts it owns (`Dsv41._ep_owns`).  `shard=None` is the
@@ -359,6 +363,13 @@ class Weights:
     def load(self, layers: "range | list[int] | None" = None) -> "Weights":
         cfg = self.cfg
         dev, dt = self.device, self.dtype
+        if not self.dense:
+            # experts-only: no embed, head, attention, shared expert, mHC or norms on this card.  The
+            # per-layer records still exist (empty) so a caller that indexes them by layer does not have
+            # to special-case the split; nothing reads them on a worker.
+            self.embed = self.head = self.final_norm = None
+            self.layers = [LayerWeights() for _ in range(cfg.num_hidden_layers)]
+            return self
         if self.tp_size > 1:
             # a vocab shard per rank: the embedding lookup and the head's logits are gathered across the
             # group in `TPEngine` (two small collectives a step), which keeps HBM symmetric.  Replicating
@@ -462,6 +473,8 @@ class Weights:
                 "k_weight": self._put(B + "k_weight", torch.float32)}
 
     def resident_bytes(self) -> int:
+        if not self.dense:
+            return 0
         total = 0
         for t in (self.embed, self.head, self.final_norm):
             total += t.numel() * t.element_size()
@@ -537,11 +550,17 @@ class ExpertStreamer(ExpertSource):
 
     def __init__(self, ckpt: Checkpoint, cfg: TextConfig, device, dtype=torch.bfloat16,
                  cache_slots: int = 0, io_threads: int = 6, pin: bool = True, max_batch: int = 8,
-                 layer_devices: "list[str] | None" = None, landing_blocks: bool = False):
+                 layer_devices: "list[str] | None" = None, landing_blocks: bool = False,
+                 split_layers: bool = False):
         self.ckpt, self.cfg, self.device, self.dtype = ckpt, cfg, device, dtype
         # the experts of a layer may live on another card than the layer itself: their tier is what needs
         # the room, and moving a token's 20 KB activation costs nothing next to a 35 MB expert
         self.layer_devices = list(layer_devices) if layer_devices else None
+        # `split_layers` is the one-driver split: this card holds a slice of *every* layer's experts, so
+        # its slots are shared by all 40 layers rather than by the 10 whose whole expert set it held.  It
+        # changes only the per-layer capacity the insert decision sees; the ownership is `e % ep_size`,
+        # which `Dsv41._ep_owns` already implements.
+        self.split_layers = bool(split_layers)
         self.cache_slots = max(0, int(cache_slots))
         self._cache: dict[tuple[int, int], dict] = {}
         # one LRU per card: the slots are HBM on a card, so a single global LRU can put more expert bytes
@@ -814,7 +833,8 @@ class ExpertStreamer(ExpertSource):
         fills it; `_routed_sum` uses this to decide whether a fetch may insert.
         """
         devices = self.layer_devices or [self.device]
-        layers = sum(1 for d in devices if str(d) == str(device))
+        layers = (self.cfg.num_hidden_layers if self.split_layers
+                  else sum(1 for d in devices if str(d) == str(device)))
         return int(self._slots.get(str(device), 0) // max(1, layers))
 
     def fetch_int8(self, layer: int, experts: list[int], insert: bool = True) -> list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
@@ -999,6 +1019,15 @@ class Dsv41:
         self._graph_reason_logged = False
         # where each layer's experts are computed; empty means "on the card the layer is on"
         self.expert_device_for = getattr(weights.experts, "device_for", None)
+        # The one-driver split: this instance runs the dense path and is handed the experts-only ranks
+        # (`forward(..., workers=)`); a layer's experts are `e % ep_size` on every card, which
+        # `_ep_owns` already selects.  `Weights.dense` is False on the workers, so their `Weights` has no
+        # embed/head/attention at all and this flag is the only thing that says "driver".
+        self.expert_split = bool(getattr(weights.experts, "split_layers", False))
+        # the eager exchange buffers, per peer card (see `_split_partial`); allocated on first use
+        self._split_x = None
+        self._split_idx = None
+        self._split_wts = None
         # The captured decode puts each layer's `g_post` - and therefore that layer's landing zone - on
         # the card its experts live on.  Normally that is the streamer's own placement; an explicit map
         # (`{layer: "npu:2"}`) overrides it, which is also how the CPU tests exercise a spread tier.
@@ -1683,10 +1712,67 @@ class Dsv41:
                                        entries_bucket=entries_bucket)
         return rms(self.hc_pre(h, pre), self.weights.final_norm, self.eps)
 
+    # -- the one-driver split, eagerly ----------------------------------------------------------
+    def _split_partial(self, li: int, x: torch.Tensor, idx: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+        """One worker's part of a layer's routed experts, for a chunk of tokens.
+
+        The activation, the ids and the weights are copied into this card first: a kernel may read peer
+        HBM once peer access is on, but the eager path must also work on the CPU test, where "peer" is the
+        same device, and a copy is what makes the two identical.  `_routed_sum` then keeps only the
+        experts `e % ep_size == ep_rank` - the same ownership rule EP-only used.
+        """
+        if self._split_x is None or self._split_x.shape != x.shape or self._split_x.dtype != x.dtype:
+            self._split_x = torch.empty(x.shape, dtype=x.dtype, device=self.device)
+            self._split_idx = torch.empty(idx.shape, dtype=idx.dtype, device=self.device)
+            self._split_wts = torch.empty(wts.shape, dtype=wts.dtype, device=self.device)
+        self._split_x.copy_(x)
+        self._split_idx.copy_(idx)
+        self._split_wts.copy_(wts)
+        return self._routed_sum(li, self._split_x, self._split_idx, self._split_wts)
+
+    def _moe_split(self, li: int, x: torch.Tensor, workers: "list[Dsv41]") -> torch.Tensor:
+        """The layer's MoE with the routed experts split over `workers`.
+
+        The driver routes and keeps the shared expert (its weights are part of the dense path and do not
+        move); each card, the driver included, computes its own residue class of the six ids and the
+        partials are summed here.  The order is driver, then the workers in card order, then the shared
+        expert, so a decode stream can diverge from the single-card one where a bf16 tie flips - the
+        mechanism §18.6 records, not a new one.
+        """
+        idx, wts = self.router(li, x)
+        y = self._routed_sum(li, x, idx, wts)
+        recv = None
+        for w in workers:
+            got = w._split_partial(li, x, idx, wts)
+            if recv is None or recv.shape != got.shape:
+                recv = torch.empty(got.shape, dtype=got.dtype, device=x.device)
+            recv.copy_(got)                     # the worker's HBM -> the driver, one small copy a layer
+            y = y + recv
+        lw = self.weights.layers[li]
+        shared = self.swiglu(x, lw.ffn["shared_w1"], lw.ffn["shared_w3"])
+        return y + self.mm(shared, lw.ffn["shared_w2"])
+
+    def _eager_layers_split(self, h: torch.Tensor, pre: torch.Tensor, state: State,
+                            positions: torch.Tensor, host_positions: list[int], engram_rows,
+                            workers: "list[Dsv41]", start: int = 0) -> torch.Tensor:
+        """Every layer eagerly with the experts split over `workers`: the prompt path and the fallback.
+
+        The dense half of each layer runs here, exactly as on one card; only `_moe_split` is new.
+        """
+        for li in range(start, self.cfg.num_hidden_layers):
+            o, res, a_pre, a_post, a_comb = self._attn_half(li, h, pre, state, positions,
+                                                            host_positions, engram_rows)
+            x, res, f_pre, f_post, f_comb = self._ffn_half(li, o, res, a_pre, a_post, a_comb)
+            with self.phase("moe"):
+                h = self.hc_post(self._moe_split(li, x, workers), res, f_post, f_comb)
+            pre = f_pre
+        return rms(self.hc_pre(h, pre), self.weights.final_norm, self.eps)
+
     # -- the whole forward ----------------------------------------------------------------------
     @torch.inference_mode()
     def forward(self, ids: list[int] | torch.Tensor, state: State, logits_last_only: bool = True,
-                compute_logits: bool = True, entries_bucket: int | None = None):
+                compute_logits: bool = True, entries_bucket: int | None = None,
+                workers: "list[Dsv41] | None" = None):
         """Run a chunk of tokens through the 40 layers; returns the logits (or just the last row's).
 
         ``compute_logits=False`` skips the head for a prompt chunk whose logits nothing will read.
@@ -1717,7 +1803,14 @@ class Dsv41:
         pre = torch.zeros(T, self.hc, device=dev, dtype=torch.float32)
         pre[:, 0] = 1.0
 
-        if T == 1 and self.graphs and self._graphs_usable():
+        if workers:
+            workers = [w for w in workers if w is not self]
+            if T == 1 and self.graphs and self._graphs_usable():
+                x = self._graph_decode(h, pre, state, engram_rows, workers=workers)
+            else:
+                x = self._eager_layers_split(h, pre, state, positions, host_positions, engram_rows,
+                                             workers)
+        elif T == 1 and self.graphs and self._graphs_usable():
             x = self._graph_decode(h, pre, state, engram_rows)
         else:
             x = self._eager_layers(h, pre, state, positions, host_positions, engram_rows,
@@ -1790,7 +1883,8 @@ class Dsv41:
             print(f"graphs: not used - {reason}; the eager path runs", flush=True)
         return False
 
-    def _graph_decode(self, h: torch.Tensor, pre: torch.Tensor, state: State, engram_rows) -> torch.Tensor:
+    def _graph_decode(self, h: torch.Tensor, pre: torch.Tensor, state: State, engram_rows,
+                      workers: "list[Dsv41] | None" = None) -> torch.Tensor:
         """One decode token through 40 captured `g_pre` / `g_post` pairs, with the host seam between them.
 
         Per layer: replay `g_pre` (engram, mHC, attention, compressor/indexer, router, shared expert) on the
@@ -1800,9 +1894,17 @@ class Dsv41:
         ``pread`` + async H2D, outside every graph); replay that card's `g_post` (six expert matmul triples,
         the post-mHC); hand the residual back.  Anything that fails to capture or replay disables graphs and
         finishes the step (and the request) on the eager path.
+
+        With ``workers`` the same seam is used *per card*: every layer's `g_post` runs here on the driver
+        (the post-MHC must follow the full sum), each worker has a captured partial-expert graph on its own
+        card, the activation reaches it over peer HBM and its partial comes back the same way.  That is
+        still one dense path, still captured; what the split adds is the per-layer hand-off, measured
+        separately (``Dsv41.split_timers``).
         """
         g = self._decode_graphs
-        if g is None or g.state is not state or g.state.kv is not state.kv:
+        stale = (g is not None and workers is not None
+                 and g.split_workers != [str(w.device) for w in workers])
+        if g is None or stale or g.state is not state or g.state.kv is not state.kv:
             if g is not None:
                 try:
                     g.close()
@@ -1812,7 +1914,7 @@ class Dsv41:
                     print(f"graphs: teardown of the previous State's graphs failed ({teardown})",
                           flush=True)
             g = self._decode_graphs = _DecodeGraphs(self, state, verify=self.graph_verify,
-                                                   cards=self.expert_cards)
+                                                   cards=self.expert_cards, workers=workers)
             print(g.describe(), flush=True)
         b = g.buffers
         g.activate(g.compute_key)
@@ -1834,6 +1936,16 @@ class Dsv41:
                     g.engram[li].copy_(e.view_as(g.engram[li]))
                 g.replay_pre(li)
                 ids = b.idx.cpu().tolist()              # the ONE host break: six ints, one sync
+                if g.split:
+                    wts = b.wts.cpu().tolist()          # same sync, six more floats
+                    for key, worker in g.workers.items():
+                        g.stage_worker(li, key, ids, wts)   # x over peer, masked wts, the fetch
+                        g.replay_work(li, key)              # that card's partial experts
+                    g.fetch_own(li, ids, wts)               # the driver's own residue class
+                    g.gather_partials(li)                   # partials -> the driver, over peer
+                    g.replay_post(li)                       # sum, shared expert, post-MHC
+                    posted = li
+                    continue
                 key = g.card_of[li]
                 if key != g.compute_key:
                     g.carry(li)                         # registers -> the expert card, outside the graphs
@@ -1861,6 +1973,9 @@ class Dsv41:
                 print(f"graphs: teardown of the failed capture also failed ({teardown})", flush=True)
             self._decode_graphs = None
             # layer `start`'s own input pre-mix is still in its parity (g_pre writes the other one)
+            if g.split:
+                return self._eager_layers_split(b.h, b.pres[start % 2], state, state.pos, [],
+                                                engram_rows, workers, start=start)
             return self._eager_layers(b.h, b.pres[start % 2], state, state.pos, [], engram_rows,
                                       start=start)
         g.activate(g.compute_key)
@@ -1920,18 +2035,20 @@ class Dsv41:
         pre_out.copy_(f_pre)
         return (b.x, b.idx, b.wts, b.yshared, b.res, b.fpost, b.fcomb, pre_out)
 
-    def _layer_post_body(self, li: int, g: "_DecodeGraphs"):
-        """What `g_post` captures: the six unrolled expert matmul triples and the post-MHC.
+    def _run_experts(self, li: int, g: "_DecodeGraphs", regs: "_CardRegisters") -> torch.Tensor:
+        """The six unrolled expert matmul triples of one card, from its landing zone into its `y`.
 
         Same arithmetic as `_routed_one`, on the same per-token activation quantisation, but the expert
         weights are read from this layer's parity of *this card's* landing zone (a fixed address, filled by
-        the host between the replays) and their scales from the matching fixed slab.  The registers it
-        reads live on this card too: `_DecodeGraphs.carry` is what puts them there, and the shared expert
-        was already folded into `yshared` by `g_pre`.
+        the host between the replays) and their scales from the matching fixed slab.
+
+        ``regs.wts[i]`` is the routing weight of slot ``i``.  Under the split it is staged by the host with
+        the slots this card does not own set to **zero**, and those slots' scale rows are zeroed as well,
+        so an unowned slot (whose slab still holds whatever expert was there last) contributes exactly
+        zero and cannot leak a stale expert or a NaN into the sum.
         """
         cfg = self.cfg
         K = cfg.num_experts_per_tok
-        regs = g.regs_for(li)
         x = regs.x
         y = regs.y
         y.zero_()
@@ -1956,10 +2073,32 @@ class Dsv41:
                 g_ = self.mm(x, self.dequant(w1, sc1[i], z1[i])).clamp(max=self.lim)
                 u_ = self.mm(x, self.dequant(w3, sc3[i], z3[i])).clamp(-self.lim, self.lim)
                 y.add_(self.mm(F.silu(g_) * u_, self.dequant(w2, sc2[i], z2[i])) * regs.wts[i])
+        return y
+
+    def _layer_post_body(self, li: int, g: "_DecodeGraphs"):
+        """What `g_post` captures: the expert triples, the shared expert, the (split) peer partials, the
+        post-MHC.
+
+        The shared expert was folded into `yshared` by `g_pre`; under the split the workers' partial sums
+        were already gathered into `ypart` by `_DecodeGraphs.gather_partials`, outside every graph, and the
+        sum here is `own + workers + shared` - the eager `_moe_split`'s order.
+        """
+        regs = g.regs_for(li)
+        y = self._run_experts(li, g, regs)
         y.add_(regs.yshared)          # the shared expert, computed by g_pre on the layer's own card
+        if g.split:
+            y.add_(g.buffers.ypart)
         regs.h.copy_(self.hc_post(y, regs.res, regs.fpost, regs.fcomb))
         return (regs.h, regs.y)
 
+    def _layer_experts_body(self, li: int, g: "_DecodeGraphs", key: str):
+        """A worker's captured part of a layer: its own residue class of the six routed experts.
+
+        Six slots are always unrolled because which of the six ids this card owns changes every step; the
+        host stages zero weights (and zero scale rows) for the rest.  No shared expert, no post-MHC and no
+        residual cross this card: it gets an activation and returns a partial sum.
+        """
+        return (self._run_experts(li, g, g.cards[key]),)
 
 class _DecodeGraphs:
     """One State's captured decode: a `g_pre`/`g_post` pair per layer, one `g_pre` per selection bucket.
@@ -2011,7 +2150,7 @@ class _DecodeGraphs:
     """
 
     def __init__(self, model: "Dsv41", state: State, verify: bool = False,
-                 cards: "dict[int, str] | None" = None):
+                 cards: "dict[int, str] | None" = None, workers: "list[Dsv41] | None" = None):
         self.model = model
         self.state = state                      # held: id() stays unique, and the graphs belong to it
         self.verify = bool(verify)
@@ -2020,9 +2159,30 @@ class _DecodeGraphs:
         dev = model.device
         layers = cfg.num_hidden_layers
 
-        # -- which card runs each layer's g_post -------------------------------------------------
+        # -- the one-driver split: every layer's g_post on the driver, the experts on all four cards ---
+        # `workers` are the experts-only `Dsv41` instances; each gets a captured partial-expert graph per
+        # layer on its own card.  The driver's g_post runs here because the post-MHC has to follow the
+        # full sum, and the sum is assembled from peer HBM outside the graphs (a capture cannot read a
+        # peer's live memory: measured, it bakes the value it saw at capture).
+        self.split = bool(workers)
+        self.split_workers = [str(w.device) for w in workers] if workers else []
         compute_key = str(dev)
-        if cards:
+        # The key names the worker's *slot* in the capture, not just its card: the CPU tests put every
+        # rank on one device, and a dict keyed by device would silently keep only the last of them (or,
+        # worse, collide with the driver's own key and hand a worker the driver's registers).
+        self.workers: dict[str, Dsv41] = {}
+        for i, w in enumerate(workers or []):
+            key = str(w.device)
+            if key in self.workers or key == compute_key:
+                key = f"{key}#{i + 1}"
+            self.workers[key] = w
+        self.split_timers: dict[str, float] = {"stage": 0.0, "fetch": 0.0, "gather": 0.0,
+                                               "replay": 0.0, "launch": 0.0}
+
+        # -- which card runs each layer's g_post -------------------------------------------------
+        if self.split:
+            card_of = {li: compute_key for li in range(layers)}
+        elif cards:
             card_of = {li: str(cards[li]) for li in range(layers)}
         else:
             device_for = getattr(model.weights.experts, "device_for", None)
@@ -2034,7 +2194,10 @@ class _DecodeGraphs:
         # each is physically the process's own device.  That is what lets a test run the split - two
         # register sets, the carries, two runners - without two cards.
         self.physical: dict[str, str] = {}
-        for key in [compute_key] + [k for k in dict.fromkeys(card_of.values()) if k != compute_key]:
+        keys = [compute_key] + [k for k in dict.fromkeys(card_of.values()) if k != compute_key]
+        if self.split:
+            keys += [k for k in self.workers if k not in keys]
+        for key in keys:
             self.physical[key] = key if str(key).startswith("npu") else compute_key
         self.cards: dict[str, _CardRegisters] = {}
         for key in dict.fromkeys(self.physical):
@@ -2042,6 +2205,8 @@ class _DecodeGraphs:
                                              inter=cfg.moe_intermediate_size)
         b = self.buffers = _GraphBuffers(self.cards[compute_key])
         b.cards = self.cards
+        # the workers' partial sums, assembled on the driver by `gather_partials`; `g_post` adds it
+        b.ypart = torch.zeros(1, D, dtype=torch.float32, device=dev)
 
         # The pre-mix is a *lagged* register: layer `li` reads the mix layer `li-1` wrote.  A g_pre both
         # reads and writes it, and `capture(warmup=True)` runs the body once eagerly - so a single buffer
@@ -2069,6 +2234,7 @@ class _DecodeGraphs:
         self.runner = self._runner(compute_key)     # the compute card's runner (and the old alias)
         self.pre: dict[tuple[int, int], str] = {}
         self.post: dict[int, str] = {}
+        self.work: dict[tuple[int, str], str] = {}
         self.buckets: set[int] = set()
         self.captured = 0
         self.capture_s = 0.0
@@ -2162,12 +2328,17 @@ class _DecodeGraphs:
         """One line for the capture log: geometry, cards and the landing zones they cost."""
         cfg = self.model.cfg
         per = cfg.num_experts_per_tok * 3 * cfg.moe_intermediate_size * cfg.hidden_size
-        cards = list(dict.fromkeys(self.card_of.values()))
-        if cards == [self.compute_key]:
-            where = f"one card ({self.compute_key})"
+        if self.split:
+            where = (f"g_post on the driver ({self.compute_key}) + one partial-expert graph per card per "
+                     f"layer on {len(self.workers)} workers ({', '.join(self.split_workers)}); each has "
+                     f"its own landing zone")
         else:
-            where = (f"g_post on {len(cards)} cards ({', '.join(str(k) for k in cards)}); each has its own "
-                     f"landing zone")
+            cards = list(dict.fromkeys(self.card_of.values()))
+            if cards == [self.compute_key]:
+                where = f"one card ({self.compute_key})"
+            else:
+                where = (f"g_post on {len(cards)} cards ({', '.join(str(k) for k in cards)}); each has "
+                         f"its own landing zone")
         return (f"graphs: capturing on {self.compute_key} - 2 per layer, one g_pre per selection bucket "
                 f"per layer; {where}; landing zone {2 * per / 1e6:.0f} MB each "
                 f"({per / 1e6:.0f} MB x 2 parities), top-{cfg.num_experts_per_tok} experts unrolled")
@@ -2201,7 +2372,165 @@ class _DecodeGraphs:
                           None, key)
             self.post[li] = name
         self.activate(key)
+        if self.split and hasattr(torch, "npu") and str(self.physical[key]).startswith("npu"):
+            # the driver's landing zone is filled by an asynchronous H2D copy too (see `replay_work`)
+            torch.npu.current_stream(self._index(self.physical[key])).synchronize()
         self._runner(key).replay(name)
+
+    # -- the one-driver split -------------------------------------------------------------------
+    def _host_masked(self, key: str):
+        """A per-card CPU float buffer for the staged routing weights (allocated once)."""
+        hosts = getattr(self, "_wt_host", None)
+        if hosts is None:
+            hosts = self._wt_host = {}
+        t = hosts.get(key)
+        if t is None:
+            t = hosts[key] = torch.zeros(self.model.cfg.num_experts_per_tok, dtype=torch.float32)
+        return t
+
+    def _masked_weights(self, key: str, ids: list[int], wts: list[float]) -> tuple[torch.Tensor, list[int]]:
+        """The six weights with the slots this card does not own set to 0, and the owned ids.
+
+        Ownership is `e % ep_size == ep_rank` - the rule `Dsv41._ep_owns` uses - so the worked-out spread
+        of the six ids over the cards is the same one EP-only measured, just with the cards holding slices
+        of every layer instead of whole layers.
+        """
+        worker = self.workers[key]
+        mine = [i for i, e in enumerate(ids) if e % worker.ep_size == worker.ep_rank]
+        host = self._host_masked(key)
+        # slot ``i`` of the landing zone holds ``mine[i]``, so it must get *that* top-k position's weight.
+        # Leaving the weights at their original positions (with zeros between) would pair every compiled
+        # weight after the first gap with the wrong expert - the silent-wrong-answer failure this test is
+        # for, and the reason the eager path uses `torch.where(idx == e)` rather than a compacted list.
+        for i in range(len(ids)):
+            host[i] = float(wts[mine[i]]) if i < len(mine) else 0.0
+        return host, [ids[i] for i in mine]
+
+    def stage_worker(self, li: int, key: str, ids: list[int], wts: list[float]) -> None:
+        """Put this layer's activation and masked routing weights on a worker, then fetch its experts.
+
+        The activation is moved by a *kernel that reads the driver's HBM* (``out = peer + 0``), not a
+        copy: measured on this box at 20 KB it is the difference between ~10 us and ~290 us, and it is
+        legal because a kernel may read a peer's memory once peer access is on (a *captured* one may not:
+        it bakes the value it saw, which is why this stays outside every graph).  `gpre`'s ``ids.cpu()``
+        has already drained the driver's stream, so the driver's ``x`` is final here.
+        """
+        regs = self.cards[key]
+        worker = self.workers[key]
+        host, mine = self._masked_weights(key, ids, wts)
+        t0 = _perf()
+        self.activate(key)
+        if hasattr(torch, "npu") and str(self.physical[key]).startswith("npu"):
+            # Two cross-device hazards meet here, both resolved by events on the *worker's* stream:
+            # (a) this kernel reads the driver's `x`, and the driver's next `g_pre` overwrites it - the
+            #     driver's stream waits for this card's replay event (recorded in `replay_work`), so the
+            #     next `g_pre` cannot start before this read is done;
+            # (b) this card's own `y` from the *previous* layer is still being read by the driver's
+            #     `gather_partials` - so the stream waits for the driver's gather event before it does
+            #     anything that can overwrite `y`.
+            ev = getattr(self, "_gather_ev", None)
+            if ev is not None:
+                torch.npu.current_stream(self._index(self.physical[key])).wait_event(ev)
+            torch.add(self.buffers.x, 0.0, out=regs.x)     # peer-read kernel, local result
+        else:
+            regs.x.copy_(self.buffers.x)
+        regs.wts.copy_(host)                              # 24 B host -> card, outside every graph
+        self.split_timers["stage"] += _perf() - t0
+        t0 = _perf()
+        worker.weights.experts.fetch_int8_into(li, mine, regs.slab[self.parity(li)], regs.scales,
+                                               scale_flat=regs.scale_slab)
+        if len(mine) < self.model.cfg.num_experts_per_tok:
+            # an unowned slot's scale must be zero: the graph still multiplies all six slots and a stale
+            # scale is how a 0 * NaN would leak in
+            regs.scale_slab[len(mine):].zero_()
+        self.split_timers["fetch"] += _perf() - t0
+
+    def replay_work(self, li: int, key: str) -> None:
+        """Capture/replay a worker's partial-expert graph, then record an event the gather can wait on."""
+        name = self.work.get((li, key))
+        if name is None:
+            name = f"g_work.{li}.{key}"
+            self._capture(name, lambda: self.workers[key]._layer_experts_body(li, self, key),
+                          self._inputs_work(li, key), None, key)
+            self.work[(li, key)] = name
+        t0 = _perf()
+        self.activate(key)
+        # The landing-zone fill is an *asynchronous* H2D copy on this card's stream, and a captured graph
+        # replayed on the same stream was measured not to wait for it: without this sync two runs of the
+        # same fixed token stream diverge (they did, until it was added) because the graph can read a
+        # half-filled slab.  One stream sync per card per layer is what makes the split deterministic.
+        if hasattr(torch, "npu") and str(self.physical[key]).startswith("npu"):
+            torch.npu.current_stream(self._index(self.physical[key])).synchronize()
+        self._runner(key).replay(name)
+        self.split_timers["launch"] += _perf() - t0
+        if hasattr(torch, "npu") and str(self.physical[key]).startswith("npu"):
+            ev = self._work_events().get(key)
+            if ev is None:
+                ev = self._work_events()[key] = torch.npu.Event()
+            ev.record(torch.npu.current_stream(int(str(self.physical[key]).split(":")[-1])))
+
+    def _work_events(self) -> dict:
+        evs = getattr(self, "_worker_events", None)
+        if evs is None:
+            evs = self._worker_events = {}
+        return evs
+
+    def fetch_own(self, li: int, ids: list[int], wts: list[float]) -> None:
+        """The driver's own residue class: mask, fetch into its landing zone, zero the unused scales."""
+        regs = self.cards[self.compute_key]
+        driver = self.model
+        mine = [i for i, e in enumerate(ids) if e % driver.ep_size == driver.ep_rank]
+        host = self._host_masked(self.compute_key)
+        for i in range(len(ids)):
+            host[i] = float(wts[mine[i]]) if i < len(mine) else 0.0
+        t0 = _perf()
+        self.activate(self.compute_key)
+        regs.wts.copy_(host)
+        driver.weights.experts.fetch_int8_into(li, [ids[i] for i in mine], regs.slab[self.parity(li)],
+                                               regs.scales, scale_flat=regs.scale_slab)
+        if len(mine) < driver.cfg.num_experts_per_tok:
+            regs.scale_slab[len(mine):].zero_()
+        self.split_timers["fetch"] += _perf() - t0
+
+    def gather_partials(self, li: int) -> None:
+        """Sum the workers' partials into the driver's `ypart`, reading each card's HBM over peer.
+
+        Each worker's graph was launched on its own stream; the recorded event is what makes the driver's
+        stream wait for it.  One event per worker per layer - the price of a per-layer hand-off that a
+        capture cannot contain.
+        """
+        b = self.buffers
+        t0 = _perf()
+        self.activate(self.compute_key)
+        evs = self._work_events()
+        driver_stream = None
+        if hasattr(torch, "npu") and str(self.physical[self.compute_key]).startswith("npu"):
+            driver_stream = torch.npu.current_stream(int(str(self.physical[self.compute_key]).split(":")[-1]))
+            for key in self.workers:
+                ev = evs.get(key)
+                if ev is not None:
+                    driver_stream.wait_event(ev)
+        b.ypart.zero_()
+        for key in self.workers:
+            b.ypart.add_(self.cards[key].y)           # kernel reads the worker's HBM
+        if hasattr(torch, "npu") and str(self.physical[self.compute_key]).startswith("npu"):
+            # the peer reads above must finish before a worker may overwrite its `y` for the next layer.
+            # The event is created *here*, with the driver current: an Event belongs to the card that was
+            # current when it was constructed, and one made on a worker could not be recorded here.
+            if getattr(self, "_gather_ev", None) is None:
+                self._gather_ev = torch.npu.Event()
+            self._gather_ev.record(torch.npu.current_stream(
+                self._index(self.physical[self.compute_key])))
+        self.split_timers["gather"] += _perf() - t0
+
+    @staticmethod
+    def _index(device: str) -> int:
+        return int(str(device).split(":")[-1]) if ":" in str(device) else 0
+
+    def _inputs_work(self, li: int, key: str) -> dict:
+        regs = self.cards[key]
+        return {"x": regs.x, "wts": regs.wts, "slab": regs.slab[self.parity(li)],
+                "scale1": regs.scales[0], "scale2": regs.scales[1], "scale3": regs.scales[2]}
 
     def fetch(self, li: int, ids: list[int]) -> None:
         """Land the routed experts in this layer's parity, on the card its `g_post` runs on."""
@@ -2220,9 +2549,12 @@ class _DecodeGraphs:
 
     def _inputs_post(self, li: int) -> dict:
         regs = self.regs_for(li)
-        return {"x": regs.x, "wts": regs.wts, "slab": regs.slab[self.parity(li)], "res": regs.res,
-                "fpost": regs.fpost, "fcomb": regs.fcomb, "yshared": regs.yshared,
-                "scale1": regs.scales[0], "scale2": regs.scales[1], "scale3": regs.scales[2]}
+        inputs = {"x": regs.x, "wts": regs.wts, "slab": regs.slab[self.parity(li)], "res": regs.res,
+                  "fpost": regs.fpost, "fcomb": regs.fcomb, "yshared": regs.yshared,
+                  "scale1": regs.scales[0], "scale2": regs.scales[1], "scale3": regs.scales[2]}
+        if self.split:
+            inputs["ypart"] = self.buffers.ypart
+        return inputs
 
     @staticmethod
     def _perturb_pre(inputs) -> None:
@@ -2278,6 +2610,7 @@ class _DecodeGraphs:
         self._name_card.clear()
         self.pre.clear()
         self.post.clear()
+        self.work.clear()
         # the buffers are the state's addresses, not the runner's: drop them so a re-capture cannot
         # accidentally keep reading a slab nobody writes
         self.buffers = None

@@ -15,7 +15,7 @@ try:
     import torch
     from ascend.dsv41.checkpoint import Checkpoint
     from ascend.dsv41.model import Dsv41, ExpertStreamer, State, Weights
-    from ascend.dsv41.parallel import ParallelState, TPEngine
+    from ascend.dsv41.parallel import ParallelState, SplitEngine, TPEngine
     from ascend.tests.synthetic import TinyModel
     HAVE_TORCH = True
 except Exception:                                       # noqa: BLE001 - the CI job may have no torch
@@ -55,6 +55,23 @@ def ep_only(ckpt, cfg, world: int, device="cpu", cache_slots: int = 0):
         ranks.append(Dsv41(cfg, weights, device, DTYPE, tp_rank=0, tp_size=1,
                            ep_rank=r, ep_size=world))
     return TPEngine(cfg, ranks, [device] * world)
+
+
+def split_driver(ckpt, cfg, world: int, device="cpu", cache_slots: int = 0):
+    """The one-driver layout: rank 0 dense, every rank a 1/world slice of every layer's experts.
+
+    ``dense=False`` on the workers is the point being tested as much as the arithmetic is: the workers
+    must not allocate the dense path at all, or the tier's 43 % would be back.
+    """
+    ranks = []
+    for r in range(world):
+        src = ExpertStreamer(ckpt, cfg, device, DTYPE, cache_slots=cache_slots, split_layers=True)
+        if cache_slots:
+            src.set_slots({device: cache_slots})
+        weights = Weights(ckpt, cfg, device, DTYPE, expert_source=src, dense=(r == 0)).load()
+        ranks.append(Dsv41(cfg, weights, device, DTYPE, tp_rank=0, tp_size=1, ep_rank=r,
+                           ep_size=world, graphs=True))
+    return SplitEngine(cfg, ranks, [device] * world, graphs=True)
 
 
 @NEEDS_TORCH
@@ -190,6 +207,60 @@ class TensorParallel(unittest.TestCase):
         for t in got:
             self.assertTrue(torch.equal(t, torch.full((2, 3), want)))
         self.assertEqual(comm.collectives, 1)
+
+
+@NEEDS_TORCH
+class SplitDriver(unittest.TestCase):
+    """The variant that was not tried: one dense/captured driver, experts-only workers on every layer."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = TinyModel()
+        cls.ckpt = Checkpoint(cls.model.root)
+        cls.cfg = cls.model.cfg
+        cls.once = single(cls.ckpt, cls.cfg)
+        cls.split = split_driver(cls.ckpt, cls.cfg, 4, cache_slots=48)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.split.close()
+        cls.ckpt.close()
+        cls.model.close()
+
+    def test_the_workers_hold_no_dense_weights_and_their_tier_is_per_layer(self):
+        """The whole reason for the layout: a worker's HBM is expert tier, not a second dense copy."""
+        for w in self.split.workers:
+            self.assertEqual(w.weights.resident_bytes(), 0)
+            self.assertIsNone(w.weights.embed)
+            self.assertIsNone(w.weights.head)
+            # 48 slots over all 4 layers, not over the one layer a whole-layer split would serve
+            self.assertEqual(w.weights.experts.tier_slots_per_layer("cpu"), 12)
+        self.assertGreater(self.split.driver.weights.resident_bytes(), 0)
+        self.assertTrue(self.split.driver.shared_is_mine)
+        for w in self.split.workers:
+            self.assertFalse(w.shared_is_mine)
+            self.assertEqual(w.ep_rank, self.split.workers.index(w) + 1)
+
+    def test_a_batched_split_forward_matches_the_single_card_tokens(self):
+        ids = [3, 5, 7, 11, 13, 17, 19, 23]
+        want = self.once.forward(ids, State(self.cfg, self.once.plan, "cpu", DTYPE, max_context=64))
+        got = self.split.forward(ids, self.split.state(64))
+        rel = (got - want).abs().max() / want.abs().max().clamp_min(1e-6)
+        self.assertLess(rel.item(), 2e-3, f"split prompt vs single card: max rel err {rel.item():.2e}")
+        self.assertEqual(int(got[0].argmax()), int(want[0].argmax()))
+
+    def test_one_token_at_a_time_matches_the_single_card_tokens(self):
+        """The captured split decode (g_pre on the driver, one partial graph per worker) must pick the
+        same tokens as the single-card eager path, one token at a time."""
+        ids = [3, 5, 7, 11, 13, 17, 19, 23]
+        a = State(self.cfg, self.once.plan, "cpu", DTYPE, max_context=64)
+        b = self.split.state(64)
+        for i, t in enumerate(ids):
+            wa = self.once.forward([t], a)
+            gb = self.split.forward([t], b)
+            self.assertEqual(int(gb[0].argmax()), int(wa[0].argmax()), f"token {i}")
+            rel = (gb - wa).abs().max() / wa.abs().max().clamp_min(1e-6)
+            self.assertLess(rel.item(), 5e-3, f"token {i}: max rel err {rel.item():.2e}")
 
 
 if __name__ == "__main__":

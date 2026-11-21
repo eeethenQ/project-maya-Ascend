@@ -1295,3 +1295,81 @@ same rate - about 1.25 s against the baseline's 969 ms.  EP-only would need per-
 either a better tier (no dense replication: one dense driver, the other card just its experts over peer
 reads) or a routing split that does not cost 10 hit-rate points.  The wire is no longer the excuse: a 20 KB
 combine is 0.4-0.6 ms (mostly host ordering, not the link), and the peer link is 20.9 GB/s.
+
+## 21. One dense driver, experts on every card: the split keeps the tier, and still loses on the hand-off and the fetch
+
+§20 ended with the variant it *would* take: one card runs the whole dense path and keeps the KV, the
+other cards hold **experts only** (so the dense weights are not replicated and the tier keeps its size),
+and every card owns 96 of every layer's 384 experts (`e % 4`) - 40 x 96 = 3 840 candidates, the same
+number today's 10-layer x 384 split gives a card.  That variant was built and measured on four cards
+(`npu:0-3`; the driver is `npu:0` because the box exposes only the ascending device order).
+
+### 21.1 What was built
+
+* `Weights(dense=False)` - a worker never allocates embed/head/attention/shared/mHC/norms (0.00 GiB
+  resident, measured); the 15.09 GiB is what bought the tier in §20 and is simply not there now.
+* `ExpertStreamer(split_layers=True)` - the same streamer, with the insert decision's capacity divided by
+  all 40 layers instead of the 10 a whole-layer split served; ownership stays `Dsv41._ep_owns`
+  (`e % ep_size`), which is the rule EP-only already used.
+* `Dsv41.forward(..., workers=)` - the eager split (`_eager_layers_split` / `_moe_split`, the prompt path)
+  and the captured split (`_graph_decode`): `g_pre` on the driver, **one partial-expert graph per card per
+  layer** (6 unrolled slots, masked weights for the slots a card does not own), `g_post` on the driver
+  where the sum and the post-MHC must be.  200 graphs (40 g_pre + 40 g_post + 120 worker graphs), capture
+  3.5-5.8 s.  `parallel.build(..., expert_split=True)` + `SplitEngine`; `bench_split.py` (arms, floor,
+  analysis, the routing estimate); `probe_split.py` (the wire); three tests in `test_parallel.py`
+  (`SplitDriver`: no dense weights on a worker, batched parity, one-token captured parity).
+
+The hand-off cannot be inside a graph: a capture with an operand on another card replays the value it
+saw at capture time - `probe_split` captured `z.add_(x)` on card 1 with `x` on card 0, changed `x` from 3
+to 7, and the replay produced **6.0** (3 + the baked 3).  So the graph is split at the hand-off and the
+activation/partial move between replays.  A reading kernel is cheap once it is not captured: `out =
+peer + 0` measured 9 us above the harness floor, against 215-290 us for a cross `copy_` of the same
+20 KB, and 40 layers x 6 peer messages measured 8.2-8.8 ms.
+
+### 21.2 The numbers (interleaved paired A/B, fixed stream, 48 steps, warm 30, one run each)
+
+The first pair was discarded: repeated split runs of the same fixed token stream diverged, which is a
+race, not a tie.  The landing-zone fill is an **asynchronous** H2D copy and a captured graph replayed on
+the same stream was measured not to wait for it, so the graph could read a half-filled slab; one stream
+sync per card per layer (160 a step) makes the split deterministic and is now in the code, and costs
+~27 ms of the floor.  The numbers below are from the deterministic build (two runs, same tokens).
+
+| arm (four cards) | tier | fetch hit | GB/step | decode ms/token | no-fetch floor | 2 000-token prefill |
+|---|---:|---:|---:|---:|---:|---:|
+| today: layer-blocked, dense on npu:0, captured | 2 480 (254 + 742 x 3) | **81.7 %** | 1.550 | **524.1** | **114.9** | **65.6 s** |
+| split: one driver, 96/layer/card, captured | 2 480 (same) | **81.5 %** | 1.570 | **788.8** | **207.6** | 67.7 s |
+
+Paired per-step ratio split/baseline: **1.538 [1.509, 1.604] 95 % CI, n=48**; prefill **1.033x** (n=1).
+The split's own hand-off, measured inside the step: **61.8 ms/step** excluding the expert fetch
+(activation out 29.5, partial gather 8.5, extra graph launches + the 160 syncs 23.8) = 1.55 ms/layer =
+7.8 % of the split's step and 11.8 % of the baseline's.  The peer traffic itself is 8-9 ms of that.
+
+### 21.3 Where the 265 ms goes, and the tier
+
+* **The split does not cost the ten hit-rate points.**  81.5 % against 81.7 %, 1.570 against 1.550
+  GB/step: the ten points §20 lost were the *dense replication* halving the tier, not the shape of the
+  split.  The per-layer capacity is 6.3 slots (driver) and 18.6 (workers) against 25.4 and 74.2 today,
+  and each card sees ~1.5 of the six draws a layer instead of all six - but over 40 layers instead of 10,
+  which comes out even.  The routing estimate said 57.8 % vs 57.5 % for the two layouts (it is
+  pessimistic in absolute terms, as §20's was), and the measurement agrees.
+* **The hand-off floor is +92.7 ms/step** (207.6 against 114.9 with the fetch disabled, same graphs and
+  the same 240 expert matmul triples).  That is the structural cost of splitting the layer: four captured
+  expert graphs and 160 stream syncs where the baseline has one graph and two host-synchronous carries.
+* **The fetch is 600 ms for 1.570 GB (2.62 GB/s) against ~409 ms for 1.550 GB (3.79 GB/s).**  A layer's
+  six draws are now issued as four per-card fetches of 1-2 experts instead of one 6-expert fetch, so the
+  per-layer `pread` parallelism falls from six threads to one or two and the four calls are host-serial;
+  same bytes, ~1.4x the wall time.
+* **Prefill: 67.7 against 65.6 s (1.033x)**, 242 GB at 3.58 GB/s against 243 GB at 3.70.  Four concurrent
+  fetch streams do not aggregate - they are 3 % slower than one stream at a time, the same direction as
+  the earlier 3.38-vs-4.4 measurement, and this is the one place the split costs almost nothing.
+
+### 21.4 The answer
+
+The variant that had not been tried was built and does not win: **1.54x slower on decode**, 1.03x on the
+2 000-token prefill, with the tier intact.  The fabric is not the reason (8-9 ms of peer traffic; the
+whole hand-off is 62 ms and 8 % of the step).  The two reasons are the **+92.7 ms/step hand-off floor**
+and a fetch path that reads the same bytes **1.4x slower** because a layer's six experts are sliced
+across four cards.  The single number that would have to change: at the baseline's own 3.79 GB/s read
+rate the split needs the tier at **<= 1.20 GB/step, i.e. an 86 % hit rate**, to break even - it measures
+81.5 %, the same as the baseline.  Neither a faster wire nor a better-placed split is what is missing; a
+split has to *raise* the hit rate (or fail to pay a hand-off), and this one does neither.
