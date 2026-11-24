@@ -1427,3 +1427,45 @@ storage and the model's own sequential structure.
   misses x 35.4 MB (3.36 GB at 95 misses, 0.21 GB warm);
 * a hot set with its own fixed-address slab is not viable: a layer's modal six-id set covers **8.3%** of steps,
   and one slab a layer would cost 8.49 GB, a third of the tier.
+
+## 23. The last copy kernel was a tie, and the tie taught where the ceiling is
+
+The landing-zone fill was the biggest copy cost left: 8.49 GB a step of int8 moved from the tier's slots into
+the fixed-address slab that the captured `g_post` graphs read.  A Triton kernel was written to do it in one
+launch per layer (`slab_fill`, grid `(18, per/32768)`), on the theory that eighteen small copies run at
+284 GB/s where a merged copy reaches 477.  **It tied instead**, and that is the useful result:
+
+| form | in-engine, one card, interleaved | quiet process |
+|---|---:|---:|
+| `torch.cat(..., out=slab)` - shipped | 0.417 ms = **508 GB/s** | 408 GB/s |
+| `slab_fill` Triton | 0.424 ms = 501 GB/s | 460 GB/s |
+
+The 332 GB/s that motivated the kernel was a reading taken on a loaded card; the cat swings 408-508 with card
+state while the kernel holds 445-501.  So the cat is already at the copy ceiling, and the kernel's only
+advantage is steadiness under load - which is worth roughly nothing against its ~80 us launcher against the
+cat's ~41.  **The kernel is not shipped**; the default stays `cat`, and the measurement is recorded here rather
+than the code being kept behind a flag.
+
+The profile difference, before and after, is `ConcatD` 4.84 -> 0.93 ms and a new `_fill_kernel` at 3.40 -
+**-0.5 ms a token**, inside the card's drift, with the slab bytes and the scale vector bit-equal to both the cat
+and the eager `fetch_int8`, and 80/80 graphs captured.
+
+Two things this settled for good:
+
+* **the strided-view alternative is impossible**, not merely awkward: `npu_quant_matmul` wants a 2-D `[in,out]`
+  weight, in an expert-major slab the six gates have per-expert stride `3*per` and per-column stride `hidden`
+  so no uniform 2-D stride exists, the 3-D weight form is refused, and the down projection's scale is
+  per-expert so the batch axis cannot carry it.  Projection-major, hence the eighteen-region gather, is forced
+  by the operator, not chosen;
+* **the copy's real cost is 16.7 ms a decode step**, not the 10.8 ms a token that earlier notes quoted - that
+  figure came from a profile that divided a three-step run by the prompt's eight tokens as well.  At ~500 GB/s
+  on the destination (1.0 TB/s of traffic) 8.49 GB is 16.7 ms, and both copy forms sit on that ceiling.
+
+What is left of it is not a copy problem: it needs a different operator (one that reads the tier's slots
+directly) or an overlap, and the overlap was measured to be impossible in §22's timeline.
+
+**A note on the flaky suite.** The residual failures in this round were not the code: the box's host RAM was
+exhausted by other tenants (1.85 TB of 1.89 TB in use), so `aclrtMallocHost` failed *mid-capture* and took a
+capture or serve test down with it.  Each failing test passes standalone on the same tree, and this engine's
+change adds no host allocation.  The lesson is the same one the LRU and the routing read taught: on this shared
+node a failure can come from a co-tenant, and the way to tell is to re-run the single test.
