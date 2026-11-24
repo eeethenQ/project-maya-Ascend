@@ -123,13 +123,15 @@ def main() -> int:
                          "same position inherits a warm tier and the A/B measures the tier, not the code.  "
                          "A short cycle is warm after the first pass, so both arms see the same tier")
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--mode", choices=("step", "blocks"), default="step",
+    ap.add_argument("--mode", choices=("step", "blocks", "ids"), default="step",
                     help="step: real forward per arm (end-to-end, but the second arm inherits whatever the "
                          "first one did to the tier); blocks: the changed function itself, one pass over "
                          "all 40 layers with the six resident ids per layer, so both arms do byte-identical "
-                         "work and only the LRU container differs")
-    ap.add_argument("--ab", choices=("lru", "null"), default="lru",
-                    help="lru: fast vs slow _blocks; null: fast vs fast, the harness's noise floor")
+                         "work and only the LRU container differs; ids: real forward per arm, timing the "
+                         "40 routing-id reads inside the step, so the seam is measured where it is paid")
+    ap.add_argument("--ab", choices=("lru", "null", "ids"), default="lru",
+                    help="lru: fast vs slow _blocks; null: fast vs fast, the harness's noise floor; ids: "
+                         "the pinned-event id read vs the old idx.cpu().tolist()")
     ap.add_argument("--json", default="")
     a = ap.parse_args()
 
@@ -166,6 +168,8 @@ def main() -> int:
 
     if a.mode == "blocks":
         return _blocks_ab(a, run, src, arms)
+    if a.mode == "ids":
+        return _ids_ab(a, run, model, state, stream)
     ms: dict[str, list[float]] = {label: [] for label in ("fast", "slow")}
     tier: dict[str, list[tuple[int, int]]] = {}
     ratios: list[float] = []
@@ -224,6 +228,107 @@ def main() -> int:
            "fast_ms": ms["fast"], "slow_ms": ms["slow"], "ratios": ratios,
            "median_ratio": med(ratios), "ci": [lo, hi], "tier_slots": run.expert_slots,
            "fast_tier": tier.get("fast"), "slow_tier": tier.get("slow")}
+    if a.json:
+        with open(a.json, "w") as handle:
+            json.dump(out, handle, indent=1)
+        print(f"wrote {a.json}")
+    run.close()
+    return 0
+
+
+def _ids_ab(a, run, model, state, stream) -> int:
+    """The paired A/B of the routing-id read: the pinned-event copy against ``idx.cpu().tolist()``.
+
+    Both arms run the *engine's* real step and differ only in ``_DecodeGraphs.host_id_read``.  The primary
+    quantity is the sum of the step's 40 ``read_ids`` calls - that is where the change is paid - and the full
+    wall is reported as the guard that it does not hurt.  A ~3 ms seam inside a ~400 ms step is below this
+    harness's step-to-step resolution, which is exactly why the region is measured separately.
+    """
+    g = model._decode_graphs
+    if g is None:
+        print("graphs did not capture; the A/B needs the captured decode")
+        run.close()
+        return 1
+    real_read = g.read_ids
+    box = {"ms": 0.0}
+
+    def timed_read():
+        t0 = time.perf_counter()
+        ids = real_read()
+        box["ms"] += (time.perf_counter() - t0) * 1e3
+        return ids
+
+    g.read_ids = timed_read
+
+    def step(arm: str, token: int):
+        g.host_id_read = arm
+        box["ms"] = 0.0
+        sync()
+        t0 = time.perf_counter()
+        out = model.forward([token], state, logits_last_only=True)
+        sync()
+        return (time.perf_counter() - t0) * 1e3, box["ms"], out
+
+    arms = ("pinned", "cpu")
+    ms: dict[str, list[float]] = {label: [] for label in arms}
+    read_ms: dict[str, list[float]] = {label: [] for label in arms}
+    ratios: list[float] = []
+    wall_ratios: list[float] = []
+    dropped = 0
+    worst = 0.0
+    try:
+        for i in range(a.pairs):
+            # ABBA order, so a monotone drift cancels instead of accumulating into one arm
+            first, second = (arms if i % 2 == 0 else arms[::-1])
+            p = state.next_pos
+            token = stream[p % len(stream)]
+            cap0 = g.captured
+            t1, r1, out1 = step(first, token)
+            state.rewind(1)
+            t2, r2, out2 = step(second, token)
+            if g.captured != cap0:
+                dropped += 1
+                continue
+            worst = max(worst, float((out1 - out2).abs().max()))
+            got = {first: (t1, r1), second: (t2, r2)}
+            for label in arms:
+                ms[label].append(got[label][0])
+                read_ms[label].append(got[label][1])
+            ratios.append(got["pinned"][1] / max(got["cpu"][1], 1e-9))
+            wall_ratios.append(got["pinned"][0] / max(got["cpu"][0], 1e-9))
+            if i % 8 == 0:
+                print(f"  pair {i:2d} pos {p:4d} pinned {got['pinned'][1]:7.2f} ms read "
+                      f"({got['pinned'][0]:7.1f} ms step)  cpu {got['cpu'][1]:7.2f} ms read "
+                      f"({got['cpu'][0]:7.1f} ms step)  ratio {ratios[-1]:.3f}", flush=True)
+    finally:
+        del g.read_ids                          # drop the instrumentation, not the class method
+        g.host_id_read = "pinned"
+
+    def med(xs):
+        return statistics.median(xs) if xs else float("nan")
+
+    def ci(xs):
+        rnd = random.Random(a.seed)
+        boot = sorted(med(rnd.choices(xs, k=len(xs))) for _ in range(2000))
+        return boot[50], boot[-51]
+
+    lo, hi = ci(ratios)
+    wlo, whi = ci(wall_ratios)
+    print(f"\n{len(ratios)} pairs ({dropped} dropped for a bucket capture), top-1/logit parity worst "
+          f"|delta| {worst:.3e}", flush=True)
+    print(f"  pinned median read {med(read_ms['pinned']):7.2f} ms/step  cpu median read "
+          f"{med(read_ms['cpu']):7.2f} ms/step  -> {med(read_ms['cpu']) - med(read_ms['pinned']):+.2f} ms",
+          flush=True)
+    print(f"  median paired ratio of the 40 reads pinned/cpu = {med(ratios):.4f}  [{lo:.4f}, {hi:.4f}] 95% CI",
+          flush=True)
+    print(f"  median paired ratio of the whole step    pinned/cpu = {med(wall_ratios):.4f}  "
+          f"[{wlo:.4f}, {whi:.4f}] 95% CI  (wall median {med(ms['pinned']):.1f} ms)", flush=True)
+    out = {"mode": "ids", "pairs": len(ratios), "dropped": dropped, "worst_logit_delta": worst,
+           "pinned_read_ms": read_ms["pinned"], "cpu_read_ms": read_ms["cpu"],
+           "read_ratios": ratios, "read_median_ratio": med(ratios), "read_ci": [lo, hi],
+           "pinned_step_ms": ms["pinned"], "cpu_step_ms": ms["cpu"],
+           "step_ratios": wall_ratios, "step_median_ratio": med(wall_ratios), "step_ci": [wlo, whi],
+           "tier_slots": run.expert_slots}
     if a.json:
         with open(a.json, "w") as handle:
             json.dump(out, handle, indent=1)

@@ -202,7 +202,7 @@ def instrumented_step(model, state, tok: int, tally: Tally, logits_out: dict) ->
         g.replay_pre(li)
         tally.add("decode.replay_pre", time.perf_counter() - t0)
         t0 = time.perf_counter()
-        ids = b.idx.cpu().tolist()
+        ids = g.read_ids()                  # the engine's one read: pinned+event or idx.cpu().tolist()
         tally.add("decode.idx_cpu", time.perf_counter() - t0)
         key = g.card_of[li]
         if key != g.compute_key:
@@ -296,6 +296,13 @@ def idle_microbenches(model, state, tally: Tally) -> dict:
         ids = host.tolist()
     out["idx_pinned_copy_sync_40_us"] = 1e6 * (time.perf_counter() - t0) / 40
 
+    # the engine's current read: the copy is enqueued non-blocking and the event carries the wait
+    _sync()
+    t0 = time.perf_counter()
+    for _ in range(40):
+        g.read_ids()
+    out["idx_read_ids_40_us"] = 1e6 * (time.perf_counter() - t0) / 40
+
     _sync()
     t0 = time.perf_counter()
     t_check = 0.0
@@ -334,6 +341,9 @@ def main() -> int:
     ap.add_argument("--warm-steps", type=int, default=6)
     ap.add_argument("--steps", type=int, default=4, help="instrumented steps to average the table over")
     ap.add_argument("--max-context", type=int, default=2048)
+    ap.add_argument("--id-read", choices=("pinned", "cpu"), default="pinned",
+                    help="how the step reads its 40 routing ids: the pinned non-blocking copy + event "
+                         "(the default) or the old idx.cpu().tolist(), for a before/after table")
     ap.add_argument("--json", default="")
     a = ap.parse_args()
 
@@ -357,6 +367,9 @@ def main() -> int:
         out = model.forward([tok], state, logits_last_only=True)
         tok = int(out[0].argmax())
         _sync()
+    if model._decode_graphs is not None:
+        model._decode_graphs.host_id_read = a.id_read
+    print(f"id read: {a.id_read}", flush=True)
 
     tally = Tally()
     instrument_source(run.experts, tally)
@@ -380,7 +393,8 @@ def main() -> int:
         parity.append(float((got["logits"] - ref).abs().max()))
         tok = int(ref[0].argmax())
 
-    wall = statistics.median(steps)
+    # the regions are means over the same steps; the table has to sum to the same wall
+    wall = statistics.fmean(steps)
     n = max(1, a.steps)
     per = {name: got / n for name, got in tally.ms.items()}
     per_n = {name: got / n for name, got in tally.n.items()}

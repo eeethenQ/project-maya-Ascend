@@ -139,8 +139,10 @@ class TheCapturedDecode(unittest.TestCase):
         net.forward([11], state)
         g = net._decode_graphs
         K = cfg.num_experts_per_tok
+        # projection-major: the six experts' gate (and up) matrices are one contiguous [6*inter, hidden]
+        # in each parity, which is what lets `_run_experts` do the expert block in two Cube calls
         self.assertEqual(tuple(g.buffers.slab.shape),
-                         (2, K, 3, cfg.moe_intermediate_size * cfg.hidden_size))
+                         (2, 3, K, cfg.moe_intermediate_size * cfg.hidden_size))
         self.assertEqual(g.buffers.slab.dtype, torch.int8)
         self.assertEqual(g.parity(0), 0)
         self.assertEqual(g.parity(1), 1)
@@ -168,6 +170,18 @@ class TheCapturedDecode(unittest.TestCase):
         # the cache is shared, so a second fetch into the slab is served from it and still exact
         src.fetch_int8_into(2, ids, slab, scales)
         self.assertEqual(src.hits, 2 * len(ids), "both slab fetches must be served from the tier")
+        # The projection-major zone the batched expert block reads: the regions are (gate, up, down) and
+        # the bytes and scales must be the same ones, just placed where `_run_experts` reads them.
+        pm = torch.zeros(3, K, cfg.moe_intermediate_size * cfg.hidden_size, dtype=torch.int8)
+        pscales = tuple(torch.zeros(K, out, 1) for out in
+                        (cfg.moe_intermediate_size, cfg.hidden_size, cfg.moe_intermediate_size))
+        src.fetch_int8_into(2, ids, pm, pscales, layout="projection")
+        for i, block in enumerate(blocks):
+            for j, p in enumerate(("w1", "w3", "w2")):
+                self.assertTrue(torch.equal(pm[j, i], block[p][0][0].reshape(-1)),
+                                f"expert {i} {p} bytes differ in the projection-major zone")
+                self.assertTrue(torch.equal(pscales[("w1", "w2", "w3").index(p)][i], block[p][1][0]),
+                                f"expert {i} {p} scales differ in the projection-major zone")
         src.close()
 
     def test_the_captured_decode_follows_a_spread_expert_tier(self):

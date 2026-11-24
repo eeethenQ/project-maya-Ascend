@@ -596,6 +596,16 @@ class Weights:
         return total
 
 
+# The landing zone's projection axis, in the order the slab stores it: gate and up are adjacent because
+# `_run_experts` multiplies all six experts' gate *and* up with one Cube call, and the down projection
+# needs its own (the six rows it multiplies differ per expert).  The wire order in the checkpoint
+# (`w1, w2, w3`) is unchanged - the fill just places each projection in its own region.
+_PROJ_ORDER = ("w1", "w3", "w2")
+# The order of the three-tuple callers pass as `scales`: the checkpoint's, and the one the eager paths
+# index (`sc1, sc2, sc3`), so a fetch writes each projection's scale into the slot it belongs to.
+_SCALE_ORDER = ("w1", "w2", "w3")
+
+
 class ExpertSource:
     """Where a routed expert's three int8 matrices come from.
 
@@ -620,10 +630,12 @@ class ExpertSource:
         """The same fetch, written into a caller-owned slab at an address the caller already fixed.
 
         A captured decode layer bakes the address it reads, so the 40 layers cannot each own a landing
-        zone: they all read the same device buffer, filled here.  ``slab`` is ``[n, 3, out*in]`` int8 in
-        w1/w2/w3 order and ``scales`` a matching 3-tuple of ``[n, out, 1]`` fp32 tensors (a slice of the
-        double buffer, so its address is fixed too).  ``scale_flat``, when the caller has it, is the
-        ``[n, 2*out1 + out2]`` fp32 buffer those three are views of, which lets the fill be one copy.
+        zone: they all read the same device buffer, filled here.  ``slab`` is either ``[n, 3, out*in]``
+        int8 in w1/w2/w3 order (an expert contiguous, the eager shape) or ``[3, n, out*in]`` in
+        w1/w3/w2 order (projection-major, what the grouped expert block reads - see
+        :meth:`ExpertStreamer.fetch_int8_into`), and ``scales`` a matching 3-tuple of ``[n, out, 1]`` fp32
+        tensors (a slice of the double buffer, so its address is fixed too).  ``scale_flat``, when the
+        caller has it, is the fp32 buffer those three are views of, which lets the fill be one call.
         The eager path keeps `fetch_int8`.
         """
         raise NotImplementedError
@@ -958,44 +970,80 @@ class ExpertStreamer(ExpertSource):
 
     def fetch_int8_into(self, layer: int, experts: list[int], slab: torch.Tensor,
                         scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                        scale_flat: "torch.Tensor | None" = None) -> None:
-        """Fetch into a fixed landing zone: ``slab[i, j]`` is expert ``i``'s w{j+1}, flattened int8.
+                        scale_flat: "torch.Tensor | None" = None,
+                        layout: "str | None" = None) -> None:
+        """Fetch into a fixed landing zone at an address the caller already fixed.
+
+        Two layouts, both are the same expert bytes and the same scales:
+
+        * ``"expert"`` - ``slab[i, j]`` is expert ``i``'s j-th projection (``[n, 3, per]``).  An expert is
+          contiguous as ``[w1 | w2 | w3]``, so a fetch is one copy of its 35.4 MB, which is the fastest a
+          per-expert copy gets (measured 459 GB/s; 18 copies of one projection are 256 GB/s).
+        * ``"projection"`` - ``slab[j, i]`` is expert ``i``'s j-th projection (``[3, n, per]``), which is
+          what the batched expert block reads: the six experts' gate matrices become one contiguous
+          ``[6*inter, hidden]``.  An expert is then *not* contiguous, and a fetch is one ``cat`` of the 18
+          projections into the contiguous 212 MB zone - one host call and one device kernel, which
+          `ascend/probe_slab_layout.py` measures at 332 GB/s against the expert-major fill's 459 (a
+          `copy_` per (expert, projection) instead is 256 GB/s, so the ``cat`` is the one that ships).
 
         The copy into the slab is a device-to-device move from the batch this fetch just landed (or from
-        the resident tier), so it adds 203 MB of on-card bandwidth per layer and no host work.  ``slab``
+        the resident tier), so it adds ~212 MB of on-card bandwidth per layer and no host work.  ``slab``
         must live on the card the layer's experts live on (:meth:`device_for`), because that is the card
         the captured ``g_post`` runs on: a captured graph cannot contain a cross-device copy, so the
         landing zone, not the layer, is what follows the experts.
 
-        ``scale_flat`` is the optional ``[len(experts), 2*inter + hidden]`` fp32 buffer the three
-        ``scales`` are views of (``_CardRegisters.scale_slab``).  Given it, the experts' scales land in
-        one ``cat`` instead of 18 tiny copies; without it (the direct-call path in the tests) they are
-        copied per slice.
+        ``scale_flat`` is the fp32 buffer the three ``scales`` are views of (``_CardRegisters.scale_slab``):
+        ``[n, 2*inter + hidden]`` expert-major, or ``[2*n*inter + n*hidden]`` projection-major.  Given it,
+        the scales land in one ``cat`` instead of 18 tiny copies; without it (the direct-call path in the
+        tests) they are copied per slice.
+
+        ``layout`` is inferred from the slab's shape when the caller does not say: the two differ in which
+        axis holds the three projections.
         """
         experts = [int(e) for e in experts]
         if not experts:
             return
-        if len(experts) > slab.shape[0]:
-            raise ValueError(f"{len(experts)} experts do not fit a landing zone of {slab.shape[0]} slots")
-        blocks = self._blocks(layer, experts)
         n = len(experts)
+        if layout is None:
+            layout = "projection" if (slab.dim() == 3 and int(slab.shape[0]) == 3
+                                      and int(slab.shape[1]) != 3) else "expert"
+        slots = int(slab.shape[1]) if layout == "projection" else int(slab.shape[0])
+        if n > slots:
+            raise ValueError(f"{n} experts do not fit a landing zone of {slots} slots")
+        blocks = self._blocks(layer, experts)
+        merged = self.landing_mode == "merged"
+        # one call can only cover the whole zone: a partial fill's destination is not contiguous
+        whole = merged and n == slots
+        order = _PROJ_ORDER if layout == "projection" else ("w1", "w2", "w3")
         for _repeat in range(max(1, int(self.landing_repeat))):
-            for i, block in enumerate(blocks):
-                whole = block.get("slab") if self.landing_mode == "merged" else None
-                if whole is not None:
-                    # one expert is contiguous in the slab as [w1 | w2 | w3]: one copy, not three
-                    slab[i].copy_(whole)
-                    continue
-                for j, p in enumerate(("w1", "w2", "w3")):
-                    slab[i, j].copy_(block[p][0][0].reshape(-1))
-            if scale_flat is not None and self.landing_mode == "merged":
-                sources = [block[p][1][0].reshape(-1) for block in blocks
-                           for p in ("w1", "w2", "w3")]
-                torch.cat(sources, out=scale_flat[:n].reshape(-1))
-            else:
+            if layout == "expert":
                 for i, block in enumerate(blocks):
-                    for j, p in enumerate(("w1", "w2", "w3")):
-                        scales[j][i].copy_(block[p][1][0])
+                    cached = block.get("slab") if merged else None
+                    if cached is not None:
+                        # one expert is contiguous in the slab as [w1 | w2 | w3]: one copy, not three
+                        slab[i].copy_(cached)
+                        continue
+                    for j, p in enumerate(order):
+                        slab[i, j].copy_(block[p][0][0].reshape(-1))
+            elif whole:
+                torch.cat([blocks[i][p][0][0].reshape(-1) for p in order for i in range(n)],
+                          out=slab.reshape(-1))
+            else:
+                for j, p in enumerate(order):
+                    for i, block in enumerate(blocks):
+                        slab[j, i].copy_(block[p][0][0].reshape(-1))
+            if scale_flat is not None and whole:
+                if layout == "projection":
+                    torch.cat([blocks[i][p][1][0].reshape(-1) for p in order for i in range(n)],
+                              out=scale_flat.reshape(-1))
+                else:
+                    torch.cat([blocks[i][p][1][0].reshape(-1) for i in range(n) for p in order],
+                              out=scale_flat[:n].reshape(-1))
+            else:
+                for j, p in enumerate(order):
+                    for i, block in enumerate(blocks):
+                        # the caller's `scales` tuple is (w1, w2, w3) - by projection, not by slab region
+                        scales[_SCALE_ORDER.index(p)][i].copy_(block[p][1][0])
 
     def staging_bytes(self) -> int:
         """What the pinned staging ring costs, for the budget that decides the expert tier."""
@@ -1152,6 +1200,10 @@ class Dsv41:
         self.expert_batch = int(getattr(weights.experts, "_max_batch", 8))
         # the int8 fast path needs an Ascend runtime and a symmetric (zero-point-free) checkpoint
         self.int8_experts = (str(device).startswith("npu") and getattr(weights, "offsets_are_zero", False))
+        # The decode step's expert block as two grouped Cube calls a layer instead of eighteen
+        # (`_run_experts`): 720 -> 80 calls a step, the same int8 products and the same scales.
+        # `DSV41_PER_EXPERT_MM=1` restores the per-expert calls for the paired A/B.
+        self.batched_experts = os.environ.get("DSV41_PER_EXPERT_MM") != "1"
         # Both fused operators are **off by default**, on the card only, and switchable at run time
         # (`bench_step --ab-ops` A/Bs them in one process).  They were measured, and both lost:
         #
@@ -1736,6 +1788,16 @@ class Dsv41:
         """The int8 multiply's bf16 output, before the per-token dequant: what a fused epilogue consumes."""
         return torch_npu.npu_quant_matmul(xq, q[0].T, scale.view(-1), output_dtype=torch.bfloat16)
 
+    def expert_mm_group(self, xq: torch.Tensor, w_nk: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """One int8 multiply for a *group* of experts: ``xq`` [m, in] against a stacked ``[n, in]`` weight.
+
+        ``w_nk`` is the experts' ``[out, in]`` matrices side by side, and ``scale`` their per-output-channel
+        scales concatenated in the same order.  The int8 Cube accumulates in int32 - exact, and independent
+        of how the columns are tiled - and the per-channel scale is one fp32 multiply per output element,
+        so this is the six calls' arithmetic bit for bit, in one call instead of six.
+        """
+        return torch_npu.npu_quant_matmul(xq, w_nk.T, scale.view(-1), output_dtype=torch.bfloat16)
+
     def expert_block(self, xq: torch.Tensor, xs: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor,
                      w3: torch.Tensor, s3: torch.Tensor, w2: torch.Tensor, s2: torch.Tensor,
                      weight: torch.Tensor, y: torch.Tensor) -> None:
@@ -2159,8 +2221,9 @@ class Dsv41:
 
         Per layer: replay `g_pre` (engram, mHC, attention, compressor/indexer, router, shared expert) on the
         compute card, which writes the expert input and the six routing ids to fixed registers; read those
-        ids with one ``cpu()``; hand the register pack to the card the layer's experts live on (one small
-        cross-card copy, outside every graph); fetch the six experts into *that card's* landing zone (host
+        ids with one event wait (:meth:`_DecodeGraphs.read_ids`); hand the register pack to the card the
+        layer's experts live on (one small cross-card copy, outside every graph); fetch the six experts into
+        *that card's* landing zone (host
         ``pread`` + async H2D, outside every graph); replay that card's `g_post` (six expert matmul triples,
         the post-mHC); hand the residual back.  Anything that fails to capture or replay disables graphs and
         finishes the step (and the request) on the eager path.
@@ -2205,7 +2268,7 @@ class Dsv41:
                     e = self.engram.embedding(li, self.engram.gather(li, rows))
                     g.engram[li].copy_(e.view_as(g.engram[li]))
                 g.replay_pre(li)
-                ids = b.idx.cpu().tolist()              # the ONE host break: six ints, one sync
+                ids = g.read_ids()                      # the ONE host break: six ints, one wait
                 if g.split:
                     wts = b.wts.cpu().tolist()          # same sync, six more floats
                     for key, worker in g.workers.items():
@@ -2312,6 +2375,16 @@ class Dsv41:
         weights are read from this layer's parity of *this card's* landing zone (a fixed address, filled by
         the host between the replays) and their scales from the matching fixed slab.
 
+        Two forms, and the shape of the cost is what chose between them.  Three Cube calls a expert is 720
+        a step at ~20 us each, and `ascend/probe_mm_shapes.py` says what those 20 us are: inside a captured
+        graph, 18 calls of `N=2304` cost 0.544 ms where one call of `N=41472` costs 0.289 ms for the *same*
+        212 MB of weights.  So ~12 us of every call is fixed - tiling, workspace, launch, drain - and the
+        rest is the weight read at ~1.1 TB/s; the six experts' calls were not doing more arithmetic, they
+        were paying that fixed cost six times.  `batched_experts` therefore does the whole expert block
+        (six experts, gate + up + down) in **two** `npu_quant_matmul` calls a layer instead of eighteen:
+        one for the six gates *and* the six ups, one for the six downs.  `DSV41_PER_EXPERT_MM=1` keeps the
+        per-expert form for the paired A/B.
+
         ``regs.wts[i]`` is the routing weight of slot ``i``.  Under the split it is staged by the host with
         the slots this card does not own set to **zero**, and those slots' scale rows are zeroed as well,
         so an unowned slot (whose slab still holds whatever expert was there last) contributes exactly
@@ -2322,17 +2395,34 @@ class Dsv41:
         x = regs.x
         y = regs.y
         y.zero_()
-        slab = regs.slab[g.parity(li)]
+        slab = regs.slab[g.parity(li)]        # [3, K, inter*hidden]: gate, up, down - see `_CardRegisters`
         sc1, sc2, sc3 = regs.scales
         z1, z2, z3 = regs.zeros
         xq = xs = None
         if self.int8_experts and torch_npu is not None:
             xq, xs = per_token_int8(x, fused=self.fused_quant)
         inter, hidden = cfg.moe_intermediate_size, cfg.hidden_size
+        if (xq is not None and self.fused_expert_epi and not self.fused_quant
+                and self.batched_experts):
+            # One Cube call for the six gates *and* the six ups: at T == 1 all six experts multiply the
+            # same activation row, and the landing zone is projection-major, so the six `w1` are one
+            # contiguous `[6*inter, hidden]` and the six `w3` the next one - the op reads both as one
+            # `[2*6*inter, hidden]` weight and returns all twelve results side by side.  One more call
+            # for the six down projections: six rows (the six experts' quantised `h`) against the six
+            # `w2` side by side, and only the `[6, 6*hidden]` output's *diagonal* blocks are the answer,
+            # so the six calls' work is one call's for the price of the `M` rows the Cube pads to anyway.
+            gu = self.expert_mm_group(xq, slab[:2].view(2 * K * inter, hidden), regs.scale1)
+            rows = gu.view(2, K, inter)
+            hq, hs = expert_triton.gate_up_swiglu_q8(rows[0], rows[1], xs, self.lim, hq=regs.hq,
+                                                     hs=regs.hs)
+            wide = self.expert_mm_group(hq, slab[2].view(K * hidden, inter), regs.scale2)
+            expert_triton.down_sum(wide.view(K, K, hidden).diagonal(dim1=1, dim2=2), hs, regs.wts, y,
+                                   rows=K, hidden=hidden, row_stride=(K + 1) * hidden)
+            return y
         for i in range(K):
-            w1 = slab[i, 0].view(inter, hidden)
-            w2 = slab[i, 1].view(hidden, inter)
-            w3 = slab[i, 2].view(inter, hidden)
+            w1 = slab[0, i].view(inter, hidden)
+            w3 = slab[1, i].view(inter, hidden)
+            w2 = slab[2, i].view(hidden, inter)
             if xq is not None and self.fused_expert_epi and not self.fused_quant:
                 self.expert_block(xq, xs, w1[None], sc1[i], w3[None], sc3[i], w2[None], sc2[i],
                                   regs.wts[i], y)
@@ -2390,11 +2480,19 @@ class _DecodeGraphs:
     card its experts live on*.  The card boundary is crossed by two small copies outside the graphs:
 
         g_pre[li].replay()                 # compute card
-        ids = idx.cpu().tolist()           # the ONE host break: six ints, one sync
+        ids = self.read_ids()              # the ONE host break: six ints, one wait
         carry(li)                          # compute card -> expert card, one ~200 KB copy, eager
         fetch_int8_into(li, ids, ...)      # host pread + async H2D into *that* card's landing zone
         g_post[li].replay()                # expert card
         carry_back(li)                     # expert card -> compute card, the residual, eager
+
+    The routing read is a *wait*, not a blocking copy: the six ids are copied into a pinned host buffer with
+    ``non_blocking=True`` the moment `g_pre` is enqueued, and the host only waits on the copy's event.  On an
+    idle queue that is slower than ``.cpu()`` (the copy has nothing to hide behind); in a step the copy lands
+    while the device is running `g_post[L-1]` + `g_pre[L]`, so the read costs the wait it cannot avoid and
+    nothing else - 1 432 us against 1 566 us for ``idx.cpu().tolist()`` in one process with the same two
+    replays pending, equal to a bare stream sync (1 423 us).  ``host_id_read = "cpu"`` keeps the old read
+    for the paired A/B.
 
     The registers are the fixed addresses a capture bakes.  Everything a `g_post` reads or writes except the
     routing ids lives in one contiguous ``pack`` per card, which is what makes each hand-off one copy
@@ -2409,10 +2507,12 @@ class _DecodeGraphs:
     * ``pres`` - the lagged pre-mix, two buffers ping-ponged by layer parity.  A single buffer would hand
       the first replay the warm-up's output instead of its input (`capture(warmup=True)` runs the body
       once eagerly), and two fixed buffers are also what keeps every graph's address fixed;
-    * ``slab`` - the expert landing zone, per card, ``[2, top_k, 3, inter*hidden]`` int8 (425 MB at the real
-      geometry), double-buffered so the host can fill one parity while the other is still being read.  A
-      layer uses parity ``li % 2``; its `g_post` bakes that address, and that is why the layers of one card
-      share a pair of buffers instead of owning 33.8 MB x 6 of HBM each;
+    * ``slab`` - the expert landing zone, per card, ``[2, 3, top_k, inter*hidden]`` int8 (425 MB at the real
+      geometry), **projection-major** so the six experts' gate (and up) matrices are one contiguous
+      ``[6*inter, hidden]`` each parity and one Cube call can read all six - see :class:`_CardRegisters`.
+      Double-buffered so the host can fill one parity while the other is still being read.  A layer uses
+      parity ``li % 2``; its `g_post` bakes that address, and that is why the layers of one card share a
+      pair of buffers instead of owning 33.8 MB x 6 of HBM each;
     * ``scales``/``zeros`` - per card: the experts' per-output-channel scales, in the same w1/w2/w3 order,
       at fixed addresses (`fetch_int8_into` fills them);
     * ``topk``/``candidates`` - the selection registers, on the compute card: one per index source, one for
@@ -2504,6 +2604,12 @@ class _DecodeGraphs:
         self.runners: dict[str, GraphRunner] = {}
         self._name_card: dict[str, str] = {}
         self._events: dict[str, object] = {}
+        # How `read_ids` moves the six routing ids to the host: "pinned" (a non-blocking copy into a pinned
+        # buffer, waited on through its own event) or "cpu" (the old blocking `idx.cpu().tolist()`).  A flag
+        # rather than a constant because the only honest way to price it is a paired A/B in one process.
+        self.host_id_read = "pinned"
+        self._id_host: torch.Tensor | None = None
+        self._id_event: object | None = None
         self.runner = self._runner(compute_key)     # the compute card's runner (and the old alias)
         self.pre: dict[tuple[int, int], str] = {}
         self.post: dict[int, str] = {}
@@ -2619,6 +2725,43 @@ class _DecodeGraphs:
     def parity(self, li: int) -> int:
         return li % 2
 
+    def read_ids(self) -> list[int]:
+        """The six routing ids `g_pre` wrote, as Python ints - the step's one device->host break.
+
+        Two ways to pay for it, and they differ by ~70 us a layer when there is queued work:
+
+        * ``host_id_read = "cpu"`` (the old read): ``idx.cpu().tolist()``.  ``cpu()`` synchronises the stream
+          first and *then* issues the six-int copy, so the copy's own latency is added to the wait on the
+          device work that is already in the queue;
+        * ``host_id_read = "pinned"`` (the default): the copy is enqueued with ``non_blocking=True`` into a
+          pinned host buffer immediately after the replay, and the host waits on the copy's event.  In a step
+          the queue already holds the previous layer's `g_post` and this layer's `g_pre`, so the copy lands
+          while the device runs them and the wait is the device wait alone plus nothing.
+
+        The read is *not* the step's cost: with those two replays pending, ``idx.cpu().tolist()`` measured
+        1 566 us and this 1 432 us, against a bare ``torch.npu.current_stream().synchronize()`` of 1 423 us,
+        and a bare ``torch.npu.synchronize()`` of 1 447 us.  The read's floor is therefore the device time in
+        front of it, which the dependency chain makes unavoidable (`ascend/probe_host_sync.py`).  The paired
+        A/B in ``ascend/bench_host_ab.py --mode ids`` (48 pairs) puts the saving at 2.5 ms a step, median
+        ratio 0.962 (95% CI [0.953, 0.988]); a repeat gave 4.6 ms, 0.939 [0.930, 0.965].
+
+        On CPU (the tests' honest eager fallback) there is no queue and no pinned memory, so this is the
+        plain read.
+        """
+        idx = self.buffers.idx
+        if self.host_id_read != "pinned" or idx.device.type != "npu":
+            return idx.cpu().tolist()
+        host = self._id_host
+        if host is None:
+            host = self._id_host = torch.empty_like(idx, device="cpu", pin_memory=True)
+            # an event belongs to the card current when it is made; `replay_pre` selected the compute card
+            # just before this call, and the idx register lives there
+            self._id_event = torch.npu.Event()
+        host.copy_(idx, non_blocking=True)
+        self._id_event.record()
+        self._id_event.synchronize()
+        return host.tolist()
+
     # -- capture and replay ---------------------------------------------------------------------
     def replay_pre(self, li: int) -> None:
         bucket = self.bucket_for(li)
@@ -2715,7 +2858,7 @@ class _DecodeGraphs:
         if len(mine) < self.model.cfg.num_experts_per_tok:
             # an unowned slot's scale must be zero: the graph still multiplies all six slots and a stale
             # scale is how a 0 * NaN would leak in
-            regs.scale_slab[len(mine):].zero_()
+            regs.zero_scale_tail(len(mine))
         self.split_timers["fetch"] += _perf() - t0
 
     def replay_work(self, li: int, key: str) -> None:
@@ -2762,7 +2905,7 @@ class _DecodeGraphs:
         driver.weights.experts.fetch_int8_into(li, [ids[i] for i in mine], regs.slab[self.parity(li)],
                                                regs.scales, scale_flat=regs.scale_slab)
         if len(mine) < driver.cfg.num_experts_per_tok:
-            regs.scale_slab[len(mine):].zero_()
+            regs.zero_scale_tail(len(mine))
         self.split_timers["fetch"] += _perf() - t0
 
     def gather_partials(self, li: int) -> None:
@@ -2929,24 +3072,52 @@ class _CardRegisters:
             raise AssertionError(f"register pack layout covers {offset} of {n} floats")
         self.y = torch.zeros(1, D, dtype=torch.float32, device=device)
         per = int(inter) * D
-        # [2, top_k, 3, inter*hidden] int8: all the layers whose g_post runs on this card read this pair
-        self.slab = torch.empty(2, K, 3, per, dtype=torch.int8, device=device)
-        # [K, 2*inter + D] fp32, one expert's w1 | w2 | w3 scales side by side.  The three `scales` are
-        # views with fixed addresses (a captured g_post reads `sc1[i]`); the tiling is what lets the
-        # landing-zone fetch fill all six experts' scales with one copy instead of 18.  `.view(-1)` on a
-        # row slice is the quant matmul's per-channel scale, and the same shape broadcasts over a
-        # [out, in] weight in the dequantising fallback.
-        span = 2 * int(inter) + D
-        self.scale_slab = torch.zeros(K, span, dtype=torch.float32, device=device)
-        self.scales = (self.scale_slab[:, :int(inter)].unsqueeze(-1),
-                       self.scale_slab[:, int(inter):int(inter) + D].unsqueeze(-1),
-                       self.scale_slab[:, int(inter) + D:].unsqueeze(-1))
+        # [2, 3, top_k, inter*hidden] int8: all the layers whose g_post runs on this card read this pair.
+        # **Projection-major**: the three projections are the outer axis (gate, up, down), so the six
+        # experts' gate matrices are one contiguous `[6*inter, hidden]` and their up matrices the next
+        # one, and the six down matrices `[6*hidden, inter]`.  That is what lets `_run_experts` do the
+        # whole expert block in two `npu_quant_matmul` calls: the grouped op needs the group on one
+        # contiguous axis, and at T == 1 the six experts share the activation row, so the group can be
+        # the N axis.  The cost is the fill: an expert is no longer contiguous in the slab, so the fetch
+        # is one `cat` of the eighteen projections rather than one copy per expert (see
+        # `ExpertStreamer.fetch_int8_into` and `ascend/probe_slab_layout.py`).
+        self.slab = torch.empty(2, 3, K, per, dtype=torch.int8, device=device)
+        # [2*K*inter + K*hidden] fp32: the six experts' `w1` scales, then their `w3`, then their `w2`, in
+        # the slab's projection-major order - so the batched gate/up call's scale is one contiguous vector
+        # (`scale1`) and the down call's another (`scale2`).  `scales` are the per-expert fixed-address
+        # views a captured g_post reads: (w1, w2, w3), so `sc1[i]`/`sc2[i]`/`sc3[i]` keep their meaning.
+        span = 2 * K * int(inter) + K * D
+        self.scale_slab = torch.zeros(span, dtype=torch.float32, device=device)
+        self.scale1 = self.scale_slab[:2 * K * int(inter)]           # gate + up, one call
+        self.scale2 = self.scale_slab[2 * K * int(inter):]           # down
+        self.scales = (self.scale_slab[:K * int(inter)].view(K, int(inter), 1),
+                       self.scale_slab[2 * K * int(inter):].view(K, D, 1),
+                       self.scale_slab[K * int(inter):2 * K * int(inter)].view(K, int(inter), 1))
         self.zeros = tuple(torch.zeros_like(s) for s in self.scales)
+        # the batched expert block's intermediates (gate+up output, the quantised h, its scale, the wide
+        # down output).  `hq`/`hs` are the kernel's outputs, so they are fixed buffers: a captured g_post
+        # then reads and writes the same addresses on every replay.
+        self.hq = torch.empty(K, int(inter), dtype=torch.int8, device=device)
+        self.hs = torch.empty(K, 1, dtype=torch.float32, device=device)
+
+    def zero_scale_tail(self, n: int) -> None:
+        """Zero the unowned slots' scales, in every projection region (a split card owns fewer than K).
+
+        The graph multiplies all six slots whatever this card owns, so an unowned slot's scale must be
+        zero or a stale expert's scale could turn a zero product into a non-zero one.
+        """
+        K, inter = int(self.scales[0].shape[0]), int(self.hq.shape[1])
+        if n >= K:
+            return
+        for region, width in ((self.scale_slab[:K * inter], inter),
+                              (self.scale_slab[K * inter:2 * K * inter], inter),
+                              (self.scale2, int(self.scale2.numel() // K))):
+            region.view(-1, width)[n:].zero_()
 
     def bytes(self) -> int:
         """What this card's registers cost, for the budget that sizes the tier."""
-        return (self.pack.numel() + self.y.numel() + sum(s.numel() * 2 for s in self.scales)
-                ) * 4 + self.slab.numel()
+        return ((self.pack.numel() + self.y.numel() + 2 * self.scale_slab.numel()) * 4
+                + self.slab.numel() + self.hq.numel() + 4 * self.hs.numel())
 
 
 class _GraphBuffers:

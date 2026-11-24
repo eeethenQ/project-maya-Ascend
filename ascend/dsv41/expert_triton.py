@@ -60,15 +60,20 @@ def _load():
     MAGIC = tl.constexpr(12582912.0)
 
     @triton.jit
-    def _gate_up_kernel(g_raw, u_raw, xs, hq, hs, lim, N: tl.constexpr, BLOCK: tl.constexpr):
+    def _gate_up_kernel(g_raw, u_raw, xs, hq, hs, lim, N: tl.constexpr, BLOCK: tl.constexpr,
+                        XS_STRIDE: tl.constexpr = 1):
         """One expert row: gate/up epilogue + SwiGLU + the int8 quantisation of the result.
 
         Two passes over the row (the max, then the quotient): with 2304 columns and the SwiGLU's
         temporaries a whole-row block overflows the UB, and the recompute is far cheaper than the launch.
+
+        ``XS_STRIDE`` is the row stride of the activation scale: 1 when every row has its own (a prompt
+        chunk), 0 when one token's scale is shared by the six experts a decode step folds into one call
+        (`_run_experts`), which is what lets the batched expert block avoid a six-element copy.
         """
         row = tl.program_id(0)
         offs = tl.arange(0, BLOCK)
-        x = tl.load(xs + row).to(tl.float32)
+        x = tl.load(xs + row * XS_STRIDE).to(tl.float32)
         limv = lim.to(tl.float32) if hasattr(lim, "to") else lim
         a = 0.0
         for k in tl.static_range(0, N, BLOCK):
@@ -108,7 +113,28 @@ def _load():
         t = d * x
         tl.store(y + row * N + offs, acc + t * rw, mask=m)
 
-    _CACHE["kernel"] = (_gate_up_kernel, _down_kernel)
+    @triton.jit
+    def _down_sum_kernel(d_raw, hs, w, y, N: tl.constexpr, ROW_STRIDE: tl.constexpr,
+                         ROWS: tl.constexpr, BLOCK: tl.constexpr):
+        """``y += (d_raw[row] * hs[row]) * w[row]`` summed over the rows, in slot order.
+
+        `_down_kernel` writes one row of ``y`` per program because a prompt chunk has a token per row.
+        A batched decode step is the other case: six experts, one token, one accumulator row, and one
+        Cube call - whose ``[6, 6*hidden]`` output is a diagonal view (``ROW_STRIDE`` is its row stride,
+        narrower than the row it strides over).  The accumulation order is the six
+        `_down_kernel` calls' order, so the sum is bit-identical to it.
+        """
+        offs = tl.arange(0, BLOCK)
+        m = offs < N
+        acc = tl.load(y + offs, mask=m, other=0.0)
+        for r in tl.static_range(0, ROWS):
+            x = tl.load(hs + r).to(tl.float32)
+            rw = tl.load(w + r).to(tl.float32)
+            d = tl.load(d_raw + r * ROW_STRIDE + offs, mask=m, other=0.0).to(tl.float32)
+            acc = acc + (d * x) * rw
+        tl.store(y + offs, acc, mask=m)
+
+    _CACHE["kernel"] = (_gate_up_kernel, _down_kernel, _down_sum_kernel)
     return _CACHE["kernel"]
 
 
@@ -153,6 +179,12 @@ def warm(device: torch.device | str, columns: "tuple[int, ...]" = (2304, 5120)) 
             d_raw = torch.zeros((2, int(n)), dtype=torch.bfloat16, device=d)
             down_epilogue(d_raw, torch.ones((2, 1), dtype=torch.float32, device=d),
                           torch.ones(2, dtype=torch.float32, device=d), y)
+            # the batched form: a [rows, rows*n] diagonal view (here rows == 2), one accumulator row
+            wide = torch.zeros((2, 2 * int(n)), dtype=torch.bfloat16, device=d)
+            diag = wide.view(2, 2, int(n)).diagonal(dim1=1, dim2=2)
+            down_sum(diag, torch.ones((2, 1), dtype=torch.float32, device=d),
+                     torch.ones(2, dtype=torch.float32, device=d), y[:1],
+                     rows=2, hidden=int(n), row_stride=3 * int(n))
             _CACHE[key] = str(d)
 
 
@@ -164,7 +196,7 @@ def gate_up_swiglu_q8(g_raw: torch.Tensor, u_raw: torch.Tensor, xs: torch.Tensor
     kernels = _load()
     if kernels is None:
         raise RuntimeError(f"the expert kernel is unavailable: {_ERROR}")
-    gate_up, _down = kernels
+    gate_up = kernels[0]
     g_raw = g_raw.contiguous()
     u_raw = u_raw.contiguous()
     rows, n = int(g_raw.shape[0]), int(g_raw.shape[1])
@@ -172,7 +204,8 @@ def gate_up_swiglu_q8(g_raw: torch.Tensor, u_raw: torch.Tensor, xs: torch.Tensor
         hq = torch.empty((rows, n), dtype=torch.int8, device=g_raw.device)
     if hs is None:
         hs = torch.empty((rows, 1), dtype=torch.float32, device=g_raw.device)
-    gate_up[(rows,)](g_raw, u_raw, xs, hq, hs, float(lim), N=n, BLOCK=_block(n, _GATE_UP_CAP))
+    gate_up[(rows,)](g_raw, u_raw, xs, hq, hs, float(lim), N=n, BLOCK=_block(n, _GATE_UP_CAP),
+                     XS_STRIDE=0 if int(xs.numel()) == 1 else 1)
     calls += 1
     return hq, hs
 
@@ -183,13 +216,31 @@ def down_epilogue(d_raw: torch.Tensor, hs: torch.Tensor, w: torch.Tensor, y: tor
     kernels = _load()
     if kernels is None:
         raise RuntimeError(f"the expert kernel is unavailable: {_ERROR}")
-    _gate, down = kernels
+    down = kernels[1]
     rows, n = int(d_raw.shape[0]), int(d_raw.shape[1])
     if w.numel() == 1:
         w = w.reshape(1)
         if rows != 1:
             w = w.expand(rows)                 # a scalar route weight, one per row
     down[(rows,)](d_raw, hs, w.contiguous(), y, N=n, BLOCK=_block(n, _DOWN_CAP))
+    calls += 1
+
+
+def down_sum(diag: torch.Tensor, hs: torch.Tensor, w: torch.Tensor, y: torch.Tensor, *,
+             rows: int, hidden: int, row_stride: int) -> None:
+    """``y += sum_rows (diag[row] * hs[row]) * w[row]`` in place - the six experts' down epilogue in one.
+
+    ``diag`` is the ``[rows, hidden]`` diagonal view of the batched Cube call's ``[rows, rows*hidden]``
+    output: its rows are ``row_stride`` apart (``rows * hidden + hidden``), which is why the kernel takes
+    the stride rather than assuming a packed row.
+    """
+    global calls
+    kernels = _load()
+    if kernels is None:
+        raise RuntimeError(f"the expert kernel is unavailable: {_ERROR}")
+    down = kernels[2]
+    down[(1,)](diag, hs, w.contiguous(), y, N=int(hidden), ROW_STRIDE=int(row_stride),
+               ROWS=int(rows), BLOCK=_block(hidden, _DOWN_CAP))
     calls += 1
 
 
