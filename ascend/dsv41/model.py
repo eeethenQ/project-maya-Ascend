@@ -43,7 +43,7 @@ from .checkpoint import Checkpoint
 from .config import FULL, REUSE, SWA_ONLY, LayerRole, TextConfig, Topology, build_layer_plan
 from .graph_runner import GraphRunner, GraphRunnerError, GraphTeardownError
 from .kv_planes import INDEX as INDEX_PLANE
-from . import sinkhorn_triton
+from . import attn_triton, expert_triton, quant_triton, sinkhorn_triton
 
 
 # --------------------------------------------------------------------------- quantization
@@ -144,7 +144,7 @@ def mhc_pre_sinkhorn():
 ATTN_BLOCK = 64
 
 
-def per_token_int8(x: torch.Tensor, *, fused: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+def per_token_int8(x: torch.Tensor, *, fused: bool = True, kernel: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamic per-token symmetric int8 activation quantization: ``q = round(x / (max|x|/127))``.
 
     On the card ``npu_dynamic_quant`` is that formula as one operator (its docstring says
@@ -158,7 +158,17 @@ def per_token_int8(x: torch.Tensor, *, fused: bool = True) -> tuple[torch.Tensor
     The op accepts bf16/fp16 only, so the activation is rounded first; fp16 is used because it is the
     finer of the two and both call sites are bounded far inside its range (see below).  ``fused=False``
     is the torch reference and stays the prompt (``T > 1``) path.
+
+    The default on the card is `quant_triton`: one Triton kernel that reproduces *this* function
+    bit-for-bit (int8 values and fp32 scale, exact ties and the all-zero row included) without the
+    round-through-fp16 that made the vendor op unusable.  It covers every shape - decode and prompt -
+    because the check is the same arithmetic at every ``T``; ``DSV41_TORCH_QUANT=1`` puts this torch
+    path back for the A/B, and ``fused=True`` still selects the vendor op when a caller opts in.
+    ``kernel=False`` forces the torch form on the card, which is what the tests and
+    `ascend/probe_quant.py` compare the kernel against.
     """
+    if kernel and not fused and quant_triton.enabled(x):
+        return quant_triton.per_token_int8(x)
     if fused and _FUSED_QUANT and x.device.type != "cpu":
         # fp16, not bf16: the op accepts both, and fp16's 11 mantissa bits make the pre-rounding change
         # the int8 result on ~1 value in 2000 instead of ~1 in 200.  Both call sites are bounded well
@@ -1186,6 +1196,59 @@ class Dsv41:
             except Exception as exc:             # noqa: BLE001 - a broken Triton falls back to torch
                 self.fused_sinkhorn = False
                 self._mhc_note = f"torch Sinkhorn: {exc}"
+        # The per-token int8 quantiser as one Triton kernel (`quant_triton`), which replaces ten
+        # dispatches and is bit-identical to the torch path.  Off on CPU and on a stack without a
+        # working Triton; `DSV41_TORCH_QUANT=1` restores the torch form for the A/B.
+        self.fused_quant_kernel = npu and not quant_triton.off() and quant_triton.available()
+        if str(device).startswith("npu") and self.fused_quant_kernel:
+            try:
+                quant_triton.warm(device)        # both column counts compile outside any capture
+            except Exception as exc:             # noqa: BLE001 - a broken Triton falls back to torch
+                self.fused_quant_kernel = False
+                self._mhc_note = f"{self._mhc_note} torch quantiser: {exc}".strip()
+        # The expert block's epilogues (`expert_triton`): gate/up dequant + clamps + SwiGLU + the
+        # quantisation of h in one launch, and the down projection's scale/route-weight/accumulate in
+        # another.  Same three Cube multiplies; ~20 elementwise dispatches a expert disappear.
+        # `DSV41_TORCH_EXPERT_EPI=1` restores the torch epilogues for the A/B, and `fused_quant=True`
+        # (the rejected vendor quantiser experiment) also keeps them off, so that that A/B stays exactly
+        # the path it was measured on - the h quantisation there is the vendor op, as it was then.
+        self.fused_expert_epi = (self.int8_experts and npu and not expert_triton.off()
+                                 and expert_triton.available())
+        if str(device).startswith("npu") and self.fused_expert_epi:
+            try:
+                expert_triton.warm(device)
+            except Exception as exc:             # noqa: BLE001 - a broken Triton falls back to torch
+                self.fused_expert_epi = False
+                self._mhc_note = f"{self._mhc_note} torch expert epilogue: {exc}".strip()
+        # The decode attention (`T == 1`) as one Triton kernel (`attn_triton`): the torch path spends
+        # ~13 dispatches a layer on the mask, the sink fold, the max/exp/sum/divide and the two einsums
+        # around a QK/PV core that is 0.7 ms of the step, and one kernel does all of it.  Off on CPU and
+        # on a stack without a working Triton; `DSV41_TORCH_ATTN=1` puts the torch path back for the A/B.
+        # T > 1 keeps the block-vectorised torch path (see `attn_triton`'s docstring).
+        self.fused_attn = npu and not attn_triton.off() and attn_triton.available()
+        self.attn_calls = {"kernel": 0, "torch": 0}
+        if str(device).startswith("npu") and not self.fused_attn:
+            self._mhc_note = (self._mhc_note + " " if self._mhc_note else "") + \
+                f"torch attention: {attn_triton.error()}"
+
+    @property
+    def attn_path(self) -> str:
+        """Which attention implementation this instance dispatches to, for the log a run prints."""
+        counts = f"{self.attn_calls['kernel']} kernel, {self.attn_calls['torch']} torch"
+        if self.fused_attn:
+            return f"attention kernel (T==1): {counts}"
+        return f"torch attention: {counts}"
+
+    @property
+    def quant_path(self) -> str:
+        """Which per-token int8 quantiser this instance dispatches to, for the log a run prints."""
+        if quant_triton.off():
+            return f"torch quantiser ({quant_triton.calls} kernel calls)"
+        if self.fused_quant:
+            return "vendor npu_dynamic_quant (rounds through fp16)"
+        if self.fused_quant_kernel:
+            return f"quantiser kernel ({quant_triton.calls} calls)"
+        return f"torch quantiser ({quant_triton.error() or 'kernel off'})"
 
     @property
     def mhc_path(self) -> str:
@@ -1571,18 +1634,26 @@ class Dsv41:
         if T == 1:
             # the captured decode step: one row, one window read, exactly the arithmetic a graph replays
             wkeys, wvalid = state.kv.read_window(li, positions[0:1])
-            wkeys = wkeys.float()                                          # [win, D]
             if r:
                 j = topk[0]
                 # the indexer's -1 padding gathers entry 0 and is masked by `cvalid`, exactly as the host
                 # `long_kv[:, j.clamp_min(0)]` slice did, but with no host index in the graph
-                ckeys = state.kv.read_groups(role.kv_source_layer, j).float()
+                ckeys = state.kv.read_groups(role.kv_source_layer, j)
                 cvalid = j >= 0
                 keys = torch.cat([wkeys, ckeys], 0)
                 valid = torch.cat([wvalid, cvalid])
             else:
                 keys, valid = wkeys, wvalid
-            out[0] = self.sparse_attn(q[0:1], keys[None], valid[None], sink, scale)[0]
+            if self.fused_attn and attn_triton.enabled(q[0], keys, valid, sink):
+                # one kernel: the mask, the sink fold, both denominators, QK and P*V (`attn_triton`).
+                # It writes the layer's row in place, so there is no result copy after the launch.
+                attn_triton.sparse_attn(q[0], keys, valid, sink, scale, out=out[0])
+                self.attn_calls["kernel"] += 1
+            else:
+                # the tested composition; the keys are upcast here (bf16 -> fp32 is exact), so this is
+                # the arithmetic the old path ran with the upcast before the `cat`
+                out[0] = self.sparse_attn(q[0:1], keys[None].float(), valid[None], sink, scale)[0]
+                self.attn_calls["torch"] += 1
         else:
             # A prompt chunk, in blocks of ATTN_BLOCK queries.  Each query sees exactly `win` window rows
             # plus its own top-k compressed rows, so a block's union of window rows runs from query 0's
@@ -1658,9 +1729,26 @@ class Dsv41:
         projection - about 1 200 times a step - although every expert of a token multiplies the same rows.
         """
         if self.int8_experts and torch_npu is not None:
-            got = torch_npu.npu_quant_matmul(xq, q[0].T, scale.view(-1), output_dtype=torch.bfloat16)
-            return got.float() * xs
+            return self.expert_mm_raw(xq, q, scale).float() * xs
         return self.mm(xq, self.dequant(q, scale, offset)[0])
+
+    def expert_mm_raw(self, xq: torch.Tensor, q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """The int8 multiply's bf16 output, before the per-token dequant: what a fused epilogue consumes."""
+        return torch_npu.npu_quant_matmul(xq, q[0].T, scale.view(-1), output_dtype=torch.bfloat16)
+
+    def expert_block(self, xq: torch.Tensor, xs: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor,
+                     w3: torch.Tensor, s3: torch.Tensor, w2: torch.Tensor, s2: torch.Tensor,
+                     weight: torch.Tensor, y: torch.Tensor) -> None:
+        """One expert, gate/up -> SwiGLU -> quantise -> down, accumulated into ``y`` in place.
+
+        The three Cube multiplies are the same `npu_quant_matmul` calls `expert_mm_q` makes; what the two
+        Triton kernels replace is everything between them (`expert_triton`), which the torch path spends
+        ~20 dispatches on.  ``xs`` is the layer activation's per-token scale, ``weight`` the routing weight.
+        """
+        g_raw = self.expert_mm_raw(xq, w1, s1)
+        u_raw = self.expert_mm_raw(xq, w3, s3)
+        hq, hs = expert_triton.gate_up_swiglu_q8(g_raw, u_raw, xs, self.lim)
+        expert_triton.down_epilogue(self.expert_mm_raw(hq, w2, s2), hs, weight, y)
 
     def expert_mm(self, x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
         """x [T,in] times an expert's int8 [1,out,in] and its per-channel scale, as [T,out] fp32.
@@ -1821,7 +1909,11 @@ class Dsv41:
             with self.phase("moe_fetch"):
                 blocks = self.weights.experts.fetch_int8(li, batch)
             for i, _e in enumerate(batch):
-                if xq is not None:
+                if xq is not None and self.fused_expert_epi and not self.fused_quant:
+                    b1, b3, b2 = blocks[i]["w1"], blocks[i]["w3"], blocks[i]["w2"]
+                    self.expert_block(xq, xs, b1[0], b1[1], b3[0], b3[1], b2[0], b2[1],
+                                      weights[slots[start + i]].reshape(1), y)
+                elif xq is not None:
                     g = self.expert_mm_q(xq, xs, *blocks[i]["w1"]).clamp(max=self.lim)
                     u = self.expert_mm_q(xq, xs, *blocks[i]["w3"]).clamp(-self.lim, self.lim)
                     h = F.silu(g) * u
@@ -2241,7 +2333,10 @@ class Dsv41:
             w1 = slab[i, 0].view(inter, hidden)
             w2 = slab[i, 1].view(hidden, inter)
             w3 = slab[i, 2].view(inter, hidden)
-            if xq is not None:
+            if xq is not None and self.fused_expert_epi and not self.fused_quant:
+                self.expert_block(xq, xs, w1[None], sc1[i], w3[None], sc3[i], w2[None], sc2[i],
+                                  regs.wts[i], y)
+            elif xq is not None:
                 g_ = self.expert_mm_q(xq, xs, w1[None], sc1[i], z1[i]).clamp(max=self.lim)
                 u_ = self.expert_mm_q(xq, xs, w3[None], sc3[i], z3[i]).clamp(-self.lim, self.lim)
                 h_ = F.silu(g_) * u_

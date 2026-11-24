@@ -285,6 +285,101 @@ class Parity(unittest.TestCase):
         peak = torch.npu.max_memory_allocated(0) / (1 << 30)
         self.assertLess(peak, 32.0, f"peak allocation {peak:.1f} GiB is past the 32 GiB share")
 
+    def test_the_quantiser_kernel_is_bit_exact_and_captures(self):
+        """`ascend/dsv41/quant_triton.py`: one kernel, the same int8 values and scale bits as torch.
+
+        The bar is exact, not 2e-3: the reason the vendor one-op quantiser was rejected is that rounding
+        the activation changes int8 values (41 of 5120) and, over 40 layers, the logits.  So this compares
+        int8 values and the fp32 scale bit for bit, at a decode shape and a prompt shape, with exact ties
+        (amax = 127 makes the scale exactly 1 and every half-integer a tie) and an all-zero row.
+        """
+        from ascend.dsv41 import quant_triton
+        from ascend.dsv41.graph_runner import GraphRunner
+        from ascend.dsv41.model import per_token_int8
+
+        net = self.build(self.dev, torch.bfloat16)
+        self.assertTrue(net.fused_quant_kernel, "the kernel should be the device default")
+        self.assertIn("quantiser kernel", net.quant_path)
+        d = self.cfg.hidden_size
+        gen = torch.Generator(device="cpu").manual_seed(5)
+        ties = torch.randint(-254, 255, (3, d), generator=gen).float() + 0.5
+        ties[:, 0] = 127.0                                       # amax exactly 127 -> scale exactly 1
+        cases = [(torch.randn(1, d, generator=gen) * 0.5, "decode"),
+                 (torch.randn(1, 16, generator=gen) * 24.0, "expert"),
+                 (torch.randn(7, d, generator=gen) * 6.0, "prompt"),
+                 (ties, "ties"),
+                 (torch.zeros(2, d), "zeros")]
+        for x, tag in cases:
+            x = x.to(self.dev)
+            want_q, want_s = per_token_int8(x, fused=False, kernel=False)
+            before = quant_triton.calls
+            got_q, got_s = per_token_int8(x, fused=False)
+            self.assertEqual(quant_triton.calls, before + 1, f"{tag}: the kernel was not the path taken")
+            self.assertTrue(torch.equal(got_q, want_q), f"{tag}: int8 values differ from the torch path")
+            self.assertTrue(torch.equal(got_s.view(torch.int32), want_s.view(torch.int32)),
+                            f"{tag}: the fp32 scale differs from the torch path")
+        x = (torch.randn(1, d, generator=gen) * 3).to(self.dev)
+        runner = GraphRunner(self.dev)
+        try:
+            def fn():
+                return per_token_int8(x, fused=False)
+
+            runner.capture("quant", fn, inputs={"x": x}, verify=True)
+            report = runner.report("quant")
+            self.assertTrue(report.verified, f"the guard did not run: {report}")
+            self.assertTrue(report.ok, f"the quantiser kernel did not capture: {report}")
+        finally:
+            runner.close()
+
+    def test_the_expert_epilogue_kernels_match_and_capture(self):
+        """`ascend/dsv41/expert_triton.py`: gate/up + SwiGLU + quantise, and the down epilogue.
+
+        The block's bar is the engine's 2e-3, not token equality (a 1-LSB int8 change can flip routing
+        downstream - `docs/ascend-notes/mhc-adoption.md`), so this checks the quantised h and its scale
+        against the torch composition, and that the down epilogue is the same arithmetic bit for bit.
+        """
+        from ascend.dsv41 import expert_triton
+        from ascend.dsv41.graph_runner import GraphRunner
+        from ascend.dsv41.model import per_token_int8
+
+        net = self.build(self.dev, torch.bfloat16)
+        self.assertTrue(net.fused_expert_epi, "the kernels should be the device default")
+        gen = torch.Generator(device="cpu").manual_seed(7)
+        inter, hidden = self.cfg.moe_intermediate_size, self.cfg.hidden_size
+        g = (torch.randn(2, inter, generator=gen) * 4000).to(torch.bfloat16).to(self.dev)
+        u = (torch.randn(2, inter, generator=gen) * 4000).to(torch.bfloat16).to(self.dev)
+        xs = torch.full((2, 1), 3e-4, dtype=torch.float32, device=self.dev)
+        h = torch.nn.functional.silu((g.float() * xs).clamp(max=net.lim)) * \
+            (u.float() * xs).clamp(-net.lim, net.lim)
+        want_q, want_s = per_token_int8(h, fused=False, kernel=False)
+        got_q, got_s = expert_triton.gate_up_swiglu_q8(g, u, xs, net.lim)
+        deq = (got_q.float() * got_s - want_q.float() * want_s).abs().max()
+        denom = want_q.float().mul(want_s).abs().max().clamp_min(1e-30)
+        self.assertLess((deq / denom).item(), 2e-3,
+                        f"the quantised h moved {(deq / denom).item():.2e} relative, past the 2e-3 bar")
+        d_raw = (torch.randn(2, hidden, generator=gen) * 300).to(torch.bfloat16).to(self.dev)
+        w = torch.tensor([0.37], device=self.dev)
+        want_y = (d_raw.float() * want_s) * w
+        y = torch.zeros(2, hidden, device=self.dev)
+        expert_triton.down_epilogue(d_raw, want_s, w, y)
+        self.assertTrue(torch.equal(y.view(torch.int32), want_y.view(torch.int32)),
+                        "the down epilogue's arithmetic differs from the torch order")
+        runner = GraphRunner(self.dev)
+        try:
+            def fn():
+                hq, hs = expert_triton.gate_up_swiglu_q8(g, u, xs, net.lim)
+                expert_triton.down_epilogue(d_raw, hs, w, y)
+                return hq.float() * hs
+
+            runner.capture("expert", fn, inputs={"g": g, "u": u, "xs": xs, "d": d_raw, "w": w},
+                           verify=True)
+            report = runner.report("expert")
+            self.assertTrue(report.verified, f"the guard did not run: {report}")
+            self.assertTrue(report.ok, f"the expert kernels did not capture: {report}")
+        finally:
+            runner.close()
+
+
 
 @unittest.skipUnless(HAS_NPU, "needs an Ascend NPU")
 class FusedMhc(unittest.TestCase):
@@ -448,6 +543,59 @@ class FusedMhc(unittest.TestCase):
         self.assertEqual(net.mhc_calls["torch"], before["torch"] + 1)
         self.assertIn("T==1", net.mhc_path)
 
+
+    def test_the_attention_kernel_matches_torch_and_captures(self):
+        """`ascend/dsv41/attn_triton.py`: the decode attention as one kernel, at the real 64x512 shape.
+
+        The tiny model has two heads, so its own decode keeps the torch path (`enabled()` refuses a head
+        count that is not a multiple of the kernel's head block); this runs the kernel at the real head
+        width and 512 channels against `Dsv41.sparse_attn`, at the profiled 192-key shape and at the full
+        640-key one, with masked rows and with a sink that dominates or is -inf.  The bar is the fp32
+        matmul's own noise: the kernel reproduces the reference's sink algebra and keeps both products
+        ~fp32, so a per-call error far below the model's 2e-3 is expected - and the call must pass the
+        capture guard (two eager values, two replays bit-identical).
+        """
+        from ascend.dsv41 import attn_triton
+        from ascend.dsv41.graph_runner import GraphRunner
+
+        net = self.build()
+        self.assertTrue(net.fused_attn and attn_triton.available(), attn_triton.error())
+        self.assertIn("attention kernel", net.attn_path)
+        H, D = 64, 512
+        gen = torch.Generator(device="cpu").manual_seed(11)
+        q = torch.randn(H, D, generator=gen).to(self.dev)
+        sink = (torch.randn(H, generator=gen) * 2).to(self.dev)
+        scale = D ** -0.5
+        for n in (192, 640):
+            keys = torch.randn(n, D, generator=gen).to(torch.bfloat16).to(self.dev)
+            valid = torch.ones(n, dtype=torch.bool, device=self.dev)
+            valid[:17] = False                      # a window read before token 0
+            keys[::13] = 17.0                       # an invalid row's content is unspecified
+            self.assertTrue(attn_triton.enabled(q, keys, valid, sink))
+            got = attn_triton.sparse_attn(q, keys, valid, sink, scale)
+            want = net.sparse_attn(q[None], keys[None].float(), valid[None], sink, scale)[0]
+            rel = ((got - want).abs().max() / want.abs().max().clamp_min(1e-30)).item()
+            self.assertLess(rel, 2e-5, f"N={n}: max rel err {rel:.2e}")
+            self.assertTrue(torch.isfinite(got).all())
+            for s, tag in ((torch.full((H,), 1e9, device=self.dev), "huge"),
+                           (torch.full((H,), float("-inf"), device=self.dev), "none")):
+                k = attn_triton.sparse_attn(q, keys, valid, s, scale)
+                w = net.sparse_attn(q[None], keys[None].float(), valid[None], s, scale)[0]
+                rel = ((k - w).abs().max() / w.abs().max().clamp_min(1e-30)).item()
+                self.assertLess(rel, 2e-5, f"N={n} sink {tag}: max rel err {rel:.2e}")
+                if tag == "huge":
+                    self.assertLess(k.abs().max().item(), 1e-3, "a dominant sink zeroes the output")
+        keys = torch.randn(192, D, generator=gen).to(torch.bfloat16).to(self.dev)
+        valid = torch.ones(192, dtype=torch.bool, device=self.dev)
+        runner = GraphRunner(self.dev)
+        try:
+            runner.capture("attn", lambda: attn_triton.sparse_attn(q, keys, valid, sink, scale),
+                           inputs={"q": q, "keys": keys, "valid": valid, "sink": sink}, verify=True)
+            report = runner.report("attn")
+            self.assertTrue(report.verified, f"the guard did not run: {report}")
+            self.assertTrue(report.ok, f"the attention kernel did not capture: {report}")
+        finally:
+            runner.close()
 
 if __name__ == "__main__":
     unittest.main()
