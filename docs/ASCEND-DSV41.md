@@ -1373,3 +1373,57 @@ across four cards.  The single number that would have to change: at the baseline
 rate the split needs the tier at **<= 1.20 GB/step, i.e. an 86 % hit rate**, to break even - it measures
 81.5 %, the same as the baseline.  Neither a faster wire nor a better-placed split is what is missing; a
 split has to *raise* the hit rate (or fail to pay a hand-off), and this one does neither.
+
+## 22. The operator work: what a fused kernel bought, and the pattern behind it
+
+The engine began as a PyTorch composition - 32 242 operator calls for one decode step. Graph capture removed
+the launch cost of those calls (1 661 -> ~410-630 ms/token), which left the *device* time as the next target,
+and that is what this section is about. Eight changes, each measured with `bench_profile --graphs --msprof` and
+each behind a flag so it can be A/B'd.
+
+| change | effect | numerics |
+|---|---|---|
+| mHC Sinkhorn as one Triton kernel, 20 rounds in registers | **21.07 -> 0.805 ms/step**, 9 360 -> 80 dispatches | pre/post bit-identical, comb 1.21e-7 - closer to torch than the engine's own numpy path |
+| per-token int8 quantiser as one kernel | **4.68 -> 2.00 ms/step** | **bit-identical**, 2.17 M values, including ties and zero rows |
+| `gate_up_swiglu_q8` + `down_epilogue` | **5.34 -> 2.93 ms/step** | **bit-identical** for hq, hs and y |
+| CSA2 decode attention as one kernel | **15 device tasks -> 1 a layer**, ~5.5 ms/step | max 2.42e-6, median 1.18e-6 |
+| six experts' matmuls batched | 720 -> 80 `npu_quant_matmul`, **-4.5 ms of Cube** | **bit-identical** |
+| `npu_rms_norm` | 13 360 -> 12 915 calls, 67.3 -> 66.1 ms | 2.1e-7, bit-identical on 168 of 169 calls |
+| tier LRU: list -> OrderedDict | 16.38 -> 0.45 ms (**36.5x**) | none (same policy, same eviction order) |
+| slab fill: cached views instead of rebuilt ones | 18.18 -> 8.34 ms | none (identical logits) |
+
+Operator calls per decode step: **32 242 before capture, 24 079 after it, 5 370 now**.
+
+### The pattern, which is the transferable part
+
+Three times a cost attributed to the device turned out to be **host bookkeeping**, and each was bigger than the
+kernel work around it: the tier LRU scanned a list per hit (16 ms), the routing read rebuilt nothing but waited
+(see below), and the slab fill spent 16 ms building `cat` views rather than copying bytes. A profile that says
+`ReduceSum` is expensive does not say the time is in the arithmetic.
+
+**The acceptance bar had to change.** Substituting `npu_rms_norm` at 2.1e-7 per call still moved the real
+model's logits by 1.5e-1 and flipped a token, because forty layers of discrete top-6 routing amplify any
+perturbation. Token equality is therefore not a usable test for a kernel substitution - it turns every adoption
+far inside the 2e-3 contract into a false failure. The bar is a per-call perturbation bound plus a statistical
+accuracy check, and it is written down in `ascend-notes/mhc-adoption.md`.
+
+**Two vendor operators were rejected on evidence, not on suspicion.** `aclnnMhcPreSinkhorn` is the right
+arithmetic (3e-7 at layer 0) but degrades to 1.3e-3 by layer 79 where the activation is large, and flips tokens
+on the real model; `npu_moe_gating_top_k` normalises a softmax or sigmoid of its input while this model
+L1-renormalises the raw sqrtsoftplus score and matched the top-6 set on only 143 of 440 rows. `npu_fusion_attention`
+runs correctly and **cannot be captured** (107025), and cannot express the sink at `Sq=1` (161002). `npu_mhc_sinkhorn`
+has no 910B kernel at all (561103).
+
+**What is left is not an operator problem.** The per-layer timeline puts the decode step's critical path at:
+`pread` (the array's 2.5 GB/s ceiling), the fixed 8.49 GB/step of tier-to-slab D2D that the batched matmul
+needs, and a device chain of ~62 ms that only a two-token batch or speculation could shorten. Device busy is
+2.6% of a step. Everything in the table above moved host work and small kernels; the remaining terms are the
+storage and the model's own sequential structure.
+
+### Two smaller things recorded while doing this
+
+* the fill's D2D is **fixed at 40 x 212 MB = 8.49 GB a step regardless of tier**, because the batched matmul
+  needs six experts' projections contiguous and per-expert tier blocks are not; the H2D part is only
+  misses x 35.4 MB (3.36 GB at 95 misses, 0.21 GB warm);
+* a hot set with its own fixed-address slab is not viable: a layer's modal six-id set covers **8.3%** of steps,
+  and one slab a layer would cost 8.49 GB, a third of the tier.
