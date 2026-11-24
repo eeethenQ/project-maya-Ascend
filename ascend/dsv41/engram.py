@@ -22,6 +22,8 @@ that engine gathers.
 """
 from __future__ import annotations
 
+import mmap as _mmap
+import os
 import sys
 from pathlib import Path
 
@@ -33,6 +35,11 @@ except Exception:                       # noqa: BLE001 - the CI job has no torch
     torch = None
 
 _CACHE: dict[str, object] = {}
+
+# A row gather is 24 random pages of a 101 GiB file, so the mapping wants MADV_RANDOM.  The A/B switch
+# puts the mount's readahead window back: on this host `read_ahead_kb = 4096`, which turns a 24-row
+# gather into ~186 MiB of reads (measured in `ascend/probe_engram_host.py`).
+_READAHEAD = os.environ.get("DSV41_ENGRAM_READAHEAD") == "1"
 
 
 def _engram_hash():
@@ -78,6 +85,28 @@ class EngramTable:
         self.scale_offset = self.shard.data_start + sinfo.begin
         self.groups = self.cols // group
         self.bytes_read = 0
+        self.random_reads = not _READAHEAD      # the mapping policy `_mapping` asks for
+        self._policy_set = False
+
+    def _mapping(self):
+        """The shard's mapping with the array's readahead window turned off (see below), mapped once.
+
+        A token's 24 rows are 24 *random* pages: the gather is 264 bytes an entry out of 384 006 168, so
+        nothing is sequential about it even though the rows are sorted.  `/mnt/weights` is mounted with
+        `read_ahead_kb = 4096`, and the default fault policy spends that window on every fault: 24 rows
+        pull ~93 MiB off the array to deliver 6 KiB, and the decode gathered **0.66 s/token** for both
+        layers against **0.24 s** with `MADV_RANDOM` (measured in `ascend/probe_engram_host.py`, in situ
+        through the captured decode).  The flag is per mapping, and an Engram shard holds nothing but
+        that layer's weight and scale, so no sequential reader shares it.
+        """
+        mm = self.shard.mmap()
+        if not self._policy_set:
+            try:
+                mm.madvise(_mmap.MADV_RANDOM if self.random_reads else _mmap.MADV_NORMAL)
+            except (AttributeError, OSError, ValueError):    # no madvise here: the policy stays as it is
+                pass
+            self._policy_set = True
+        return mm
 
     def rows_at(self, indices: np.ndarray) -> np.ndarray:
         """The dequantized rows, `[n, cols]` fp32.  Reads walk the file forward (indices are sorted first)."""
@@ -85,7 +114,7 @@ class EngramTable:
         order = np.argsort(flat, kind="stable")
         weights = np.empty((flat.size, self.cols), dtype=np.int8)
         scales = np.empty((flat.size, self.groups), dtype=np.uint8)
-        mm = self.shard.mmap()
+        mm = self._mapping()
         w_row, s_row = self.cols, self.groups
         for slot, i in enumerate(order):
             row = int(flat[i])

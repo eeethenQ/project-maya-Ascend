@@ -10,11 +10,14 @@ from __future__ import annotations
 import json
 import struct
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
+from ascend.dsv41 import engram as engram_module
 from ascend.dsv41.checkpoint import Checkpoint
 from ascend.dsv41.engram import Engram, EngramTable, e8m0_to_float
 
@@ -81,6 +84,22 @@ class TheTable(unittest.TestCase):
         got = self.table.rows_at(np.array([[0, 1], [2, 3]]))
         self.assertEqual(got.shape, (4, HEAD_DIM))
         self.assertEqual(self.table.bytes_read, 4 * (HEAD_DIM + HEAD_DIM // GROUP))
+
+    def test_the_gather_turns_the_arrays_readahead_off(self):
+        """A token's 24 rows are 24 *random* pages: /mnt/weights' 4 MiB readahead made that 186 MiB of
+        disk traffic, and the hint that turns it off is per mapping, so it is set once and kept."""
+        self.assertTrue(self.table.random_reads)
+        self.assertFalse(self.table._policy_set)
+        self.table.rows_at(np.array([3]))
+        self.assertTrue(self.table._policy_set)
+
+    def test_a_platform_without_madvise_still_dequantizes(self):
+        """The hint is an optimisation; a mapping that refuses it must not change the gather's values."""
+        self.table.rows_at(np.array([3]))
+        self.table._policy_set = False
+        with mock.patch.object(engram_module, "_mmap", types.SimpleNamespace()):
+            got = self.table.rows_at(np.array([4]))
+        np.testing.assert_allclose(got[0], self.want(4), rtol=0)
 
     def test_a_table_that_is_not_int8_is_refused(self):
         other = Path(self.tmp.name) / "bad"
