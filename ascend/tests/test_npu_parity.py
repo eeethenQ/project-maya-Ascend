@@ -393,6 +393,48 @@ class FusedMhc(unittest.TestCase):
         y = rms(torch.randn(7, 512, device=self.dev), None, eps)
         self.assertEqual(tuple(y.shape), (7, 512))
 
+    def test_the_sinkhorn_kernel_matches_torch_and_captures(self):
+        """`ascend/dsv41/sinkhorn_triton.py`: the device Sinkhorn as one kernel, still the torch numbers.
+
+        The bar is per-call: the vendor op matched at layer 0 and drifted to 1.3e-3 by layer 79, so this
+        checks the 24 scalars against the torch path (1e-6 relative of the tensor's maximum - the kernel
+        reproduces torch's reduction order, so the residual is the card's exp/sigmoid) and that the call
+        passes the capture guard.  Both single-token and prompt shapes: prefill (T > 1) takes this path.
+        """
+        from ascend.dsv41.graph_runner import GraphRunner
+
+        net = self.build()
+        self.assertTrue(net.fused_sinkhorn, "the kernel should be the device default")
+        net.host_mixes = False                       # T == 1 would otherwise do the host numpy Sinkhorn
+        lw = net.weights.layers[0].hc
+        for tokens in (1, 8):
+            x = (torch.randn(tokens, net.hc, self.cfg.hidden_size) * 0.05).to(self.dev)
+            net.fused_sinkhorn = False
+            want = net.hc_mixes(x, lw["attn_fn"], lw["attn_scale"], lw["attn_base"])
+            before = net.mhc_calls["kernel"]
+            net.fused_sinkhorn = True
+            got = net.hc_mixes(x, lw["attn_fn"], lw["attn_scale"], lw["attn_base"])
+            self.assertEqual(net.mhc_calls["kernel"], before + 1)
+            self.assertIn("sinkhorn kernel", net.mhc_path)
+            for name, a, b in zip(("pre", "post", "comb"), got, want):
+                rel = (a - b).abs().max() / b.abs().max().clamp_min(1e-30)
+                self.assertLess(rel.item(), 1e-6, f"T={tokens} {name}: max rel err {rel.item():.2e}")
+
+        x = (torch.randn(1, net.hc, self.cfg.hidden_size) * 0.05).to(self.dev)
+        runner = GraphRunner(self.dev)
+        try:
+            def fn():
+                return net.hc_mixes(x, lw["attn_fn"], lw["attn_scale"], lw["attn_base"])
+
+            runner.capture("sinkhorn", fn, inputs={"x": x, "fn": lw["attn_fn"],
+                                                  "scale": lw["attn_scale"],
+                                                  "base": lw["attn_base"]}, verify=True)
+            report = runner.report("sinkhorn")
+            self.assertTrue(report.verified, f"the guard did not run: {report}")
+            self.assertTrue(report.ok, f"the Sinkhorn kernel did not capture: {report}")
+        finally:
+            runner.close()
+
     def test_the_fused_mhc_is_scoped_to_one_token(self):
         """T > 1 keeps the torch path: the 4D input mis-computes comb at D=64, and prefill is not the
         hot path, so no prefill call may reach the op."""

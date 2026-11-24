@@ -86,3 +86,47 @@ is the model's: 40 layers of discrete top-k routing turn a 1e-7 perturbation int
 list.  The same phenomenon inflated the mHC A/B, but mHC also had a real per-call error (1.3e-3 at
 layer 79) four orders larger.  Treat the end-to-end token comparison as a *sensitivity* measurement,
 not an accept/reject test for an op that is bit-faithful per call.
+
+## The Sinkhorn as one kernel (adopted, same session)
+
+The 21.7 ms was never arithmetic: it was 3 120 `ReduceSum` + 3 120 `RealDiv` + 3 120 `Add` on a 4x4.
+Step 1 as briefed - "a `torch.softmax` is one op where the engine uses three" - does not apply: only the
+*first* iteration is a softmax (`comb.softmax(-1) + eps`); the other 19 are `c / (sum + eps)`, which is
+`ReduceSum` + `Add` + `RealDiv` however it is written, and any 4x4 torch op costs a dispatch.  So the
+torch-op floor is ~117 a mix, i.e. what the engine already does; the win needs a kernel.
+
+`ascend/dsv41/sinkhorn_triton.py` is one Triton kernel a mix (24 mix values in, `pre`/`post`/`comb` out,
+all 20 iterations in registers).  Measured on physical npu:2:
+
+* **isolated, 80 mixes replayed inside one graph**: **21.07 -> 0.805 ms/step** (263 -> 10 us a mix),
+  inside a graph that passes `GraphRunner.capture(verify=True)` (replay bit-identical to eager).  That is
+  the isolation that reproduced 22.0 ms for the torch path.
+* **`bench_profile --graphs --msprof`, same command both sides**: **12 915 -> 8 262 operator calls/token,
+  65.7 -> 56.2 ms/token** (the torch arm, run last on this tree, reproduces the pre-change 12 915/65.8).
+  `ReduceSum` 1 533 -> 115, `RealDiv` 1 813 -> 395, `Add` 1 919 -> 319, `SoftmaxV2` 38 -> 0, and one
+  `_sinkhorn_kernel` (36.5 calls/token, 0.53 ms/token) in their place.
+  The profile averages an 8-token prompt into every token, so the per-step figure is the isolated one.
+* **numerics, the acceptance bar**: the vendor op's failure was a per-call error growing to 1.3e-3 by
+  layer 79.  This kernel's per-call residual against the torch path, instrumented on **every one of the
+  240 real mHC calls** of a prefill + 2 decode steps (`ascend/probe_sinkhorn_ab.py`): `pre` and `post`
+  **bit-identical**, `comb` **1.21e-7** relative of its maximum (8.5e-7 per element).  For scale, the
+  engine's own host numpy Sinkhorn on the same calls is **1.80e-7 / 1.16e-6** - the kernel is the
+  *closer* of the two to the shipped device path.  It reproduces torch's reduction order: the contiguous
+  `sum(-1)` is pairwise `(a+b)+(c+d)` (16 384/16 384 bit-exact on a `[4096,4,4]`) and the stride-4
+  `sum(-2)` is sequential `((a+b)+c)+d` (16 384/16 384; pairwise is right on 11 424).
+* **capture**: `rt.build(..., graphs=True, graph_verify=True)` captures all **80/80** decode graphs with
+  the kernel inside and every one passes the did-it-capture guard.
+* **end to end** (same tokens, both arms captured, `fused_sinkhorn` the only difference): greedy argmax
+  agrees **6/6**, logits move 6e-2..2e-1 relative, wall **1 032 -> 901 ms/step**.  That is the same
+  sensitivity class already recorded above for the 2.1e-7 `npu_rms_norm`; the per-call error here is
+  1e-7, four orders below the vendor op's.
+
+A/B: `DSV41_TORCH_SINKHORN=1` or `Dsv41.fused_sinkhorn = False` restores the torch path;
+`Dsv41.mhc_path` reports the counts.  Prefill (`T > 1`) takes the same kernel (one block a row) and is
+covered by `test_npu_parity.FusedMhc::test_the_sinkhorn_kernel_matches_torch_and_captures` at T=1 and
+T=8; the eager single-token path keeps the host numpy Sinkhorn.
+
+Remaining, in value order: the kernel is 0.805 ms/step against the 0.10 ms/step 80-node floor - a 4x4
+block layout gets it to 0.40 ms (measured) but uses a tree column sum, so the exact-order form was kept;
+the mix matmul (2.7 ms/step) could join the same kernel, which is where the remaining mHC time is; and
+`ascend/kernels/sinkhorn/` is the compiled Ascend C equivalent plus registration glue, unwired.
