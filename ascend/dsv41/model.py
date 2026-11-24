@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter as _perf
 from contextlib import contextmanager
@@ -42,6 +43,7 @@ from .checkpoint import Checkpoint
 from .config import FULL, REUSE, SWA_ONLY, LayerRole, TextConfig, Topology, build_layer_plan
 from .graph_runner import GraphRunner, GraphRunnerError, GraphTeardownError
 from .kv_planes import INDEX as INDEX_PLANE
+from . import sinkhorn_triton
 
 
 # --------------------------------------------------------------------------- quantization
@@ -666,7 +668,13 @@ class ExpertStreamer(ExpertSource):
         # on one card than its share allows, which is exactly what the 32 GB cap forbids.  A quota per
         # *layer* was implemented and measured too - 64-67% hit rate either way, 1.07x on the median,
         # inside this machine's noise - and removed again rather than kept as complexity.
-        self._order: dict[str, list[tuple[int, int]]] = {}
+        #
+        # The order is an OrderedDict, not a list, because *every tier hit* touches it and a hit is on the
+        # decode step's critical path: `key in order` + `order.remove(key)` scan a list that holds one
+        # entry per resident expert, so the cost is O(slots) per hit (measured: 1 084 slots -> ~18 ms of
+        # the step's host time; a 2 480-slot tier would be ~2.5x that).  `move_to_end`/`popitem` are O(1)
+        # and implement the identical policy, so the eviction order - and every byte fetched - is unchanged.
+        self._order: dict[str, OrderedDict[tuple[int, int], None]] = {}
         self._slots: dict[str, int] = {}
         self.hits = self.misses = 0
         self.bytes_in = 0
@@ -766,7 +774,7 @@ class ExpertStreamer(ExpertSource):
         self.cache_slots = sum(self._slots.values())
         for dev in list(self._order):
             while len(self._order[dev]) > self._slots.get(dev, 0):
-                self._cache.pop(self._order[dev].pop(0), None)
+                self._cache.pop(self._order[dev].popitem(last=False)[0], None)
             if not self._order[dev]:
                 self._order.pop(dev, None)
 
@@ -872,10 +880,9 @@ class ExpertStreamer(ExpertSource):
                 dev = self.device_for(layer)
                 if self._slots.get(dev, 0):
                     key = (layer, e)
-                    order = self._order.setdefault(dev, [])
-                    if key in order:
-                        order.remove(key)
-                    order.append(key)
+                    order = self._order.setdefault(dev, OrderedDict())
+                    order[key] = None
+                    order.move_to_end(key)
                 blocks[i] = block
             else:
                 missing.append((i, e))
@@ -896,15 +903,15 @@ class ExpertStreamer(ExpertSource):
                         # The card is shared and the budget is a prediction.  A tier that cannot grow must
                         # not end the request: stream this expert and go on, with the card's free memory
                         # kept up to date so the next attempt is not made needlessly.
-                        self._slots[dev] = len(self._order.get(dev, []))
+                        self._slots[dev] = len(self._order.get(dev, {}))
                         self.oom_skips += 1
                         torch.npu.empty_cache()
                         continue
                     self._cache[(layer, e)] = cached
-                    order = self._order.setdefault(dev, [])
-                    order.append((layer, e))
+                    order = self._order.setdefault(dev, OrderedDict())
+                    order[(layer, e)] = None
                     while len(order) > self._slots[dev]:
-                        self._cache.pop(order.pop(0), None)
+                        self._cache.pop(order.popitem(last=False)[0], None)
         return blocks
 
     def _clone_for_cache(self, block: dict) -> dict:
@@ -1166,7 +1173,19 @@ class Dsv41:
         self.fused_mhc = False
         self._mhc_op = None
         self._mhc_note = ""
-        self.mhc_calls = {"fused": 0, "torch": 0}
+        self.mhc_calls = {"fused": 0, "torch": 0, "kernel": 0}
+        # The Sinkhorn as one Triton kernel (`sinkhorn_triton`): the torch path spends ~117 dispatches a
+        # mix on 24 numbers - 21.7 ms of the 109.8 ms decode step - and the arithmetic cannot be written
+        # with fewer torch ops (an iteration is a plain sum+add+divide, not a softmax).  The kernel does
+        # the whole thing in registers, in the engine's own reduction order, and captures.  Off on CPU and
+        # on a stack without a working Triton; `DSV41_TORCH_SINKHORN=1` puts the torch path back for A/B.
+        self.fused_sinkhorn = npu and not sinkhorn_triton.off() and sinkhorn_triton.available()
+        if str(device).startswith("npu") and self.fused_sinkhorn:
+            try:
+                sinkhorn_triton.warm(device)     # the JIT compile must not land inside a capture
+            except Exception as exc:             # noqa: BLE001 - a broken Triton falls back to torch
+                self.fused_sinkhorn = False
+                self._mhc_note = f"torch Sinkhorn: {exc}"
 
     @property
     def mhc_path(self) -> str:
@@ -1174,7 +1193,9 @@ class Dsv41:
         if self.fused_mhc:
             return f"cann MhcPreSinkhorn (T==1, hc==4): {self.mhc_calls['fused']} fused, " \
                    f"{self.mhc_calls['torch']} torch"
-        return "torch mHC" + (f" ({self._mhc_note})" if self._mhc_note else "")
+        sink = (f"sinkhorn kernel {self.mhc_calls['kernel']}/{self.mhc_calls['torch']}"
+                if self.fused_sinkhorn else "torch sinkhorn")
+        return f"torch mHC, {sink}" + (f" ({self._mhc_note})" if self._mhc_note else "")
 
     @contextmanager
     def phase(self, name: str):
@@ -1252,6 +1273,13 @@ class Dsv41:
             return (torch.from_numpy(pre).to(dev, dtype=dt), torch.from_numpy(post).to(dev, dtype=dt),
                     torch.from_numpy(comb).to(dev, dtype=dt))
         mixes = (xf.to(fn.dtype) @ fn.T).float() * rstd
+        if self.fused_sinkhorn and hc == 4 and sinkhorn_triton.enabled(mixes):
+            # one kernel for the Sinkhorn *and* pre/post: ~117 dispatches -> 1.  It reproduces this
+            # path's arithmetic and its reduction order (see `sinkhorn_triton`), so it is the same
+            # 24 numbers to one ulp of the card's exp/sigmoid.
+            self.mhc_calls["kernel"] += 1
+            return sinkhorn_triton.sinkhorn(mixes, scale, base, int(self.cfg.hc_sinkhorn_iters),
+                                            float(self.cfg.hc_eps))
         pre = torch.sigmoid(mixes[:, :hc] * scale[0] + base[:hc]) + self.cfg.hc_eps
         post = 2 * torch.sigmoid(mixes[:, hc:2 * hc] * scale[1] + base[hc:2 * hc])
         comb = (mixes[:, 2 * hc:] * scale[2] + base[2 * hc:]).view(-1, hc, hc)
