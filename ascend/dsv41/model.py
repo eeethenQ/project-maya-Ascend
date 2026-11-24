@@ -21,6 +21,7 @@ Nothing here imports torch_npu: run it on ``cpu`` for the reference, on ``npu:0`
 from __future__ import annotations
 
 import math
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter as _perf
@@ -61,6 +62,76 @@ def dequant_int8(weight: np.ndarray, scale: np.ndarray, offset: np.ndarray | Non
 # ones below).  It is behind a flag, off by default (see `Dsv41.__init__` for the measurement), and the
 # flag keeps the CPU reference path - the one every test compares against - on plain torch.
 _FUSED_QUANT = torch_npu is not None and hasattr(torch_npu, "npu_dynamic_quant")
+
+# CANN's fused mHC: `aclnnMhcPreSinkhorn` (910B kernel `ops_transformer/mhc_pre_sinkhorn`) in one call,
+# replacing the ~133 operators `hc_mixes` spends on 24 scalars - the matmul, the RMS scale, the sigmoid
+# pre/post and the 20 Sinkhorn iterations over a 4x4.  Measured on a physical 910B3, T=1, n=4, D=5120:
+# pre 6.9e-5, post 7.9e-5, comb 4.7e-5 relative against the torch path (Ascend's sigmoid/exp and a
+# different fp32 matmul order), and `GraphRunner.capture(verify=True)` replays bit-identically with
+# out_flag=False.  5e-5 injected into the same three outputs moves the tiny model's logits 3.9e-5.
+#
+# Two limits are enforced at the call site, both measured: n must be 4 ("hcMult must be in range [4]"),
+# and 3D input is refused on 910B ("TND format ... only supported on Ascend950"), so the call reshapes to
+# [1, 1, n, D] and is used for T == 1 only.  The 4D path also mis-computes comb for D = 64 but matches at
+# D >= 128 and at the real D = 5120, so a test must not shrink D below 128.
+#
+# torch_npu registers no op for this kernel: `torch_npu.npu_mhc_pre` is `aclnnMhcPre`, which returns the
+# comb *before* Sinkhorn and takes `gamma` as a per-stream gain on x, not the RMS weight.  CANN's own
+# python wrapper is used instead.  Importing `cann_ops_transformer` normally builds every op in the
+# package (~dozens of extensions), so only the one module file is loaded, over a stub parent package.
+_MHC_OP = None
+_MHC_LOAD_ERROR: "str | None" = None
+
+
+def _cann_ops_transformer_root() -> "str | None":
+    import glob
+    import os
+
+    root = os.environ.get("ASCEND_HOME_PATH", "")
+    cand = os.path.join(root, "python/site-packages/cann_ops_transformer") if root else ""
+    if os.path.isdir(cand):
+        return cand
+    for cand in sorted(glob.glob("/usr/local/Ascend/*/python/site-packages/cann_ops_transformer")):
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+def mhc_pre_sinkhorn():
+    """CANN's MhcPreSinkhorn torch wrapper, or ``None`` when this stack does not carry it.
+
+    The load is lazy and cached, and the compile is cached by torch's extension builder, so the first
+    call in a fresh container pays ~1 min and every later call is a `dlopen`.  Failure is not fatal: the
+    caller falls back to the torch path and this function keeps returning None.
+    """
+    global _MHC_OP, _MHC_LOAD_ERROR
+    if _MHC_OP is not None or _MHC_LOAD_ERROR is not None:
+        return _MHC_OP
+    try:
+        import importlib.util
+        import os
+        import sys
+        import types
+
+        base = _cann_ops_transformer_root()
+        if base is None:
+            raise ImportError("cann_ops_transformer is not installed under ASCEND_HOME_PATH")
+        if "cann_ops_transformer" not in sys.modules:
+            pkg = types.ModuleType("cann_ops_transformer")
+            pkg.__path__ = [base]
+            pkg.__package__ = "cann_ops_transformer"
+            sys.modules["cann_ops_transformer"] = pkg
+        path = os.path.join(base, "ops/mhc/mhc_pre_sinkhorn/mhc_pre_sinkhorn.py")
+        name = "ascend_mhc_pre_sinkhorn"
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        _MHC_OP = module.mhc_pre_sinkhorn_op_builder.load(verbose=False)
+    except Exception as e:                              # noqa: BLE001 - a missing op is a fallback, not a failure
+        _MHC_LOAD_ERROR = f"{type(e).__name__}: {e}"
+        _MHC_OP = None
+    return _MHC_OP
 
 # Queries per block in the vectorised prompt path.  The block's window union is `B + win - 1` rows, so on
 # the real model (win 128) a block computes 191 window keys per query to use 128 - a 33 % over-compute
@@ -204,8 +275,36 @@ def mixes_numpy(mixes: np.ndarray, scale: np.ndarray, base: np.ndarray, eps: flo
     return pre.reshape(1, hc), post.reshape(1, hc), comb.reshape(1, hc, hc)
 
 
+# `npu_rms_norm` is the card's fused norm: one operator instead of square+mean+add+rsqrt+mul
+# (+ the gain multiply), 188 calls a step.  Measured on 910B3, fp32, D=5120: exact against the torch
+# formula with a real gain, 1.3e-7 with an all-ones gain, and capturable (GraphRunner verify=True,
+# replay bit-identical).  The gain is required by the op, so the 121 gain==1.0 calls pass a cached
+# ones tensor rather than skipping the op - the multiply is inside the kernel and costs nothing.
+_NPU_RMS = (torch_npu is not None and hasattr(torch_npu, "npu_rms_norm")
+            and os.environ.get("DSV41_TORCH_RMS") != "1")
+_ONES: "dict[tuple[str, int], torch.Tensor]" = {}
+
+
+def _ones_like_row(x: torch.Tensor) -> torch.Tensor:
+    width = int(x.shape[-1])
+    key = (str(x.device), width)
+    ones = _ONES.get(key)
+    if ones is None:
+        ones = torch.ones(width, dtype=torch.float32, device=x.device)
+        _ONES[key] = ones
+    return ones
+
+
 def rms(x: torch.Tensor, w: torch.Tensor | None, eps: float) -> torch.Tensor:
-    """RMSNorm as the oracle writes it: the whole accumulation in fp32, then scaled by ``w``."""
+    """RMSNorm as the oracle writes it: the whole accumulation in fp32, then scaled by ``w``.
+
+    On the card this is `npu_rms_norm` (the whole norm plus the gain in one operator); the torch form
+    stays for CPU and for a stack without the op.  ``w=None`` is the checkpoint's 121 gain==1.0 sites
+    and passes a cached ones tensor, so one path covers both.
+    """
+    if _NPU_RMS and x.device.type != "cpu" and x.dim() > 0:
+        gain = w.float() if w is not None else _ones_like_row(x)
+        return torch_npu.npu_rms_norm(x.float(), gain, eps)[0]
     xf = x.float()
     y = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
     return (y * w.float()) if w is not None else y
@@ -1055,6 +1154,27 @@ class Dsv41:
         self.fused_quant = False
         self.fused_swiglu = False
         self._fused_available = npu and _FUSED_QUANT
+        # CANN's fused mHC (`aclnnMhcPreSinkhorn`).  **Off by default: it was rejected on numerics.**
+        # It captures (GraphRunner verify=True, 8/8 outputs bit-identical) and it matches the torch path
+        # at layer 0 to 3e-7, but on the real model the residual stream grows to |x|max ~ 24 by layer 79
+        # and the op's 24 scalars then differ by up to 1.3e-3 (pre) / 9e-4 (post) / 2.6e-4 (comb):
+        # over 40 layers and one decode step that moves the logits 1.0e-1 .. 2.2e-1 relative and flips
+        # 1-2 greedy tokens out of 4 (deterministic on both sides; see ascend/bench_mhc.py).  The engine
+        # promises 2e-3, so the flag stays off and the torch path is the shipped one.  The opt-in path
+        # exists for the A/B and for a future op revision:
+        #     python -m ascend.bench_mhc --model ... --no-graphs
+        self.fused_mhc = False
+        self._mhc_op = None
+        self._mhc_note = ""
+        self.mhc_calls = {"fused": 0, "torch": 0}
+
+    @property
+    def mhc_path(self) -> str:
+        """Which mHC implementation this instance dispatches to, for the log a run prints."""
+        if self.fused_mhc:
+            return f"cann MhcPreSinkhorn (T==1, hc==4): {self.mhc_calls['fused']} fused, " \
+                   f"{self.mhc_calls['torch']} torch"
+        return "torch mHC" + (f" ({self._mhc_note})" if self._mhc_note else "")
 
     @contextmanager
     def phase(self, name: str):
@@ -1089,8 +1209,38 @@ class Dsv41:
 
     # -- mHC ------------------------------------------------------------------------------------
     def hc_mixes(self, x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor):
-        """The 24 mix scalars from the residual stream, Sinkhorn-balanced (the oracle's arithmetic)."""
+        """The 24 mix scalars from the residual stream, Sinkhorn-balanced (the oracle's arithmetic).
+
+        `fused_mhc = True` (opt-in, T == 1, hc == 4, card only) takes CANN's `MhcPreSinkhorn`: one
+        operator for the matmul, the RMS scale, the sigmoid pre/post and all 20 Sinkhorn iterations.
+        It is **off by default because it is numerically wrong for this engine's fp32 residual stream**:
+        it matches at layer 0 to 3e-7 but diverges to 1.3e-3 on the 24 scalars by layer 79 and moves the
+        real model's logits 1.6e-1 (greedy tokens flip).  See `ascend/bench_mhc.py` and
+        `docs/ascend-notes/mhc-adoption.md`.  Everything else - T > 1, hc != 4, CPU, a stack without the
+        op, or `fused_mhc = False` - stays on the torch path.
+        """
         hc = self.hc
+        if self.fused_mhc and hc == 4 and x.shape[0] == 1 and x.device.type != "cpu":
+            if self._mhc_op is None:
+                self._mhc_op = mhc_pre_sinkhorn()
+            if self._mhc_op is not None:
+                # 910B refuses the 3D form ("TND ... only supported on Ascend950"); [1, 1, n, D] is
+                # the 4D shape it accepts.  out_flag=True is required for h_pre (False returns an empty
+                # tensor); its backward-only normOut buffer does not replay bit-identically, so only the
+                # four forward outputs may leave this callable - which is why the return below is
+                # pre/post/comb and not the raw tuple.
+                xb = x.to(torch.bfloat16).reshape(1, 1, hc, -1).contiguous()
+                got = self._mhc_op.mhc_pre_sinkhorn(
+                    xb, fn, scale, base, hc, int(self.cfg.hc_sinkhorn_iters),
+                    float(self.cfg.hc_eps), float(self.eps), True)
+                # (hin, hPost, hRes, hPre): hRes is the Sinkhorned comb, already exactly what hc_post
+                # consumes.  hin is the *unnormalised* collapse in bf16, so `hc_pre` + `rms` stay torch
+                # - the residual stream is fp32 on purpose and rounding it costs 3e-3 of logit.
+                self.mhc_calls["fused"] += 1
+                return (got[3].reshape(1, hc), got[1].reshape(1, hc), got[2].reshape(1, hc, hc))
+            self.fused_mhc = False
+            self._mhc_note = f"fallback to torch: {_MHC_LOAD_ERROR}"
+        self.mhc_calls["torch"] += 1
         xf = x.flatten(1).float()
         rstd = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
         if x.shape[0] == 1 and self.host_mixes:

@@ -286,5 +286,126 @@ class Parity(unittest.TestCase):
         self.assertLess(peak, 32.0, f"peak allocation {peak:.1f} GiB is past the 32 GiB share")
 
 
+@unittest.skipUnless(HAS_NPU, "needs an Ascend NPU")
+class FusedMhc(unittest.TestCase):
+    """CANN's MhcPreSinkhorn at the one shape it was proven at: T == 1, hc == 4.
+
+    The shipped model is hc_mult=4 / hidden 5120; the synthetic model is hc=2 / hidden 64, which the op
+    refuses ("hcMult must be in range [4]") and mis-computes at D=64 ("comb rows do not sum to 1").  This
+    class therefore builds a small checkpoint *at hc_mult=4 and hidden 512*, the smallest geometry the op
+    was measured correct at, and checks the two things the adoption rests on: the 24 scalars match the
+    torch path, and the call is capturable with the did-it-capture guard.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import pathlib
+        import tempfile
+
+        from ascend.dsv41.checkpoint import Checkpoint
+        from ascend.dsv41.config import TextConfig
+        from ascend.tests.synthetic import make_tiny_checkpoint, tiny_doc
+
+        cls._tmp = tempfile.TemporaryDirectory()
+        doc = tiny_doc()
+        doc["text_config"]["hidden_size"] = 512
+        doc["text_config"]["hc_mult"] = 4
+        cls.cfg = TextConfig.from_dict(doc)
+        root = pathlib.Path(cls._tmp.name) / "hc4"
+        make_tiny_checkpoint(root, cls.cfg)
+        cls.cfg = TextConfig.from_json(root / "config.json")
+        cls.root = root
+        cls.ckpt = Checkpoint(root)
+        cls.dev = npu_device()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ckpt.close()
+        cls._tmp.cleanup()
+        torch.npu.empty_cache()
+
+    def build(self):
+        from ascend.dsv41.model import Dsv41, ExpertStreamer, Weights
+
+        cfg = self.cfg
+        src = ExpertStreamer(self.ckpt, cfg, self.dev, torch.bfloat16, cache_slots=64)
+        w = Weights(self.ckpt, cfg, self.dev, torch.bfloat16, expert_source=src).load()
+        return Dsv41(cfg, w, self.dev, torch.bfloat16)
+
+    def test_the_fused_mhc_matches_torch_and_captures(self):
+        from ascend.dsv41.graph_runner import GraphRunner
+
+        net = self.build()
+        self.assertFalse(net.fused_mhc, "the fused mHC is opt-in: it moved real-model logits 1.6e-1")
+        net.fused_mhc = True
+        lw = net.weights.layers[0].hc
+        x = (torch.randn(1, net.hc, self.cfg.hidden_size) * 0.05).to(self.dev)
+        net.fused_mhc = False
+        want = net.hc_mixes(x, lw["attn_fn"], lw["attn_scale"], lw["attn_base"])
+        net.fused_mhc = True
+        got = net.hc_mixes(x, lw["attn_fn"], lw["attn_scale"], lw["attn_base"])
+        self.assertEqual(net.mhc_calls["fused"], 1)
+        for name, a, b in zip(("pre", "post", "comb"), got, want):
+            rel = (a - b).abs().max() / b.abs().max().clamp_min(1e-30)
+            # the vendor op's accumulation order costs ~1e-4 on pre/post and up to ~8e-4 on comb at
+            # this width; the real-model measurement is 2.6e-4 (see docs/ascend-notes/mhc-adoption.md)
+            self.assertLess(rel.item(), 2e-3, f"fused {name}: max rel err {rel.item():.2e}")
+
+        runner = GraphRunner(self.dev)
+        try:
+            def fn():
+                return net.hc_mixes(x, lw["attn_fn"], lw["attn_scale"], lw["attn_base"])
+
+            runner.capture("fused_mhc", fn, inputs={"x": x, "fn": lw["attn_fn"],
+                                                   "scale": lw["attn_scale"], "base": lw["attn_base"]},
+                           verify=True)
+            report = runner.report("fused_mhc")
+            self.assertTrue(report.verified, f"the guard did not run: {report}")
+            self.assertTrue(report.ok, f"the fused mHC did not capture: {report}")
+        finally:
+            runner.close()
+
+    def test_the_fused_rms_norm_matches_the_formula(self):
+        """`rms` is one `npu_rms_norm` on the card: exact against the torch formula, and capturable."""
+        from ascend.dsv41.graph_runner import GraphRunner
+        from ascend.dsv41.model import rms
+
+        eps = 1e-20
+        x = torch.randn(4, 512, device=self.dev)
+        w = torch.linspace(0.5, 1.5, 512, device=self.dev)
+        for gain in (None, w):
+            got = rms(x, gain, eps)
+            xf = x.float()
+            want = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
+            if gain is not None:
+                want = want * gain.float()
+            rel = (got - want).abs().max() / want.abs().max().clamp_min(1e-30)
+            self.assertLess(rel.item(), 1e-5, f"rms gain={gain is not None}: rel {rel.item():.2e}")
+            self.assertEqual(got.dtype, torch.float32)
+        runner = GraphRunner(self.dev)
+        try:
+            runner.capture("rms", lambda: rms(x, w, eps), inputs={"x": x, "w": w}, verify=True)
+            report = runner.report("rms")
+            self.assertTrue(report.verified and report.ok, f"rms did not capture: {report}")
+        finally:
+            runner.close()
+        # the prompt shape (T > 1) takes the same path
+        y = rms(torch.randn(7, 512, device=self.dev), None, eps)
+        self.assertEqual(tuple(y.shape), (7, 512))
+
+    def test_the_fused_mhc_is_scoped_to_one_token(self):
+        """T > 1 keeps the torch path: the 4D input mis-computes comb at D=64, and prefill is not the
+        hot path, so no prefill call may reach the op."""
+        net = self.build()
+        net.fused_mhc = True
+        lw = net.weights.layers[0].hc
+        x = (torch.randn(3, net.hc, self.cfg.hidden_size) * 0.05).to(self.dev)
+        before = dict(net.mhc_calls)
+        net.hc_mixes(x, lw["attn_fn"], lw["attn_scale"], lw["attn_base"])
+        self.assertEqual(net.mhc_calls["fused"], before["fused"])
+        self.assertEqual(net.mhc_calls["torch"], before["torch"] + 1)
+        self.assertIn("T==1", net.mhc_path)
+
+
 if __name__ == "__main__":
     unittest.main()

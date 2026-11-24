@@ -37,6 +37,8 @@ def build_and_run(a, steps: int, timed: bool) -> None:
     model = run.model
     if a.fused_quant:
         model.fused_quant, model.fused_swiglu = True, False
+    if a.torch_mhc:
+        model.fused_mhc = False
     if timed:
         print(f"engine: {run.device}, engram {'on' if run.engram else 'off'}, "
               f"{run.expert_slots} expert slots", flush=True)
@@ -104,6 +106,8 @@ def run_msprof(a) -> int:
         inner += ["--graphs"]
     if a.fused_quant:
         inner += ["--fused-quant"]
+    if a.torch_mhc:
+        inner += ["--torch-mhc"]
     command = ["msprof", f"--output={out}", "--task-time=on", "--ai-core=on", "--runtime-api=on",
                "--application=" + " ".join(inner)]
     print("running:", " ".join(command[:5]), "... (the profiler makes it several times slower)")
@@ -154,6 +158,8 @@ def main() -> int:
                          "per_token_int8 (off by default: -2 240 operators/step and -3 ms of device time, "
                          "but a numeric variant - see Dsv41.__init__ - and no effect on the decode step)")
     ap.add_argument("--msprof", action="store_true", help="profile with msprof and report per-operator time")
+    ap.add_argument("--torch-mhc", action="store_true",
+                    help="A/B the fused mHC: run the torch Sinkhorn instead of CANN's MhcPreSinkhorn")
     ap.add_argument("--under-msprof", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     import torch_npu  # noqa: F401 - registers the backend
