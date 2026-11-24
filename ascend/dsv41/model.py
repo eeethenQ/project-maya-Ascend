@@ -743,6 +743,13 @@ class ExpertStreamer(ExpertSource):
         # `test_a_cached_expert_owns_exactly_its_own_bytes` pins each cached projection to its own storage;
         # runtime.build turns it on for the captured decode, whose only consumer is the fixed slab.
         self.landing_blocks = bool(landing_blocks)
+        # How `fetch_int8_into` builds the landing-zone `cat`'s eighteen source views.  "build" rebuilds
+        # them per call (`block[p][0][0].reshape(-1)`), which was the shipped form and costs ~0.2 ms of host
+        # time a layer; "cached" uses the flat views each block carries from the moment it was created or
+        # cloned, so the call only builds an 18-element list.  Same bytes, same order: the sum of the fill's
+        # 40 calls a step measures 18.18 -> 8.34 ms, paired 48-pair ratio 2.133 [2.079, 2.217] in
+        # `ascend/bench_slab_fill_ab.py --ab fill`.  "build" stays for that A/B.
+        self.fill_views = "cached"
         # Diagnostic only (`ascend/bench_slab_repeat.py`): fill the slab this many times.  The copies are
         # idempotent, so the arithmetic is unchanged and a paired A/B measures the fill's marginal cost on
         # the critical path - the ceiling every no-copy idea is bounded by.
@@ -870,6 +877,10 @@ class ExpertStreamer(ExpertSource):
                 for j, p in enumerate(("w1", "w2", "w3")):
                     out, inn = self._shapes[p]
                     block[p] = (q[i, j].view(1, out, inn), scales[p][i:i + 1], zeros[p][i:i + 1])
+                if self.landing_blocks:
+                    # the views a landing-zone fill would rebuild per layer, made once where the bytes land
+                    block["flat"] = {p: block[p][0].reshape(-1) for p in ("w1", "w2", "w3")}
+                    block["sflat"] = {p: block[p][1].reshape(-1) for p in ("w1", "w2", "w3")}
                 blocks.append(block)
             if events:
                 # the destination device's stream is the one the copies were enqueued on
@@ -949,6 +960,9 @@ class ExpertStreamer(ExpertSource):
             for j, p in enumerate(("w1", "w2", "w3")):
                 out, inn = self._shapes[p]
                 cached[p] = (cached["slab"][j].view(1, out, inn), block[p][1], block[p][2])
+            # the clone's own views: the fill reads the clone, not the batch it arrived in
+            cached["flat"] = {p: cached[p][0].reshape(-1) for p in ("w1", "w2", "w3")}
+            cached["sflat"] = {p: cached[p][1].reshape(-1) for p in ("w1", "w2", "w3")}
             return cached
         return {p: tuple(t.clone() for t in block[p]) for p in ("w1", "w2", "w3")}
 
@@ -987,7 +1001,12 @@ class ExpertStreamer(ExpertSource):
           `copy_` per (expert, projection) instead is 256 GB/s, so the ``cat`` is the one that ships).
 
         The copy into the slab is a device-to-device move from the batch this fetch just landed (or from
-        the resident tier), so it adds ~212 MB of on-card bandwidth per layer and no host work.  ``slab``
+        the resident tier), so it adds ~212 MB of on-card bandwidth per layer.  It is *asynchronous* - the
+        host does not wait for the bytes - so what a layer actually pays here is the host work of issuing
+        it, and that is dominated by building the cat's eighteen 1-D source views rather than by the copy
+        itself: the sum of the 40 fills a step measures 18.18 ms with the views built per call and 8.34 ms
+        with them hoisted (paired ratio 2.133 [2.079, 2.217], `ascend/bench_slab_fill_ab.py --ab fill`).
+        ``slab``
         must live on the card the layer's experts live on (:meth:`device_for`), because that is the card
         the captured ``g_post`` runs on: a captured graph cannot contain a cross-device copy, so the
         landing zone, not the layer, is what follows the experts.
@@ -1026,16 +1045,24 @@ class ExpertStreamer(ExpertSource):
                     for j, p in enumerate(order):
                         slab[i, j].copy_(block[p][0][0].reshape(-1))
             elif whole:
-                torch.cat([blocks[i][p][0][0].reshape(-1) for p in order for i in range(n)],
-                          out=slab.reshape(-1))
+                if self.fill_views == "cached" and "flat" in blocks[0]:
+                    torch.cat([blocks[i]["flat"][p] for p in order for i in range(n)],
+                              out=slab.reshape(-1))
+                else:
+                    torch.cat([blocks[i][p][0][0].reshape(-1) for p in order for i in range(n)],
+                              out=slab.reshape(-1))
             else:
                 for j, p in enumerate(order):
                     for i, block in enumerate(blocks):
                         slab[j, i].copy_(block[p][0][0].reshape(-1))
             if scale_flat is not None and whole:
                 if layout == "projection":
-                    torch.cat([blocks[i][p][1][0].reshape(-1) for p in order for i in range(n)],
-                              out=scale_flat.reshape(-1))
+                    if self.fill_views == "cached" and "sflat" in blocks[0]:
+                        torch.cat([blocks[i]["sflat"][p] for p in order for i in range(n)],
+                                  out=scale_flat.reshape(-1))
+                    else:
+                        torch.cat([blocks[i][p][1][0].reshape(-1) for p in order for i in range(n)],
+                                  out=scale_flat.reshape(-1))
                 else:
                     torch.cat([blocks[i][p][1][0].reshape(-1) for i in range(n) for p in order],
                               out=scale_flat[:n].reshape(-1))

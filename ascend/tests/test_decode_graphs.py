@@ -184,6 +184,42 @@ class TheCapturedDecode(unittest.TestCase):
                                 f"expert {i} {p} scales differ in the projection-major zone")
         src.close()
 
+    def test_the_cached_view_fill_moves_the_same_bytes_as_the_rebuilt_one(self):
+        """`fill_views="cached"` is the shipped fill with the 18 source views hoisted out of the call.
+
+        It is the arm `bench_slab_fill_ab` prices, so it is pinned here: a projection-major zone filled once
+        with the views rebuilt per layer (the shipped form) and once with the flat views each block carries
+        from the moment it was created - and then a second time, from the tier, which is the case a decode
+        step actually pays.  The bytes, the scale vector and the order must all be identical.
+        """
+        cfg = self.model.cfg
+        src = ExpertStreamer(self.ckpt, cfg, "cpu", DTYPE, cache_slots=8, landing_blocks=True)
+        ids = [1, 4]
+        K = cfg.num_experts_per_tok
+        per = cfg.moe_intermediate_size * cfg.hidden_size
+        outs = (cfg.moe_intermediate_size, cfg.hidden_size, cfg.moe_intermediate_size)
+        span = 2 * K * cfg.moe_intermediate_size + K * cfg.hidden_size
+        built = torch.zeros(3, K, per, dtype=torch.int8)
+        cached = torch.zeros(3, K, per, dtype=torch.int8)
+        built_s = tuple(torch.zeros(K, out, 1) for out in outs)
+        cached_s = tuple(torch.zeros(K, out, 1) for out in outs)
+        built_f = torch.zeros(span)
+        cached_f = torch.zeros(span)
+        src.fill_views = "build"
+        src.fetch_int8_into(2, ids, built, built_s, scale_flat=built_f, layout="projection")
+        src.fill_views = "cached"
+        src.fetch_int8_into(2, ids, cached, cached_s, scale_flat=cached_f, layout="projection")
+        self.assertTrue(torch.equal(built, cached), "the two fills put different bytes in the slab")
+        self.assertTrue(torch.equal(built_f, cached_f), "the two fills put different scales in the slab")
+        # the second fill was served from the tier, and every block it used carried its own flat views
+        self.assertEqual(src.hits, len(ids), "the cached fill should have been a tier hit")
+        for block in src._blocks(2, ids):
+            self.assertIn("flat", block)
+            for p in ("w1", "w2", "w3"):
+                self.assertTrue(torch.equal(block["flat"][p], block[p][0].reshape(-1)))
+                self.assertTrue(torch.equal(block["sflat"][p], block[p][1][0].reshape(-1)))
+        src.close()
+
     def test_the_captured_decode_follows_a_spread_expert_tier(self):
         """The tier may be spread: each layer's `g_post` runs on the card its experts live on.
 

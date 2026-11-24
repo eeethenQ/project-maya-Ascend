@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1196" height="426" font-family="monospace" font-size="12">
+<rect width="100%" height="100%" fill="white"/>
+<text x="10" y="17" font-size="14">captured decode: per-layer schedule, layers 0-5 (528.9 ms, device clock)</text>
+<text x="10" y="33" fill="#555" font-size="11">device: pre / fill / post   host: pread / H2D / fill issue / launches   grey: device idle</text>
+<text x="8" y="55" font-size="11">L00 dev</text>
+<text x="8" y="76" font-size="11">L00 host</text>
+<rect x="94.0" y="45.0" width="210.7" height="14" fill="#dcdcdc"/>
+<text x="96.0" y="56" font-size="9" fill="white">idle</text>
+<rect x="92.0" y="45.0" width="2.0" height="14" fill="#4c78a8"/>
+<rect x="304.7" y="45.0" width="1.5" height="14" fill="#f58518"/>
+<rect x="306.3" y="45.0" width="1.0" height="14" fill="#54a24b"/>
+<rect x="92.7" y="66.0" width="211.4" height="14" fill="#e45756"/>
+<text x="94.7" y="77" font-size="9" fill="white">pread</text>
+<rect x="304.0" y="66.0" width="1.0" height="14" fill="#b279a2"/>
+<rect x="304.8" y="66.0" width="1.0" height="14" fill="#f58518"/>
+<rect x="305.9" y="66.0" width="1.0" height="14" fill="#9d755d"/>
+<text x="8" y="97" font-size="11">L01 dev</text>
+<text x="8" y="118" font-size="11">L01 host</text>
+<rect x="309.1" y="87.0" width="166.8" height="14" fill="#dcdcdc"/>
+<text x="311.1" y="98" font-size="9" fill="white">idle</text>
+<rect x="306.9" y="87.0" width="2.1" height="14" fill="#4c78a8"/>
+<rect x="475.9" y="87.0" width="1.0" height="14" fill="#f58518"/>
+<rect x="476.9" y="87.0" width="1.0" height="14" fill="#54a24b"/>
+<rect x="307.5" y="108.0" width="167.9" height="14" fill="#e45756"/>
+<text x="309.5" y="119" font-size="9" fill="white">pread</text>
+<rect x="475.4" y="108.0" width="1.0" height="14" fill="#b279a2"/>
+<rect x="475.9" y="108.0" width="1.0" height="14" fill="#f58518"/>
+<rect x="476.7" y="108.0" width="1.0" height="14" fill="#9d755d"/>
+<text x="8" y="139" font-size="11">L02 dev</text>
+<text x="8" y="160" font-size="11">L02 host</text>
+<rect x="480.9" y="129.0" width="133.8" height="14" fill="#dcdcdc"/>
+<text x="482.9" y="140" font-size="9" fill="white">idle</text>
+<rect x="477.7" y="129.0" width="3.2" height="14" fill="#4c78a8"/>
+<rect x="614.7" y="129.0" width="1.0" height="14" fill="#f58518"/>
+<rect x="615.7" y="129.0" width="1.0" height="14" fill="#54a24b"/>
+<rect x="478.2" y="150.0" width="136.2" height="14" fill="#e45756"/>
+<text x="480.2" y="161" font-size="9" fill="white">pread</text>
+<rect x="614.4" y="150.0" width="1.0" height="14" fill="#b279a2"/>
+<rect x="614.8" y="150.0" width="1.0" height="14" fill="#f58518"/>
+<rect x="615.5" y="150.0" width="1.0" height="14" fill="#9d755d"/>
+<text x="8" y="181" font-size="11">L03 dev</text>
+<text x="8" y="202" font-size="11">L03 host</text>
+<rect x="618.8" y="171.0" width="213.5" height="14" fill="#dcdcdc"/>
+<text x="620.8" y="182" font-size="9" fill="white">idle</text>
+<rect x="616.5" y="171.0" width="2.3" height="14" fill="#4c78a8"/>
+<rect x="832.3" y="171.0" width="1.1" height="14" fill="#f58518"/>
+<rect x="833.4" y="171.0" width="1.0" height="14" fill="#54a24b"/>
+<rect x="617.1" y="192.0" width="214.4" height="14" fill="#e45756"/>
+<text x="619.1" y="203" font-size="9" fill="white">pread</text>
+<rect x="831.5" y="192.0" width="1.0" height="14" fill="#b279a2"/>
+<rect x="832.3" y="192.0" width="1.0" height="14" fill="#f58518"/>
+<rect x="833.2" y="192.0" width="1.0" height="14" fill="#9d755d"/>
+<text x="8" y="223" font-size="11">L04 dev</text>
+<text x="8" y="244" font-size="11">L04 host</text>
+<rect x="836.5" y="213.0" width="154.7" height="14" fill="#dcdcdc"/>
+<text x="838.5" y="224" font-size="9" fill="white">idle</text>
+<rect x="834.2" y="213.0" width="2.3" height="14" fill="#4c78a8"/>
+<rect x="991.3" y="213.0" width="1.2" height="14" fill="#f58518"/>
+<rect x="992.5" y="213.0" width="1.0" height="14" fill="#54a24b"/>
+<rect x="834.8" y="234.0" width="155.9" height="14" fill="#e45756"/>
+<text x="836.8" y="245" font-size="9" fill="white">pread</text>
+<rect x="990.7" y="234.0" width="1.0" height="14" fill="#b279a2"/>
+<rect x="991.3" y="234.0" width="1.0" height="14" fill="#f58518"/>
+<rect x="992.2" y="234.0" width="1.0" height="14" fill="#9d755d"/>
+<text x="8" y="265" font-size="11">L05 dev</text>
+<text x="8" y="286" font-size="11">L05 host</text>
+<rect x="995.7" y="255.0" width="174.6" height="14" fill="#dcdcdc"/>
+<text x="997.7" y="266" font-size="9" fill="white">idle</text>
+<rect x="993.3" y="255.0" width="2.3" height="14" fill="#4c78a8"/>
+<rect x="1170.2" y="255.0" width="1.0" height="14" fill="#f58518"/>
+<rect x="1171.2" y="255.0" width="1.0" height="14" fill="#54a24b"/>
+<rect x="994.0" y="276.0" width="175.4" height="14" fill="#e45756"/>
+<text x="996.0" y="287" font-size="9" fill="white">pread</text>
+<rect x="1169.4" y="276.0" width="1.0" height="14" fill="#b279a2"/>
+<rect x="1170.3" y="276.0" width="1.0" height="14" fill="#f58518"/>
+<rect x="1171.1" y="276.0" width="1.0" height="14" fill="#9d755d"/>
+<text x="10" y="330" font-size="13">zoom, L00: the fill's whole window (1.36 ms) - nothing else is queued beside it</text>
+<line x1="92" y1="336" x2="1172" y2="336" stroke="#bbb"/>
+<text x="8" y="356" font-size="11">L00 dev</text>
+<text x="8" y="380" font-size="11">L00 host</text>
+<rect x="92.0" y="344" width="708.8" height="18" fill="#dcdcdc"/>
+<text x="95.0" y="358" font-size="10" fill="white">device idle</text>
+<rect x="211.0" y="344" width="589.5" height="18" fill="#f58518"/>
+<text x="214.0" y="358" font-size="10" fill="white">fill</text>
+<rect x="800.8" y="344" width="252.2" height="18" fill="#54a24b"/>
+<text x="803.8" y="358" font-size="10" fill="white">g_post</text>
+<rect x="240.4" y="368" width="399.9" height="18" fill="#f58518"/>
+<text x="243.4" y="382" font-size="10" fill="white">18 views + cat</text>
+<rect x="640.3" y="368" width="367.8" height="18" fill="#9d755d"/>
+<text x="643.3" y="382" font-size="10" fill="white">launch post / pre</text>
+<text x="10" y="408" font-size="10" fill="#555">fill 0.74 ms on the device clock, of which the issue is 0.50 ms of host time; g_post starts 0.000 ms after it</text>
+</svg>
