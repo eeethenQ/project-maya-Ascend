@@ -149,6 +149,11 @@ class Conversation:
         self.clean = 0
         self.busy = False
         self.rid: int | None = None
+        # The queue item this slot is serving.  `generate` releases the slot *before* it writes DONE (the
+        # client may answer DONE with the conversation's next turn immediately), and the worker's
+        # `finally` must not then release a slot a newer request may already own: both passes carry the
+        # item, and `_finish_slot` only acts on the one the slot still holds.
+        self.request: tuple | None = None
         self.queue: "queue.Queue" = queue.Queue()
 
     def common_prefix(self, ids: list[int]) -> int:
@@ -876,6 +881,7 @@ class Engine:
             if item is None:
                 return
             line, rid, cut0, wrap0 = item
+            slot.request = item
             try:
                 with self._sched:
                     cancelled = rid in self._rid_cut
@@ -889,7 +895,7 @@ class Engine:
                     with torch.npu.stream(stream):
                         self._serve_one(line, slot, rid, cut0, wrap0)
             finally:
-                self._finish_slot(slot)
+                self._finish_slot(slot, item)
 
     def _serve_one(self, line: str, conv: Conversation, rid: int, cut0: int, wrap0: int) -> None:
         """One request: an exception is this request's error, never the engine's (the others go on)."""
@@ -905,11 +911,20 @@ class Engine:
                 conv.held = []
             self._emit(f"ERR {type(exc).__name__}: {exc}", rid)
 
-    def _finish_slot(self, slot: Conversation) -> None:
-        """Free the slot and start a queued request on it, if any (FIFO; the oldest waiter goes first)."""
+    def _finish_slot(self, slot: Conversation, request: tuple | None = None) -> None:
+        """Free the slot and start a queued request on it, if any (FIFO; the oldest waiter goes first).
+
+        `request` is the queue item being finished.  It is passed so a second call for a request whose
+        slot was already released - `generate` releases it just before writing DONE so the client's next
+        turn can be placed on this conversation's prefix - is a no-op instead of freeing the slot of a
+        newer request that has since been assigned to it.
+        """
         cancelled: list[tuple[int, int]] = []
         revoke = False
         with self._sched:
+            if request is not None and slot.request is not request:
+                return                                    # already released; a newer request owns it
+            slot.request = None
             if slot.rid is not None:
                 self._rid_cut.discard(slot.rid)       # a STOP that lost the race with the request's end
             slot.busy = False
@@ -1110,8 +1125,16 @@ class Engine:
             self.stats["tokens"] += len(produced)
             self.stats["steps"] += 1
             self.stats["decode_ms"] += decode_ms
-        self._emit(f"DONE {len(produced)} {prompt_tokens} {prompt_ms:.1f} {decode_ms:.1f} {finish} 0 0 "
-                   f"{reused} {len(produced)} {len(produced)}", rid)
+        done = (f"DONE {len(produced)} {prompt_tokens} {prompt_ms:.1f} {decode_ms:.1f} {finish} 0 0 "
+                f"{reused} {len(produced)} {len(produced)}")
+        if conv is not self and conv.request is not None:
+            # DONE tells the server the request is over, and a server answers it with the conversation's
+            # next turn immediately.  Release the slot *before* writing the line: the next GEN then finds
+            # this conversation idle with its resident prefix, instead of briefly seeing the slot busy and
+            # placing the turn on another slot (a full re-prefill of a prompt that was already held).  The
+            # worker's `finally` carries the same request item and is a no-op after this.
+            self._finish_slot(conv, conv.request)
+        self._emit(done, rid)
         _log(f"dsv41 stat: decode {decode_ms / max(1, len(produced)):.2f} ms/tok "
              f"({1000.0 * len(produced) / max(decode_ms, 1e-3):.2f} tok/s) | reused {reused}/{prompt_tokens} | "
              f"finish {finish}")

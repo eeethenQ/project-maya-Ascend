@@ -1013,6 +1013,40 @@ class ThePrefixReuse(unittest.TestCase):
         self.assertEqual([int(l.split()[2]) for l in lines if l.startswith("T 2 ")],
                          self.tokens(out_scratch), "the parallel reuse is exact too")
 
+    def test_done_releases_the_slot_before_the_server_can_send_the_next_turn(self):
+        """The next turn arrives on DONE; the slot must be free by then, not one line later.
+
+        `engine.emit` is the seam a server reads the protocol through, and `DONE` is its end-of-request
+        signal: submitting the next turn from inside `emit` is that contract in its tightest form, with
+        no scheduling window for the engine's slot bookkeeping to hide in.  If the slot were still
+        marked busy when `DONE` was written, the turn would land on the other, empty slot and `reused`
+        would be 0: the prompt prefill and its KV would be paid twice across a conversation.
+        """
+        engine = self.engine(parallel=2)
+        lines: list[str] = []
+        sent = {"next": False}
+
+        def emit(line: str) -> None:
+            lines.append(line)
+            if line.startswith("DONE 1 ") and not sent["next"]:
+                sent["next"] = True
+                engine.submit("GEN 6 rid=2 " + ",".join(str(t) for t in self.B))
+
+        engine.emit = emit
+        try:
+            engine.say_ready()
+            engine.start_workers()
+            engine.submit("GEN 4 rid=1 " + ",".join(str(t) for t in self.A))
+            self.assertTrue(self.wait_done(lines, 2))
+            self.assertTrue(engine.wait_idle(timeout=30))
+        finally:
+            engine.stop_workers()
+            engine.shutdown()
+        done = [l for l in lines if l.startswith("DONE 2 ")][0].split()
+        self.assertEqual(int(done[9]), len(self.SHARED),
+                         "the turn after DONE found its conversation idle and resumed from its KV")
+        self.assertEqual(engine._queued_seen, 0, "a freed slot is available; nothing had to queue")
+
     @staticmethod
     def wait_done(lines, n: int, timeout: float = 60.0) -> bool:
         end = time.time() + timeout
@@ -1098,15 +1132,28 @@ class TheGraphsParallelLease(unittest.TestCase):
                       "a bound that cannot be honoured is called out")
 
     def test_one_conversation_leases_a_second_revokes_and_idle_rearms(self):
-        """One conversation captures; admitting a second revokes, both run eagerly, idle re-arms."""
+        """One conversation captures; admitting a second revokes, both run eagerly, idle re-arms.
+
+        The second request is admitted while the first is *held between two tokens*: `sample` waits on
+        an event, not for a sleep the scheduler could outrun.  The capture is lazy (it belongs to the
+        first one-token forward, after that `T` line is written), so the hold is taken at the second
+        sample call - by then the first step, and with it the capture, has completed.
+        """
         engine = self.engine()
         real_sample = engine.sample
+        second_token = threading.Event()
+        release = threading.Event()
+        calls = {"n": 0}
 
-        def slow_sample(*a, **kw):
-            time.sleep(0.05)                       # give the second request time to arrive mid-decode
+        def held_sample(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 2:                    # the step after the captured one
+                second_token.set()
+                if not release.wait(30):
+                    raise AssertionError("the test did not release the first conversation's decode")
             return real_sample(*a, **kw)
 
-        engine.sample = slow_sample
+        engine.sample = held_sample
         err = io.StringIO()
         try:
             with contextlib.redirect_stderr(err):
@@ -1114,17 +1161,18 @@ class TheGraphsParallelLease(unittest.TestCase):
                 lines = self.collector(engine)
                 engine.start_workers()
                 engine.submit("GEN 12 rid=1 3,5,7")
-                end = time.time() + 20
-                while not any(l.startswith("T 1 ") for l in lines) and time.time() < end:
-                    time.sleep(0.01)               # the lease is granted before the first T
+                self.assertTrue(second_token.wait(30),
+                                f"the first conversation never reached its second token; saw {lines[-12:]}")
                 self.assertIsNotNone(engine.rt.model._decode_graphs,
                                      "the lone conversation captured its decode (the lease was granted)")
                 self.assertEqual(engine.graphs_live(), 1)
-                engine.submit("GEN 12 rid=2 11,13,17")      # request 1 is still decoding: a second slot
+                engine.submit("GEN 12 rid=2 11,13,17")      # request 1 is held mid-decode: a second slot
+                release.set()                               # let both run to their DONEs
                 self.wait_done(lines, 2)
                 self.assertTrue(engine.wait_idle(timeout=30))
                 first = [l for l in lines if l.startswith("DONE 1 ")][0].split()
         finally:
+            release.set()                           # never leave a worker parked on the event
             engine.stop_workers()
         log, graphs = err.getvalue(), engine.rt.model.graphs
         held = engine.rt.model._decode_graphs
