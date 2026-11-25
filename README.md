@@ -338,7 +338,8 @@ vision, DSpark speculative decoding, MTP, and more than one conversation at a ti
 
 | | |
 | --- | --- |
-| decode, 80 graphs, four cards | **409.6 ms/token** (about 2.4 tokens/s) in the latest paired run |
+| decode, 80 graphs, four cards | **409.6 ms/token** (about 2.4 tokens/s) in the latest paired four-card run |
+| decode after the operator work | **5 370 operator calls and ~48 ms of device time per step** (32 242 before capture, 24 079 after it); see the operator table below |
 | decode, four cards, eager | **816.5 ms/token** |
 | graphs against eager | **0.481** four-card (324.5 against 753.1 ms, **2.08x**) and **0.660** single-card (595 against 998 ms) |
 | landing-zone copy work (that change alone) | **0.880** (452.4 -> 409.6 ms, -42.8 ms over 48 paired samples) |
@@ -350,12 +351,64 @@ vision, DSpark speculative decoding, MTP, and more than one conversation at a ti
 | the card itself | 246 TFLOP/s bf16, 20 GB/s host-to-HBM, 30.48 GiB per process |
 | the array | ~2.5 GB/s cold; the page cache does not retain the expert reads |
 
+**2 000-token prompts, and 8 of them at once.** This is the request shape that matters in practice and it is
+where the numbers are thinnest, so here is exactly what is and is not measured.
+
+| 2 000-token requests | TTFT | decode | expert tier | peak HBM | note |
+|---|---|---|---|---|---|
+| **1 request, 1 card** | **181.7 s** | **0.87 tok/s** | 13.6% hit (32.2% while decoding), 555.7 GB read, 5.95 GB/step | 27.0 GiB | measured on the current engine, one card (physical npu:4) |
+| 4 requests, 4 cards | 191.2 s each | 1.08 tok/s aggregate, 0.27 per request | 28.8% hit, 459 GB per request | 20.4/11.2/10.6/10.0 GiB | measured **before** the operator work; today's engine would be faster |
+| 1 request, 4 cards | 393.5 s cold / 343.6 s warm | - | 0% hit on a prefill | - | pre-operator-work |
+| **8 requests** | **not measured** | - | - | - | see below |
+
+**8 concurrent 2 000-token requests is not measured, and the reason is the machine rather than the engine.**
+This host rebooted at 11:17 today and afterwards **cross-card access faults**: any second card traps with
+`MTE accesses an invalid GM address or cross-device memory access times out`, at `rtEventRecord` when
+recording an event on a peer card, reproducibly and identically on chips 5 and 7, with graphs on and off,
+with the tier large and disabled, in the serve engine and in a plain eager runtime. Single-card work is
+unaffected (the 181.7 s above and a full 225-test suite ran on one card). Cards 0-3 are usable in principle
+but were held by another tenant's benchmark, and cards 4-7 are the ones in the faulted state. In-band chip
+reset is refused by the platform (`User aborts reset server by inband`), including the `-d` and `-m 1`
+variants, so clearing it needs an out-of-band reset or a host reboot - which on a shared box also kills the
+other tenants' jobs, and was therefore not done unilaterally. The failure logs and card snapshots are in
+[`ascend/results/diag-20261125/`](ascend/results/diag-20261125/) and the write-up in
+[`ascend/results/serve-2k8-REPORT.md`](ascend/results/serve-2k8-REPORT.md).
+
+For scale, the two multi-request results that do exist: 4 x 2 000 tokens on four cards ran **1.65x** the
+aggregate of a serial serve path, and 4 x short prompts **2.10x**, with client TTFT for the short case going
+from 53.4 s to 10.4 s. Eight concurrent 2 000-token conversations would need roughly twice the four-card
+activation memory, so the four-card measurement is not a lower bound for it - it is simply unknown.
+
 **What is measured and what is not.** The speed figures are one process on four 910B3s (64 GB each, shared;
 each process held to 32 GB), and every comparison is an interleaved A/B in one process. Absolute milliseconds
 move with the other tenant's load - the four-card step has measured 324.5, 350.6 and 409.6 ms at different
 points of the work - so the paired ratios are the signal. The GSM8K re-check is Engram off; the committed
 0.47 tok/s baseline is Engram on and pre-graph, so the two are not a like-for-like speed comparison.
 Nothing here is measured on another card, another checkpoint or another dtype.
+
+**The operator work.** Six operator families were rewritten as fused Triton kernels or replaced with the
+vendor's own (per-layer Sinkhorn, per-token int8 quantiser, the expert block's SwiGLU+quantise, CSA2 decode
+attention, batched expert matmuls, RMSNorm), plus three host-side fixes that turned out to be larger than any
+kernel (a list-scanned tier LRU, a routing read that was a wait, and a slab fill that rebuilt `cat` views).
+Operator calls per decode step went **32 242 -> 24 079 (capture) -> 5 370**, and the four changes with a
+strict numerical result are bit-identical or within 2.4e-6:
+
+| change | effect | numerics |
+|---|---|---|
+| mHC Sinkhorn as one kernel (20 rounds in registers) | 21.07 -> **0.805 ms/step**, 9 360 -> 80 dispatches | pre/post bit-identical, comb 1.21e-7 |
+| per-token int8 quantiser as one kernel | 4.68 -> **2.00 ms/step** | **bit-identical** over 2.17 M values |
+| `gate_up_swiglu_q8` + `down_epilogue` | 5.34 -> **2.93 ms/step** | **bit-identical** |
+| CSA2 decode attention as one kernel | 15 device tasks -> **1** per layer | max 2.42e-6 |
+| six experts' matmuls batched | 720 -> **80** calls, -4.5 ms of Cube | **bit-identical** |
+| `npu_rms_norm` | 13 360 -> 12 915 calls | 2.1e-7 |
+| tier LRU: list -> OrderedDict | 16.38 -> **0.45 ms** (36.5x) | none |
+| slab fill: cached views | 18.18 -> **8.34 ms** | none |
+
+Rejected on evidence rather than suspicion: CANN's `aclnnMhcPreSinkhorn` (right arithmetic, 3e-7 at layer 0,
+1.3e-3 by layer 79), `npu_moe_gating_top_k` (normalises a softmax where this model L1-renormalises the raw
+sqrtsoftplus score; the top-6 set matched on 143 of 440 rows), `npu_fusion_attention` (cannot be captured,
+107025, and cannot express the sink at `Sq=1`), `npu_mhc_sinkhorn` (no 910B kernel), and a slab-fill kernel
+that tied the shipped `torch.cat` at 501 against 508 GB/s.
 
 **How right, measured.** Ten sampled GSM8K questions, greedy, non-thinking, the same sample both ways: with
 80 graphs **9 correct at 1.77 tokens/s**; eager **10 correct at 0.83 tokens/s**. The difference is not
