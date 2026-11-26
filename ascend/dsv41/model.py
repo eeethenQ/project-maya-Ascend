@@ -24,6 +24,7 @@ import math
 import os
 import threading
 import time
+import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter as _perf
@@ -1178,6 +1179,59 @@ class State:
 
 
 
+# --------------------------------------------------------------------------- capture exclusion
+# A capture is exclusive in the *process*, not per graph domain and (measured) not reliably per card.
+# The vendor's `torch.npu.graph` is not re-entrant: entering a capture calls a device-wide
+# `torch.npu.synchronize()` (both in `torch_npu.npu.graphs.graph.__enter__` and again after the body in
+# `GraphRunner._capture_npu`), and ACL refuses that with
+#
+#     Not_Supported(EE1016): Synchronizing the device failed. Reason: Stream (stream_id=N) on
+#     device_id=0 is being captured. End the stream capture before synchronizing the device.
+#
+# while the stream it waits on is being captured.  Two conversations that reach their first decode step
+# at the same instant each build a domain, each starts its own capture, and both fail - and the offending
+# stream is the *other* conversation's (measured at 4 x 2k, commit d0aeaac).
+#
+# The lock is process-wide, not per card.  The no-argument synchronise is meant to be per device, but with
+# captures open on two cards at once it was measured to wait on whichever stream is being captured: a
+# 4-card trivial probe failed on card 0 while cards 1-3 were capturing, and the model run below failed a
+# g_pre on npu:0 naming a capture open on npu:1.  A per-card lock therefore is not enough; one capture at
+# a time in the process is (captures are ~10-20 ms a graph, 1.3-1.9 s for a domain).  It covers capture
+# *and* graph teardown, and leaves the caller's current device and stream as it found them.
+_CAPTURE_LOCK = threading.RLock()
+
+
+def _card_index(device: str) -> int:
+    return int(str(device).split(":")[-1]) if ":" in str(device) else 0
+
+
+@contextmanager
+def _capture_exclusive(device: str):
+    """Hold the process capture lock with `device` current, and restore the caller's context.
+
+    The device and stream are saved and restored explicitly rather than relying on `torch.npu.graph` to
+    do it: the caller may be a decode step on another card whose current stream must survive the capture
+    (the graph runner's capture stream is the one the graph context makes current, and it is restored by
+    the vendor context, but `GraphRunner` also creates a stream and a pool outside that context).
+    """
+    if not (str(device).startswith("npu") and hasattr(torch, "npu")):
+        with _CAPTURE_LOCK:
+            yield
+        return
+    index = _card_index(device)
+    previous_device = int(torch.npu.current_device())
+    previous_stream = torch.npu.current_stream(previous_device)
+    with _CAPTURE_LOCK:
+        try:
+            if previous_device != index:
+                torch.npu.set_device(index)
+            yield
+        finally:
+            if previous_device != index:
+                torch.npu.set_device(previous_device)
+            torch.npu.set_stream(previous_stream)
+
+
 # --------------------------------------------------------------------------- the model
 class Dsv41:
     """The 40-layer backbone: mHC residual streams, CSA2 attention, routed plus shared experts.
@@ -1229,6 +1283,23 @@ class Dsv41:
         if self.graphs:
             self.host_mixes = False
         self._decode_graphs: "_DecodeGraphs | None" = None
+        # Every live conversation's own captured domain, keyed by `id(state)` (a domain holds its State,
+        # so the id stays unique while it is a key).  A domain bakes one State's KV addresses, which is
+        # why the model used to hold a single slot and rebuilt it per State: with N conversations that
+        # was N simultaneous captures on one card and no capture at all (commit d0aeaac).  The bound is
+        # 4 by default - the measured fit, four domains of 1.585 GiB (405.7 MiB a card each) on a
+        # 30.48 GiB share - so the policy is bounded and stated in the log, not "one" and not unbounded.
+        # `DSV41_GRAPH_MAX_CONVERSATIONS` raises or lowers it.
+        self._graph_domains: "dict[int, _DecodeGraphs]" = {}
+        self._graph_lock = threading.RLock()
+        # States whose capture or replay failed: they run eagerly for the rest of their life, while the
+        # other conversations keep their domains.  Weak, because a State holds the whole KV and must not
+        # be kept alive by this set.
+        self._graph_failed: "weakref.WeakSet" = weakref.WeakSet()
+        self._graph_cap_logged: "weakref.WeakSet" = weakref.WeakSet()
+        self._graph_failures: list[str] = []
+        self._graph_leaked = 0             # domains a failed teardown left alive: counted against the bound
+        self.graph_max_conversations = max(1, int(os.environ.get("DSV41_GRAPH_MAX_CONVERSATIONS", "4")))
         self._graph_reason_logged = False
         # where each layer's experts are computed; empty means "on the card the layer is on"
         self.expert_device_for = getattr(weights.experts, "device_for", None)
@@ -2186,12 +2257,12 @@ class Dsv41:
 
         if workers:
             workers = [w for w in workers if w is not self]
-            if T == 1 and self.graphs and self._graphs_usable():
+            if T == 1 and self.graphs and self._graphs_usable() and state not in self._graph_failed:
                 x = self._graph_decode(h, pre, state, engram_rows, workers=workers)
             else:
                 x = self._eager_layers_split(h, pre, state, positions, host_positions, engram_rows,
                                              workers)
-        elif T == 1 and self.graphs and self._graphs_usable():
+        elif T == 1 and self.graphs and self._graphs_usable() and state not in self._graph_failed:
             x = self._graph_decode(h, pre, state, engram_rows)
         else:
             x = self._eager_layers(h, pre, state, positions, host_positions, engram_rows,
@@ -2229,14 +2300,143 @@ class Dsv41:
         return "\n".join(lines)
 
     def release_graphs(self) -> None:
-        """Drop the captured graphs and their buffers (the graph domain is per State).
+        """Drop *every* captured domain and its buffers (a graph domain belongs to one State).
 
-        A failed teardown is raised *after* the reference is dropped, so the caller sees the leak and a
-        later ``release_graphs`` cannot try to tear the same half-dead domain down twice.
+        The references are dropped *before* the teardowns, so a close that fails cannot turn into a
+        half-closed domain a later ``release_graphs`` reports twice.  Every domain is attempted even
+        when one card fails, and the failures are raised once at the end (a leak that is not named is
+        the failure this method exists to stop).
         """
-        if self._decode_graphs is not None:
-            graphs, self._decode_graphs = self._decode_graphs, None
-            graphs.close()
+        with self._graph_lock:
+            domains = list(self._graph_domains.values())
+            self._graph_domains.clear()
+            self._decode_graphs = None
+            self._graph_failed = weakref.WeakSet()
+            self._graph_cap_logged = weakref.WeakSet()
+        failures: list[GraphTeardownError] = []
+        for g in domains:
+            try:
+                g.close()
+            except GraphTeardownError as exc:
+                failures.append(exc)
+        if failures:
+            # a domain whose teardown failed has lost its HBM for the life of the process: keep counting
+            # it against the bound, or the next conversation captures into HBM that is still occupied
+            with self._graph_lock:
+                self._graph_leaked += len(failures)
+            raise GraphTeardownError(failures[0].device,
+                                     [item for exc in failures for item in exc.failures])
+
+    def adopt_graph_domain(self, state: State, domain: "_DecodeGraphs") -> None:
+        """Register an already-built domain for `state` (the domain-fit probe and tests build one directly).
+
+        Normal use never needs this: :meth:`_graph_domain` builds a domain on the conversation's first
+        one-token step.  It exists so a caller that measured the capture *before* decoding does not make
+        ``_graph_decode`` build a second 1.585 GiB domain on top of it.
+        """
+        key = id(state)
+        with self._graph_lock:
+            old = self._graph_domains.get(key)
+            self._graph_domains[key] = domain
+            self._decode_graphs = domain
+        if old is not None and old is not domain:
+            old.close()
+
+    def _close_dropped(self, g: "_DecodeGraphs", why: str) -> None:
+        """Tear down a domain we are dropping; a failure is counted against the bound and named (lock held)."""
+        try:
+            g.close()
+        except GraphTeardownError as exc:
+            self._graph_leaked += 1
+            print(f"graphs: teardown of a domain dropped after {why} failed - {exc}.  Its HBM stays "
+                  f"allocated and it counts against the "
+                  f"{self.graph_max_conversations}-conversation bound", flush=True)
+
+    def _graph_domain(self, state: State, workers: "list[Dsv41] | None") -> "_DecodeGraphs | None":
+        """This conversation's captured domain, or None when it must run eagerly.
+
+        Lookup, creation and the bound are under `_graph_lock`, so N conversations starting together
+        cannot exceed the bound or build two domains for one State.  The capture itself is serialised
+        process-wide by `_capture_exclusive`, which is what makes N simultaneous first steps legal.
+        """
+        key = id(state)
+        workers_cards = [str(w.device) for w in workers] if workers else None
+        with self._graph_lock:
+            g = self._graph_domains.get(key)
+            if g is not None and (g.state is not state or g.state.kv is not state.kv):
+                # defensive only: the domain holds its State, so a live key cannot name another one
+                self._graph_domains.pop(key, None)
+                self._decode_graphs = None
+                self._close_dropped(g, "its State was replaced")
+                g = None
+            stale = (g is not None and workers_cards is not None
+                     and g.split_workers != workers_cards)
+            if g is not None and not stale:
+                self._decode_graphs = g
+                return g
+            if g is not None:
+                self._graph_domains.pop(key, None)
+                self._decode_graphs = None
+                self._close_dropped(g, f"its split workers changed to {workers_cards}")
+            if state in self._graph_failed:
+                return None
+            held = len(self._graph_domains) + self._graph_leaked
+            if held >= self.graph_max_conversations:
+                if state not in self._graph_cap_logged:
+                    self._graph_cap_logged.add(state)
+                    print(f"graphs: {held} captured conversation(s) already hold a domain "
+                          f"(DSV41_GRAPH_MAX_CONVERSATIONS={self.graph_max_conversations}, one domain is "
+                          f"1.585 GiB = 405.7 MiB a card); conversation 0x{key & 0xffff:x} runs eagerly.  "
+                          f"It is not silent: raise the bound only against measured HBM headroom",
+                          flush=True)
+                return None
+            try:
+                g = _DecodeGraphs(self, state, verify=self.graph_verify, cards=self.expert_cards,
+                                  workers=workers)
+            except Exception as exc:                       # noqa: BLE001 - OOM must not kill the request
+                self._graph_failed.add(state)
+                self._graph_failures.append(f"domain build: {type(exc).__name__}: {exc}")
+                print(f"graphs: could not build a domain for conversation 0x{key & 0xffff:x} "
+                      f"({type(exc).__name__}: {exc}); this conversation runs eagerly and nothing was kept",
+                      flush=True)
+                return None
+            self._graph_domains[key] = g
+            self._decode_graphs = g
+            # The policy, loud: one domain per conversation, bounded, and which slot this one took.
+            print(f"graphs: conversation 0x{key & 0xffff:x} captured its own domain "
+                  f"({held + 1}/{self.graph_max_conversations}, {g.bytes() / (1 << 30):.3f} GiB); "
+                  f"{g.describe()}", flush=True)
+            return g
+
+    def _graph_abandon(self, g: "_DecodeGraphs", state: State, reason: str) -> None:
+        """Free a domain whose capture/replay failed, forget it, and keep this conversation eager.
+
+        Per conversation, not per process: one bad capture must not take the other conversations'
+        working domains away.  The failure is named, and so is whether the HBM came back.
+        """
+        key = id(state)
+        with self._graph_lock:
+            if self._graph_domains.get(key) is g:
+                self._graph_domains.pop(key, None)
+            if self._decode_graphs is g:
+                self._decode_graphs = None
+            self._graph_failed.add(state)
+            self._graph_failures.append(reason[:400])
+            n = len(self._graph_domains)
+        leaked: GraphTeardownError | None = None
+        try:
+            g.close()
+        except GraphTeardownError as exc:
+            leaked = exc
+            with self._graph_lock:
+                self._graph_leaked += 1
+        if leaked is None:
+            note = "the half-built domain was closed and its HBM freed (no leak)"
+        else:
+            note = (f"the teardown also failed - {leaked}; its HBM stays allocated and it counts against "
+                    f"the bound")
+        print(f"graphs: conversation 0x{key & 0xffff:x} capture/replay failed ({reason}); {note}.  It runs "
+              f"eagerly from here; {n} other conversation(s) keep their domains", flush=True)
 
     def _graph_unusable_reason(self) -> str | None:
         """Why this model cannot run the captured decode, or None if it can."""
@@ -2274,8 +2474,9 @@ class Dsv41:
         layer's experts live on (one small cross-card copy, outside every graph); fetch the six experts into
         *that card's* landing zone (host
         ``pread`` + async H2D, outside every graph); replay that card's `g_post` (six expert matmul triples,
-        the post-mHC); hand the residual back.  Anything that fails to capture or replay disables graphs and
-        finishes the step (and the request) on the eager path.
+        the post-mHC); hand the residual back.  Anything that fails to capture or replay abandons *this
+        conversation's* domain (freed, named in the log) and finishes the step on the eager path; the
+        other conversations keep theirs.
 
         With ``workers`` the same seam is used *per card*: every layer's `g_post` runs here on the driver
         (the post-MHC must follow the full sum), each worker has a captured partial-expert graph on its own
@@ -2283,21 +2484,12 @@ class Dsv41:
         still one dense path, still captured; what the split adds is the per-layer hand-off, measured
         separately (``Dsv41.split_timers``).
         """
-        g = self._decode_graphs
-        stale = (g is not None and workers is not None
-                 and g.split_workers != [str(w.device) for w in workers])
-        if g is None or stale or g.state is not state or g.state.kv is not state.kv:
-            if g is not None:
-                try:
-                    g.close()
-                except GraphTeardownError as teardown:
-                    # the old conversation's graphs could not all be destroyed: name it and capture the
-                    # new domain anyway - a leak must not stop the next conversation from being served
-                    print(f"graphs: teardown of the previous State's graphs failed ({teardown})",
-                          flush=True)
-            g = self._decode_graphs = _DecodeGraphs(self, state, verify=self.graph_verify,
-                                                   cards=self.expert_cards, workers=workers)
-            print(g.describe(), flush=True)
+        g = self._graph_domain(state, workers)
+        if g is None:
+            # the bound is full, or a previous capture for this State failed: the eager path, unchanged
+            if workers:
+                return self._eager_layers_split(h, pre, state, state.pos, [], engram_rows, workers)
+            return self._eager_layers(h, pre, state, state.pos, [], engram_rows)
         b = g.buffers
         g.activate(g.compute_key)
         b.h.copy_(h)
@@ -2337,23 +2529,17 @@ class Dsv41:
                 if key != g.compute_key:
                     g.carry_back(li)                    # the residual -> the compute card, outside
         except (GraphRunnerError, RuntimeError) as exc:
-            # a capture the wrapper refused, or a replay the runtime refused: finish this step (and the
-            # request) eagerly rather than fail the conversation half-way through a layer
+            # a capture the wrapper refused, or a replay the runtime refused: abandon *this* domain
+            # (freed, and named with whether the HBM came back), finish this step eagerly, and let the
+            # other conversations keep their working domains
             g.activate(g.compute_key)
-            self._disable_graphs(f"layer {li}: {type(exc).__name__}: {exc}")
             start = li
             if posted == li:
                 # the layer's g_post did finish and only the hand-off back failed: its residual is in the
                 # expert card's registers, so take it and carry on from the *next* layer
                 b.h.copy_(g.regs_for(li).h)
                 start = li + 1
-            try:
-                g.close()
-            except GraphTeardownError as teardown:
-                # A leaked graph model must not turn a recoverable replay failure into a failed request:
-                # report it, finish the step eagerly, and let the next State capture its own graphs.
-                print(f"graphs: teardown of the failed capture also failed ({teardown})", flush=True)
-            self._decode_graphs = None
+            self._graph_abandon(g, state, f"layer {li}: {type(exc).__name__}: {exc}")
             # layer `start`'s own input pre-mix is still in its parity (g_pre writes the other one)
             if g.split:
                 return self._eager_layers_split(b.h, b.pres[start % 2], state, state.pos, [],
@@ -2366,7 +2552,12 @@ class Dsv41:
                    self.eps)
 
     def _disable_graphs(self, reason: str) -> None:
-        """Fall back for the rest of the request, and say why (the graphs are not silently half-used)."""
+        """Turn the captured path off *for the whole model*, and say why.
+
+        Per-conversation failures go through :meth:`_graph_abandon` instead, which leaves the other
+        conversations' domains alone.  This stays as the explicit process-wide switch (a device-level
+        fault, or an operator decision), and it is what the serve engine's revoke path effectively does.
+        """
         self.graphs = False
         print(f"graphs: disabled after a capture/replay failure ({reason}); the rest runs eagerly", flush=True)
 
@@ -2520,8 +2711,11 @@ class _DecodeGraphs:
     bucket crossing re-captures that layer's `g_pre` (and only that layer's).
 
     The graph domain is a State, not a model: a captured body bakes the addresses of the KV planes it
-    writes and reads, so a second conversation gets its own capture (and the first one's is dropped).  That
-    is a log line, not a silent reuse - `GraphRunner`'s input contract would refuse the replay anyway.
+    writes and reads, so every conversation gets its own capture.  The model keeps them all
+    (``Dsv41._graph_domains``, bounded and logged) and every capture is exclusive in the process
+    (``_capture_exclusive``); that is what lets four concurrent conversations each own a working domain
+    instead of the first two captures colliding on one card's device synchronisation.  The domain itself
+    is never shared - `GraphRunner`'s input contract would refuse the replay anyway.
 
     The layers' attention runs on the compute card (``model.device``).  The routed experts' tier may be
     spread over several cards (`ExpertStreamer.layer_devices`), and a cross-device copy cannot be captured,
@@ -2714,13 +2908,20 @@ class _DecodeGraphs:
         """The GraphRunner of one card: one capture pool per device, created where its graphs are.
 
         Each runner draws its graphs on that card's own capture stream (see `GraphRunner`), which is what
-        makes a capture legal on more than one card in one process.
+        makes a capture legal on more than one card in one process.  Creation is under the process
+        capture lock: it makes an NPU stream and a graph pool on that card, and no capture anywhere may
+        be in flight while it does.  Replay never enters the lock (it only launches the already-captured
+        graph) and keeps the caller's card current, which a replay needs.
         """
         runner = self.runners.get(key)
-        if runner is None:
-            self.activate(key)
-            runner = self.runners[key] = GraphRunner(self.physical[key],
-                                                     capture_error_mode="relaxed")
+        if runner is not None:
+            return runner
+        with _capture_exclusive(self.physical.get(key, key)):
+            runner = self.runners.get(key)
+            if runner is None:
+                self.activate(key)
+                runner = self.runners[key] = GraphRunner(self.physical[key],
+                                                         capture_error_mode="relaxed")
         return runner
 
     def report(self, name: str):
@@ -3037,11 +3238,20 @@ class _DecodeGraphs:
                 t.bitwise_xor_(1)
 
     def _capture(self, name: str, fn, inputs: dict, perturb, key: str) -> None:
-        runner = self._runner(key)
+        """Capture one graph on `key`'s card, exclusively and with the caller's device/stream restored.
+
+        The lock is the process's (not the domain's, and - measured - not the card's): two conversations
+        capturing their own domains at once, even on different cards, is exactly the case that used to
+        fail with EE1016 (see `_capture_exclusive`).  Holding it also covers `_runner`'s first-call
+        stream/pool creation.
+        """
         saved, self.model.timers = self.model.timers, None   # phase() synchronises, which capture refuses
         t0 = _perf()
         try:
-            runner.capture(name, fn, inputs=inputs, verify=self.verify, perturb=perturb)
+            with _capture_exclusive(self.physical.get(key, key)):
+                self.activate(key)
+                runner = self._runner(key)
+                runner.capture(name, fn, inputs=inputs, verify=self.verify, perturb=perturb)
         finally:
             self.model.timers = saved
             self.capture_s += _perf() - t0
@@ -3059,6 +3269,9 @@ class _DecodeGraphs:
         destroyed from its own context), so the normal path leaves nothing behind.  A failure is
         collected rather than raised per card, so one bad card cannot skip tearing down the others,
         and then reported once - a leak that is not named is the failure this method exists to stop.
+
+        Each runner is closed under the process capture lock: teardown synchronises the card and
+        destroys graph models, which must not run while any conversation is capturing.
         """
         if self.closed:
             return
@@ -3066,7 +3279,8 @@ class _DecodeGraphs:
         failures: list[tuple[str, str]] = []
         for key, runner in list(self.runners.items()):
             try:
-                runner.close()
+                with _capture_exclusive(self.physical.get(key, key)):
+                    runner.close()
             except GraphTeardownError as exc:
                 failures.append((key, str(exc)))
         self.runners.clear()

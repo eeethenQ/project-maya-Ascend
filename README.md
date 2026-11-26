@@ -363,13 +363,24 @@ where the numbers are thinnest, so here is exactly what is and is not measured.
 | 4 requests, 1 card | 113.9 s | 1.30 tok/s aggregate | 43.3% hit | 30.0 GiB | |
 | 1 request, 1 card, warm cache | 77.2 s | 1.12 tok/s | 13.6% hit | 27.0 GiB | the same run cold gives 181.7 s - a 2.35x regime effect, not a concurrency one |
 | **8 requests, 4 cards** | **339.6 s** (spread **0.05 s**) | **1.62 tok/s** aggregate, 0.20-0.21 each | 36.9% hit, 406.4 GB/request, 1.21 GB/step | **39.6/24.4/21.7/24.1 GiB** | eager, `--hbm-share 0.85`; **does not fit the 32 GiB share** |
-| 4 requests, 4 cards | 318.4 s | 1.37 tok/s aggregate | 29.9% hit, 450.7 GB/request | - | eager |
+| **4 requests, 4 cards, captured** | **179.2 s** (spread 2.9) | **4.18 tok/s** aggregate, 1.05 each | 37.2% hit | 20.3/22.1/19.2/21.6 GiB | all four conversations captured, 320 graphs |
+| 4 requests, 4 cards, eager | 180.2 s | 1.40 tok/s aggregate, 0.35 each | 38.1% hit | 20.9/20.7/17.9/20.6 GiB | paired wall ratio **0.773** = **2.99x** decode |
 
 **On one card, eight concurrent 2 000-token requests saturate at about 1.1-1.3 aggregate tokens/s** - the same
 figure as a single request, because the concurrency cost sits in the decode path and not in the prefill: the
 short-prompt control at the same concurrency gives 1.13 tokens/s, and 2 000-token prompts add 266 s of TTFT
 without changing the rate.  Eight at once also needs **33.7 GiB**, above the 32 GiB the process is normally held
 to (`--hbm-share 0.85` was needed), so one card cannot serve eight 2k conversations within the per-process cap.
+
+**Four conversations can each have their own captured decode, and it is worth about 3x.** A conversation's
+graphs belong to its `State`, so this needed one domain per conversation plus a process-wide capture lock (a
+per-card lock is not enough: a capture on one card fails naming an open capture on another). Four interleaved
+arms give wall ratios of **0.773 / 0.782 / 0.779** and decode ratios of **2.99 / 2.90 / 2.58x**, with every arm
+reporting four live domains, 320 graphs, 128 of 128 steps on their own domain, and all 32 x 4 token streams
+identical to eager. Peak **22.12 GiB** against the 30.48 GiB share, so the memory fits; the bound is a policy
+of four conversations (`DSV41_GRAPH_MAX_CONVERSATIONS`), and past it a conversation runs eagerly with a log
+rather than evicting a live domain. The serve path still leases one captured conversation at a time - relaxing
+that is the next step.
 
 **Eight concurrent 2 000-token requests do not fit the 32 GiB share.** At `--hbm-share 0.85` the four-card
 run completes - **339.6 s TTFT with a 0.05 s spread across the eight**, 1.62 tok/s aggregate (0.20-0.21 each),

@@ -7,10 +7,16 @@ builds the **same** engine with ``rt.build(graphs=True)`` (or False for the pair
 counters are unchanged; only the build's `graphs` argument and this file's instrumentation differ.
 
 The capture question is answered by probe events, not by guessing: every `_DecodeGraphs` constructed or
-closed, every `_disable_graphs`, and every one-token `forward` (its State, whether the graph domain was
-that State's, and how long it took) are recorded.  A domain is per `State` and the model holds one slot
-(`model._decode_graphs`), so when four threads each run their own State the probe shows whether each
-conversation captured, was torn down, re-captured, or fell back.
+closed, every graph-disable, and every one-token `forward` (its State, whether the graph domain was that
+State's, and how long it took) are recorded.  A domain is per `State`; the model keeps one per
+conversation (`model._graph_domains`, bounded by `DSV41_GRAPH_MAX_CONVERSATIONS`, default 4) and every
+capture is exclusive in the process, so the probe reports whether each conversation captured, kept its
+domain, fell back, or was refused by the bound.  `--graphs on` at `--parallel 4` is the arm this driver exists to
+measure; the summary's `all_conversations_captured` is the yes/no.
+
+The timing sync is `_capture_tolerant_sync` rather than `bench_serve._sync`: ACL refuses a device-wide
+synchronise while another thread's capture is in flight (`EE1016`), so the harness waits for that capture
+instead of killing the conversation.  Eager arms never hit the retry.
 
     # four conversations, 2 000 tokens, captured decode on
     python3 -m ascend.bench_4card_graphs --model ... --tokenizer ... --cards npu:0,npu:1,npu:2,npu:3 \\
@@ -61,11 +67,55 @@ def _hbm_end(devices, share: float) -> dict:
     return out
 
 
+def _capture_tolerant_sync(devices, timeout_s: float = 300.0) -> None:
+    """`bench_serve._sync`, but a device synchronise that lands inside another thread's capture waits.
+
+    ACL refuses a *device-wide* synchronise while any stream on that card is being captured
+    (``Not_Supported(EE1016): Stream (stream_id=N) ... is being captured``).  With four threads each
+    capturing its own 80-graph domain, any thread that finishes a forward during those ~1.5 s windows would
+    otherwise kill its conversation - which is what the previous round measured.  The capture ends on its
+    own, so the honest thing for the timing harness is to wait for it and then read the clock; the wait is
+    reported as part of that thread's step, not hidden.
+    """
+    deadline = time.perf_counter() + timeout_s
+    for d in devices:
+        if not str(d).startswith("npu"):
+            continue
+        index = int(str(d).split(":")[-1])
+        while True:
+            try:
+                torch.npu.synchronize(index)
+                break
+            except TypeError:                                   # older signatures take no device
+                torch.npu.synchronize()
+                break
+            except RuntimeError as exc:
+                text = str(exc)
+                if ("is being captured" not in text and "stream is captured" not in text):
+                    raise
+                if time.perf_counter() > deadline:
+                    raise RuntimeError(f"a capture on npu:{index} did not end within {timeout_s:.0f}s; "
+                                       f"refusing to spin: {exc}") from exc
+                time.sleep(0.02)
+
+
+def _domain_of(model, state):
+    """This State's own captured domain, from the model's per-conversation registry (or None)."""
+    registry = getattr(model, "_graph_domains", None) or {}
+    domain = registry.get(id(state))
+    if domain is not None and getattr(domain, "state", None) is state:
+        return domain
+    domain = getattr(model, "_decode_graphs", None)
+    return domain if domain is not None and getattr(domain, "state", None) is state else None
+
+
 class Probe:
     """Records every graph domain created/closed, every graph-disable, and every decode step.
 
     `states` is filled by wrapping ``run.state``: `concurrent_prefill_decode` allocates its States in
-    conversation order (thread 0 .. n-1), so the index in this list is the conversation index.
+    conversation order (thread 0 .. n-1), so the index in this list is the conversation index.  The model
+    used to hold one domain at a time; it now holds one per conversation (bounded), so a step's domain is
+    looked up in `model._graph_domains` by its State, not read from `model._decode_graphs`.
     """
 
     def __init__(self, run):
@@ -134,7 +184,7 @@ class Probe:
             out = orig_forward(self, ids, state, *args, **kwargs)
             if one:
                 dt = time.perf_counter() - t
-                dom = self._decode_graphs
+                dom = _domain_of(self, state)
                 with probe.lock:
                     if probe.split is None:
                         probe.split = {"t": probe.now(), "tier": _tier(probe.run),
@@ -142,7 +192,7 @@ class Probe:
                     probe.steps.append({
                         "t": probe.now(), "conv": probe.conv(state),
                         "graphs_on": graphs_on,
-                        "domain_match": dom is not None and getattr(dom, "state", None) is state,
+                        "domain_match": dom is not None,
                         "step_s": round(dt, 3)})
             return out
 
@@ -165,19 +215,24 @@ class Probe:
             disabled = [e for e in self.events if e["ev"] == "graphs_disabled"]
             steps = list(self.steps)
         per_conv: dict[str, dict] = {}
-        for i in range(len(self.states)):
+        model = self.run.model
+        failed = getattr(model, "_graph_failed", ())
+        alive_domains = list((getattr(model, "_graph_domains", None) or {}).values())
+        for i, state in enumerate(self.states):
             cap = [e for e in created if e["conv"] == i]
             done = [e for e in closed if e["conv"] == i]
             cap_steps = [s for s in steps if s["conv"] == i and s["graphs_on"]]
             match_steps = [s for s in steps if s["conv"] == i and s["graphs_on"] and s["domain_match"]]
-            alive = getattr(self.run.model, "_decode_graphs", None)
-            alive_cap = (int(getattr(alive, "captured", 0))
-                         if alive is not None and getattr(alive, "state", None) is self.states[i] else 0)
+            alive = _domain_of(model, state)
+            alive_cap = int(getattr(alive, "captured", 0)) if alive is not None else 0
             per_conv[str(i)] = {
                 "domains_created": len(cap),
                 "domains_closed": len(done),
+                "domain_alive_at_end": alive is not None,
+                "alive_domain_captured": alive_cap,
                 "graphs_captured_total": sum(e["captured"] for e in done) + alive_cap,
                 "capture_s_total": round(sum(e["capture_s"] for e in done), 2),
+                "graphs_failed": state in failed,
                 "decode_steps": len([s for s in steps if s["conv"] == i]),
                 "decode_steps_with_graphs_on": len(cap_steps),
                 "decode_steps_on_own_domain": len(match_steps),
@@ -187,7 +242,11 @@ class Probe:
                     [s["step_s"] for s in steps if s["conv"] == i and not s["graphs_on"]]), 3)
                     if [s for s in steps if s["conv"] == i and not s["graphs_on"]] else None),
             }
-        dom = getattr(self.run.model, "_decode_graphs", None)
+        layers = int(getattr(self.run.cfg, "num_hidden_layers", 0))
+        captured_convs = [i for i, row in per_conv.items()
+                          if row["domain_alive_at_end"]
+                          and row["graphs_captured_total"] >= 2 * layers
+                          and row["decode_steps_on_own_domain"] > 0]
         def _delta(after, before):
             return {"hits": after["hits"] - before["hits"],
                     "misses": after["misses"] - before["misses"],
@@ -207,15 +266,19 @@ class Probe:
                       "decode_steps": len(steps)}
         return {
             "graphs_build": self.build_graphs,
-            "model_graphs_at_end": bool(getattr(self.run.model, "graphs", False)),
+            "model_graphs_at_end": bool(getattr(model, "graphs", False)),
+            "max_conversations": int(getattr(model, "graph_max_conversations", 0)),
             "events": self.events,
             "domains_created": len(created),
             "domains_closed": len(closed),
-            "domains_alive_at_end": len(created) - len(closed),
-            "alive_domain_conv": probe_conv(self, dom),
-            "alive_domain_id": id(dom) if dom is not None else None,
-            "alive_domain_captured": int(getattr(dom, "captured", 0)) if dom is not None else 0,
-            "alive_domain_bytes": dom.bytes() if dom is not None else 0,
+            "domains_alive_at_end": len(alive_domains),
+            "alive_domain_convs": sorted(filter(None, (self.conv(d.state) for d in alive_domains))),
+            "alive_domain_ids": [id(d) for d in alive_domains],
+            "alive_domain_captured": sum(int(getattr(d, "captured", 0)) for d in alive_domains),
+            "alive_domain_bytes": sum(d.bytes() for d in alive_domains),
+            "captured_conversations": len(captured_convs),
+            "all_conversations_captured": len(captured_convs) == len(self.states),
+            "graph_failures": list(getattr(model, "_graph_failures", [])),
             "graphs_disabled": len(disabled),
             "disable_reasons": [e["reason"] for e in disabled],
             "decode_steps_total": len(steps),
@@ -273,7 +336,7 @@ def run_concurrent(a, tokenizer) -> int:
     error = None
     try:
         rec = concurrent_prefill_decode(run, ids, a.gen, a.max_context, devices, label, a.eos,
-                                        n=a.parallel)
+                                        n=a.parallel, sync=lambda: _capture_tolerant_sync(devices))
     except BaseException as exc:                                    # noqa: BLE001 - report, save
         error = traceback.format_exc()
         print(f"arm failed:\n{error}", flush=True)
@@ -328,7 +391,7 @@ def run_fit(a, tokenizer) -> int:
             t0 = time.perf_counter()
             with torch.inference_mode():
                 dom = model_mod._DecodeGraphs(model, s, cards=model.expert_cards)
-            model._decode_graphs = dom
+            model.adopt_graph_domain(s, dom)
             logits = model.forward([int(prompt[-1])], s)
             _sync_devices(devices)
             row.update({"ok": True, "capture_s": round(time.perf_counter() - t0, 2),
@@ -352,7 +415,7 @@ def run_fit(a, tokenizer) -> int:
     replay = []
     for i, dom in enumerate(doms):
         try:
-            model._decode_graphs = dom
+            model.adopt_graph_domain(states[i], dom)
             t0 = time.perf_counter()
             model.forward([int(prompt[-1])], states[i])
             _sync_devices(devices)

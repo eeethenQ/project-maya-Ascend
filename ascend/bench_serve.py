@@ -312,12 +312,20 @@ def single_prefill(run, ids: list[int], max_context: int, timers: bool, devices)
 
 # --------------------------------------------------------------------------- 3/4: N conversations
 def concurrent_prefill_decode(run, ids, gen: int, max_context: int, devices,
-                              label: str, eos: int, n: int = 4) -> dict:
+                              label: str, eos: int, n: int = 4, sync=None) -> dict:
     """`n` threads, one State each: prefill then greedy decode, all starting at the same instant.
 
     ``ids`` is one prompt (shared by the `n` conversations) or a list of `n` prompts (distinct ones, so the
     token streams must differ and a shared-buffer corruption shows).
+
+    ``sync`` is the barrier between a forward and its timing read, defaulting to the device-wide
+    :func:`_sync`.  A caller that captures decode graphs on several threads passes one that tolerates a
+    capture in flight: ACL refuses a *device* synchronise while any stream on that card is being
+    captured (``EE1016``), which is not a benchmark failure but a capture that has not finished yet.
     """
+    if sync is None:
+        def sync():
+            _sync(devices)
     prompts = [ids[i] if ids and isinstance(ids[0], (list, tuple)) else ids for i in range(n)]
     states = [run.state(max_context) for _ in range(n)]
     results: list[dict | None] = [None] * n
@@ -333,7 +341,7 @@ def concurrent_prefill_decode(run, ids, gen: int, max_context: int, devices,
             barrier.wait()
             t_start = time.perf_counter()
             logits = run.model.forward(ids_i, state, logits_last_only=True)
-            _sync(devices)
+            sync()
             t_first = time.perf_counter()
             tok = int(logits[0].argmax())
             tokens: list[int] = []
@@ -344,7 +352,7 @@ def concurrent_prefill_decode(run, ids, gen: int, max_context: int, devices,
                     break
                 t0 = time.perf_counter()
                 logits = run.model.forward([tok], state, logits_last_only=True)
-                _sync(devices)
+                sync()
                 step_s.append(time.perf_counter() - t0)
                 tok = int(logits[0].argmax())
             t_end = time.perf_counter()

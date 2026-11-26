@@ -1,0 +1,477 @@
+{
+ "summary": {
+  "run_s": 252.5,
+  "cards": [
+   "npu:0",
+   "npu:1",
+   "npu:2",
+   "npu:3"
+  ],
+  "visible": "0,1,2,3",
+  "device": "npu:0",
+  "mode": "concurrent",
+  "parallel": 4,
+  "hbm_share": 0.5,
+  "expert_reserve_gib": 13.0,
+  "max_context": 2048,
+  "prompt_tokens": 2000,
+  "gen": 32,
+  "scenarios": 1,
+  "graph": true,
+  "graphs_config": "on",
+  "build_s": 42.7
+ },
+ "records": [
+  {
+   "scenario": "par4-2k-locked-on-3",
+   "prompt_tokens": 2000,
+   "max_context": 2048,
+   "requests": 4,
+   "gen_tokens": 32,
+   "succeeded": 4,
+   "errors": [],
+   "wall_s": 208.07,
+   "ttft_s": 175.16,
+   "ttft_s_list": [
+    175.87,
+    175.79,
+    173.05,
+    175.92
+   ],
+   "ttft_median_s": 175.83,
+   "ttft_spread_s": 2.87,
+   "ttft_sum_over_wall": 3.37,
+   "ttft_slowest_over_fastest": 1.02,
+   "first_token_spread_s": 2.87,
+   "decode_tok_s": 3.66,
+   "wall_tok_s": 0.62,
+   "decode_steps_total": 128,
+   "decode_tok_s_per_request": [
+    0.99,
+    0.99,
+    0.94,
+    1.0
+   ],
+   "decode_ms_median_per_request": [
+    847.2,
+    862.6,
+    900.7,
+    848.3
+   ],
+   "tokens_identical": true,
+   "token_streams": [
+    [
+     64528,
+     7743,
+     5395,
+     2272,
+     74,
+     1269,
+     5426,
+     2699,
+     21592,
+     17,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     22604,
+     369,
+     2619,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     666
+    ],
+    [
+     64528,
+     7743,
+     5395,
+     2272,
+     74,
+     1269,
+     5426,
+     2699,
+     21592,
+     17,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     22604,
+     369,
+     2619,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     666
+    ],
+    [
+     64528,
+     7743,
+     5395,
+     2272,
+     74,
+     1269,
+     5426,
+     2699,
+     21592,
+     17,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     22604,
+     369,
+     2619,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     666
+    ],
+    [
+     64528,
+     7743,
+     5395,
+     2272,
+     74,
+     1269,
+     5426,
+     2699,
+     21592,
+     17,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     22604,
+     369,
+     2619,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     666
+    ]
+   ],
+   "per_request": [
+    {
+     "ttft_s": 175.867,
+     "first_token": 64528,
+     "decode_steps": 32,
+     "decode_s": 32.205,
+     "decode_tok_s": 0.994,
+     "decode_ms_median": 847.177,
+     "end_s": 208.072
+    },
+    {
+     "ttft_s": 175.787,
+     "first_token": 64528,
+     "decode_steps": 32,
+     "decode_s": 32.283,
+     "decode_tok_s": 0.991,
+     "decode_ms_median": 862.616,
+     "end_s": 208.07
+    },
+    {
+     "ttft_s": 173.055,
+     "first_token": 64528,
+     "decode_steps": 32,
+     "decode_s": 34.178,
+     "decode_tok_s": 0.936,
+     "decode_ms_median": 900.718,
+     "end_s": 207.233
+    },
+    {
+     "ttft_s": 175.923,
+     "first_token": 64528,
+     "decode_steps": 32,
+     "decode_s": 32.148,
+     "decode_tok_s": 0.995,
+     "decode_ms_median": 848.267,
+     "end_s": 208.071
+    }
+   ],
+   "tier": {
+    "hits": 25334,
+    "misses": 47350,
+    "hit_rate": 0.3485,
+    "gb_read": 1675.69,
+    "gb_read_per_request": 418.92,
+    "slots": 1778,
+    "oom_skips": 0
+   },
+   "peak_gib": {
+    "npu:0": 20.1,
+    "npu:1": 22.12,
+    "npu:2": 19.22,
+    "npu:3": 21.65
+   },
+   "allocated_gib": {
+    "npu:0": 18.61,
+    "npu:1": 22.05,
+    "npu:2": 19.18,
+    "npu:3": 21.62
+   },
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2",
+    "npu:3"
+   ],
+   "device": "npu:0",
+   "tier_slots": 2267,
+   "io": {
+    "read_gb": 0.0,
+    "rchar_gb": 1675.91
+   },
+   "hbm_free_after": {
+    "npu:0": {
+     "free_gib": 40.27,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 18.61
+    },
+    "npu:1": {
+     "free_gib": 37.38,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 22.05
+    },
+    "npu:2": {
+     "free_gib": 40.64,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 19.18
+    },
+    "npu:3": {
+     "free_gib": 37.87,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 21.62
+    }
+   },
+   "graph_probe": {
+    "graphs_build": true,
+    "model_graphs_at_end": true,
+    "max_conversations": 4,
+    "events": [
+     {
+      "ev": "domain_created",
+      "t": 173.23,
+      "conv": 2,
+      "id": 281466321055632,
+      "bytes": 1701517824
+     },
+     {
+      "ev": "domain_created",
+      "t": 175.878,
+      "conv": 1,
+      "id": 281466321048720,
+      "bytes": 1701517824
+     },
+     {
+      "ev": "domain_created",
+      "t": 175.96,
+      "conv": 0,
+      "id": 281466189920544,
+      "bytes": 1701517824
+     },
+     {
+      "ev": "domain_created",
+      "t": 176.042,
+      "conv": 3,
+      "id": 281466189919344,
+      "bytes": 1701517824
+     },
+     {
+      "ev": "domain_closed",
+      "t": 208.216,
+      "conv": 2,
+      "id": 281466321055632,
+      "captured": 80,
+      "capture_s": 4.47,
+      "bytes": null,
+      "error": null
+     },
+     {
+      "ev": "domain_closed",
+      "t": 208.271,
+      "conv": 1,
+      "id": 281466321048720,
+      "captured": 80,
+      "capture_s": 6.41,
+      "bytes": null,
+      "error": null
+     },
+     {
+      "ev": "domain_closed",
+      "t": 208.324,
+      "conv": 0,
+      "id": 281466189920544,
+      "captured": 80,
+      "capture_s": 6.43,
+      "bytes": null,
+      "error": null
+     },
+     {
+      "ev": "domain_closed",
+      "t": 208.375,
+      "conv": 3,
+      "id": 281466189919344,
+      "captured": 80,
+      "capture_s": 6.29,
+      "bytes": null,
+      "error": null
+     }
+    ],
+    "domains_created": 4,
+    "domains_closed": 0,
+    "domains_alive_at_end": 4,
+    "alive_domain_convs": [
+     1,
+     2,
+     3
+    ],
+    "alive_domain_ids": [
+     281466321055632,
+     281466321048720,
+     281466189920544,
+     281466189919344
+    ],
+    "alive_domain_captured": 320,
+    "alive_domain_bytes": 6806071296,
+    "captured_conversations": 4,
+    "all_conversations_captured": true,
+    "graph_failures": [],
+    "graphs_disabled": 0,
+    "disable_reasons": [],
+    "decode_steps_total": 128,
+    "decode_steps_with_graphs_on": 128,
+    "decode_steps_on_own_domain": 128,
+    "per_conversation": {
+     "0": {
+      "domains_created": 1,
+      "domains_closed": 0,
+      "domain_alive_at_end": true,
+      "alive_domain_captured": 80,
+      "graphs_captured_total": 80,
+      "capture_s_total": 0,
+      "graphs_failed": false,
+      "decode_steps": 32,
+      "decode_steps_with_graphs_on": 32,
+      "decode_steps_on_own_domain": 32,
+      "decode_step_s_median_own_domain": 0.845,
+      "decode_step_s_median_eager": null
+     },
+     "1": {
+      "domains_created": 1,
+      "domains_closed": 0,
+      "domain_alive_at_end": true,
+      "alive_domain_captured": 80,
+      "graphs_captured_total": 80,
+      "capture_s_total": 0,
+      "graphs_failed": false,
+      "decode_steps": 32,
+      "decode_steps_with_graphs_on": 32,
+      "decode_steps_on_own_domain": 32,
+      "decode_step_s_median_own_domain": 0.861,
+      "decode_step_s_median_eager": null
+     },
+     "2": {
+      "domains_created": 1,
+      "domains_closed": 0,
+      "domain_alive_at_end": true,
+      "alive_domain_captured": 80,
+      "graphs_captured_total": 80,
+      "capture_s_total": 0,
+      "graphs_failed": false,
+      "decode_steps": 32,
+      "decode_steps_with_graphs_on": 32,
+      "decode_steps_on_own_domain": 32,
+      "decode_step_s_median_own_domain": 0.899,
+      "decode_step_s_median_eager": null
+     },
+     "3": {
+      "domains_created": 1,
+      "domains_closed": 0,
+      "domain_alive_at_end": true,
+      "alive_domain_captured": 80,
+      "graphs_captured_total": 80,
+      "capture_s_total": 0,
+      "graphs_failed": false,
+      "decode_steps": 32,
+      "decode_steps_with_graphs_on": 32,
+      "decode_steps_on_own_domain": 32,
+      "decode_step_s_median_own_domain": 0.847,
+      "decode_step_s_median_eager": null
+     }
+    },
+    "phases": {
+     "split_t": 179.233,
+     "prefill": {
+      "hits": 282,
+      "misses": 42264,
+      "bytes": 1495699292160,
+      "gb_read": 1495.7,
+      "rchar_gb": 1495.92
+     },
+     "decode": {
+      "hits": 25052,
+      "misses": 5086,
+      "bytes": 179990691840,
+      "gb_read": 179.99,
+      "rchar_gb": 179.99,
+      "gb_read_per_step": 1.406
+     },
+     "decode_steps": 128
+    }
+   },
+   "graphs_config": "on",
+   "build_s": 42.7
+  }
+ ]
+}

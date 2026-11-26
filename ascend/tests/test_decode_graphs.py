@@ -13,11 +13,13 @@ that a decode that crosses indexer buckets still produces the eager answer.
 """
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 
 from ascend.dsv41.checkpoint import Checkpoint
 from ascend.dsv41.config import build_layer_plan
-from ascend.dsv41.graph_runner import GraphTeardownError
+from ascend.dsv41.graph_runner import GraphRunner, GraphRunnerError, GraphTeardownError
 
 try:                                                    # torch is only installed where the engine runs
     import torch
@@ -367,6 +369,161 @@ class TheGraphSwitch(unittest.TestCase):
         net.forward([9], state)
         self.assertIsNot(net._decode_graphs, first)
         self.assertEqual(len(net._decode_graphs.post), net.cfg.num_hidden_layers)
+
+
+@NEEDS_TORCH
+class TheCaptureIsExclusive(unittest.TestCase):
+    """N conversations get N domains, one capture at a time per card, and a failure frees its own.
+
+    On CPU the capture wrapper is the eager fallback, but the *lifecycle* is the real one: the same
+    `_capture_exclusive` card lock, the same per-conversation registry, the same abandon-on-failure path.
+    The measured failure this pins (commit d0aeaac) was two captures on one card at once; the test forces
+    that overlap by making every `GraphRunner.capture` slow and having both threads start together.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = TinyModel()
+        cls.ckpt = Checkpoint(cls.model.root)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ckpt.close()
+        cls.model.close()
+
+    def tokens(self, net, state, prompt, steps):
+        logits = net.forward(list(prompt), state)
+        logits = net.forward([prompt[-1]], state)
+        out = []
+        for _ in range(steps):
+            tok = int(logits[0].argmax())
+            out.append(tok)
+            logits = net.forward([tok], state)
+        return out
+
+    def eager_tokens(self, prompt, steps):
+        eager = build(self.ckpt, self.model, graphs=False)
+        eager.host_mixes = False                    # the branch a captured layer contains
+        return self.tokens(eager, new_state(self.model), prompt, steps)
+
+    def test_two_conversations_capture_concurrently_and_both_keep_their_domain(self):
+        net = build(self.ckpt, self.model, graphs=True)
+        net.host_mixes = False
+        layers = net.cfg.num_hidden_layers
+        prompts = ([3, 5, 7, 11], [13, 17, 19, 23])
+        states = [new_state(self.model) for _ in prompts]
+        results: list[list[int] | None] = [None, None]
+        errors: list[BaseException | None] = [None, None]
+        gate = threading.Barrier(3)
+        observed = {"active": 0, "peak": 0}
+        lock = threading.Lock()
+        original = GraphRunner.capture
+
+        def slow_capture(runner, *args, **kwargs):
+            with lock:
+                observed["active"] += 1
+                observed["peak"] = max(observed["peak"], observed["active"])
+            try:
+                time.sleep(0.03)        # a window a per-domain (rather than per-card) lock would not close
+                return original(runner, *args, **kwargs)
+            finally:
+                with lock:
+                    observed["active"] -= 1
+
+        def conversation(i: int) -> None:
+            try:
+                net.forward(list(prompts[i]), states[i])        # T > 1: prefill, never captured
+                gate.wait()
+                logits = net.forward([prompts[i][-1]], states[i])   # first one-token step: capture
+                out = []
+                for _ in range(3):
+                    tok = int(logits[0].argmax())
+                    out.append(tok)
+                    logits = net.forward([tok], states[i])
+                results[i] = out
+            except BaseException as exc:                        # noqa: BLE001 - reported by the assert
+                errors[i] = exc
+
+        GraphRunner.capture = slow_capture
+        try:
+            threads = [threading.Thread(target=conversation, args=(i,)) for i in range(2)]
+            for t in threads:
+                t.start()
+            gate.wait()
+            for t in threads:
+                t.join(timeout=120)
+        finally:
+            GraphRunner.capture = original
+        self.assertEqual([str(e) for e in errors if e is not None], [])
+        self.assertFalse(any(t.is_alive() for t in threads), "a conversation thread did not finish")
+        self.assertEqual(observed["peak"], 1,
+                         f"{observed['peak']} captures ran at once on one card; capture must be exclusive")
+        self.assertEqual(len(net._graph_domains), 2, "both conversations must keep their own domain")
+        for state in states:
+            g = net._graph_domains.get(id(state))
+            self.assertIsNotNone(g, "a concurrent conversation did not end up with a domain")
+            self.assertIs(g.state, state)
+            self.assertEqual(g.captured, 2 * layers, "both domains must be fully captured")
+        for i, prompt in enumerate(prompts):
+            self.assertEqual(results[i], self.eager_tokens(prompt, 3),
+                             f"conversation {i} did not produce the eager tokens")
+
+    def test_a_failed_capture_frees_its_domain_and_only_that_conversation_goes_eager(self):
+        net = build(self.ckpt, self.model, graphs=True)
+        net.host_mixes = False
+        state = new_state(self.model)
+        prompt = [3, 5, 7]
+        net.forward(list(prompt), state)
+        calls = {"n": 0}
+        original = GraphRunner.capture
+
+        def failing_capture(runner, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise GraphRunnerError("injected capture failure")
+            return original(runner, *args, **kwargs)
+
+        GraphRunner.capture = failing_capture
+        try:
+            got = net.forward([11], state)
+        finally:
+            GraphRunner.capture = original
+        self.assertIsNotNone(got, "the failed step must finish on the eager path, not fail the request")
+        self.assertIsNone(net._decode_graphs, "the failed domain must be dropped")
+        self.assertEqual(len(net._graph_domains), 0, "the built half of the domain must be freed")
+        self.assertIn(state, net._graph_failed)
+        self.assertTrue(net._graph_failures, "the failure must be recorded (and logged)")
+        # the next step is eager and must not try to capture (and fail) again
+        after = calls["n"]
+        net.forward([13], state)
+        self.assertEqual(calls["n"], after, "a State whose capture failed must stay on the eager path")
+        eager = build(self.ckpt, self.model, graphs=False)
+        eager.host_mixes = False
+        want = new_state(self.model)
+        eager.forward(list(prompt), want)
+        a = eager.forward([11], want)
+        b = eager.forward([13], want)
+        self.assertEqual(int(got[0].argmax()), int(a[0].argmax()), "the eager fallback changed the token")
+        self.assertEqual(state.token_ids, want.token_ids, "the eager fallback changed the stream")
+
+    def test_the_bound_sends_the_next_conversation_eager_and_says_so(self):
+        net = build(self.ckpt, self.model, graphs=True)
+        net.host_mixes = False
+        net.graph_max_conversations = 2
+        prompts = ([3, 5, 7], [11, 13, 17], [19, 23, 29])
+        states = [new_state(self.model) for _ in prompts]
+        for i in range(2):
+            net.forward(list(prompts[i]), states[i])
+            net.forward([prompts[i][-1]], states[i])
+        self.assertEqual(len(net._graph_domains), 2, "the first two conversations capture")
+        # the third is past the bound: eager, logged, and it does not evict a live domain
+        net.forward(list(prompts[2]), states[2])
+        got = net.forward([prompts[2][-1]], states[2])
+        self.assertEqual(len(net._graph_domains), 2)
+        self.assertNotIn(id(states[2]), net._graph_domains)
+        self.assertIn(states[2], net._graph_cap_logged, "the refusal must be loud, not silent")
+        self.assertEqual(int(got[0].argmax()), int(self.eager_tokens(prompts[2], 1)[0]),
+                         "the conversation past the bound must still produce the eager token")
 
 
 if __name__ == "__main__":
