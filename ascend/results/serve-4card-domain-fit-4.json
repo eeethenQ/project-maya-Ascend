@@ -1,0 +1,277 @@
+{
+ "summary": {
+  "run_s": 70.8,
+  "cards": [
+   "npu:0",
+   "npu:1",
+   "npu:2",
+   "npu:3"
+  ],
+  "visible": "0,1,2,3",
+  "device": "npu:0",
+  "mode": "domain-fit",
+  "parallel": 4,
+  "hbm_share": 0.5,
+  "expert_reserve_gib": 13.0,
+  "max_context": 2048,
+  "prompt_tokens": 8,
+  "gen": 1,
+  "scenarios": 1,
+  "graph": true,
+  "build_s": 42.5
+ },
+ "records": [
+  {
+   "scenario": "domain-fit-4",
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2",
+    "npu:3"
+   ],
+   "device": "npu:0",
+   "requests": 4,
+   "fit_domains": 4,
+   "fit_prefill": 8,
+   "domains_created": 4,
+   "failed_at": null,
+   "rows": [
+    {
+     "domain": 0,
+     "ok": true,
+     "capture_s": 1.9,
+     "captured": 80,
+     "domain_bytes_gib": 1.585,
+     "domain_bytes_per_card": 0.396,
+     "first_token": 67,
+     "peak_gib": {
+      "npu:0": 17.56,
+      "npu:1": 8.91,
+      "npu:2": 7.78,
+      "npu:3": 9.74
+     },
+     "allocated_gib": {
+      "npu:0": 17.33,
+      "npu:1": 8.84,
+      "npu:2": 7.74,
+      "npu:3": 9.67
+     },
+     "hbm_free": {
+      "npu:0": {
+       "free_gib": 42.71,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 17.33
+      },
+      "npu:1": {
+       "free_gib": 51.4,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 8.84
+      },
+      "npu:2": {
+       "free_gib": 52.43,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 7.74
+      },
+      "npu:3": {
+       "free_gib": 50.53,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 9.67
+      }
+     }
+    },
+    {
+     "domain": 1,
+     "ok": true,
+     "capture_s": 1.25,
+     "captured": 80,
+     "domain_bytes_gib": 1.585,
+     "domain_bytes_per_card": 0.396,
+     "first_token": 67,
+     "peak_gib": {
+      "npu:0": 17.96,
+      "npu:1": 9.26,
+      "npu:2": 8.16,
+      "npu:3": 10.09
+     },
+     "allocated_gib": {
+      "npu:0": 17.73,
+      "npu:1": 9.24,
+      "npu:2": 8.14,
+      "npu:3": 10.07
+     },
+     "hbm_free": {
+      "npu:0": {
+       "free_gib": 42.25,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 17.73
+      },
+      "npu:1": {
+       "free_gib": 50.98,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 9.24
+      },
+      "npu:2": {
+       "free_gib": 52.01,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 8.14
+      },
+      "npu:3": {
+       "free_gib": 50.12,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 10.07
+      }
+     }
+    },
+    {
+     "domain": 2,
+     "ok": true,
+     "capture_s": 1.36,
+     "captured": 80,
+     "domain_bytes_gib": 1.585,
+     "domain_bytes_per_card": 0.396,
+     "first_token": 67,
+     "peak_gib": {
+      "npu:0": 18.36,
+      "npu:1": 9.65,
+      "npu:2": 8.55,
+      "npu:3": 10.49
+     },
+     "allocated_gib": {
+      "npu:0": 18.13,
+      "npu:1": 9.64,
+      "npu:2": 8.54,
+      "npu:3": 10.47
+     },
+     "hbm_free": {
+      "npu:0": {
+       "free_gib": 41.76,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 18.13
+      },
+      "npu:1": {
+       "free_gib": 50.57,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 9.64
+      },
+      "npu:2": {
+       "free_gib": 51.6,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 8.54
+      },
+      "npu:3": {
+       "free_gib": 49.7,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 10.47
+      }
+     }
+    },
+    {
+     "domain": 3,
+     "ok": true,
+     "capture_s": 1.31,
+     "captured": 80,
+     "domain_bytes_gib": 1.585,
+     "domain_bytes_per_card": 0.396,
+     "first_token": 67,
+     "peak_gib": {
+      "npu:0": 18.75,
+      "npu:1": 10.05,
+      "npu:2": 8.95,
+      "npu:3": 10.88
+     },
+     "allocated_gib": {
+      "npu:0": 18.52,
+      "npu:1": 10.03,
+      "npu:2": 8.93,
+      "npu:3": 10.87
+     },
+     "hbm_free": {
+      "npu:0": {
+       "free_gib": 41.3,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 18.52
+      },
+      "npu:1": {
+       "free_gib": 50.15,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 10.03
+      },
+      "npu:2": {
+       "free_gib": 51.19,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 8.93
+      },
+      "npu:3": {
+       "free_gib": 49.29,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 10.87
+      }
+     }
+    }
+   ],
+   "replay": [
+    {
+     "domain": 0,
+     "ok": true,
+     "step_s": 0.851,
+     "captured": 80
+    },
+    {
+     "domain": 1,
+     "ok": true,
+     "step_s": 0.38,
+     "captured": 80
+    },
+    {
+     "domain": 2,
+     "ok": true,
+     "step_s": 0.355,
+     "captured": 80
+    },
+    {
+     "domain": 3,
+     "ok": true,
+     "step_s": 0.352,
+     "captured": 80
+    }
+   ],
+   "peak_gib": {
+    "npu:0": 18.76,
+    "npu:1": 10.47,
+    "npu:2": 9.47,
+    "npu:3": 11.2
+   },
+   "allocated_gib": {
+    "npu:0": 18.52,
+    "npu:1": 10.43,
+    "npu:2": 9.4,
+    "npu:3": 11.17
+   },
+   "tier": {
+    "hits": 3515,
+    "misses": 2217,
+    "bytes": 78458388480,
+    "slots": 830,
+    "oom_skips": 0
+   },
+   "build_s": 42.5,
+   "graph_probe": null
+  }
+ ]
+}

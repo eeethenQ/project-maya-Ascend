@@ -1,0 +1,193 @@
+{
+ "summary": {
+  "run_s": 188.7,
+  "cards": [
+   "npu:0",
+   "npu:1",
+   "npu:2",
+   "npu:3"
+  ],
+  "visible": "0,1,2,3",
+  "device": "npu:0",
+  "mode": "concurrent",
+  "parallel": 1,
+  "hbm_share": 0.5,
+  "expert_reserve_gib": 13.0,
+  "max_context": 2048,
+  "prompt_tokens": 2000,
+  "gen": 32,
+  "scenarios": 1,
+  "graph": false,
+  "graphs_config": "off",
+  "build_s": 39.9
+ },
+ "records": [
+  {
+   "scenario": "concurrent-2k-n1-graphs-off",
+   "prompt_tokens": 2000,
+   "max_context": 2048,
+   "requests": 1,
+   "gen_tokens": 32,
+   "succeeded": 1,
+   "errors": [],
+   "wall_s": 147.08,
+   "ttft_s": 93.87,
+   "ttft_s_list": [
+    93.87
+   ],
+   "ttft_median_s": 93.87,
+   "ttft_spread_s": null,
+   "ttft_sum_over_wall": 0.64,
+   "ttft_slowest_over_fastest": 1.0,
+   "first_token_spread_s": null,
+   "decode_tok_s": 0.6,
+   "wall_tok_s": 0.22,
+   "decode_steps_total": 32,
+   "decode_tok_s_per_request": [
+    0.6
+   ],
+   "decode_ms_median_per_request": [
+    1676.7
+   ],
+   "tokens_identical": true,
+   "token_streams": [
+    [
+     64528,
+     7743,
+     5395,
+     2272,
+     74,
+     1269,
+     5426,
+     2699,
+     21592,
+     17,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     22604,
+     369,
+     2619,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     666
+    ]
+   ],
+   "per_request": [
+    {
+     "ttft_s": 93.868,
+     "first_token": 64528,
+     "decode_steps": 32,
+     "decode_s": 53.213,
+     "decode_tok_s": 0.601,
+     "decode_ms_median": 1676.706,
+     "end_s": 147.081
+    }
+   ],
+   "tier": {
+    "hits": 4638,
+    "misses": 13533,
+    "hit_rate": 0.2552,
+    "gb_read": 478.93,
+    "gb_read_per_request": 478.93,
+    "slots": 1818,
+    "oom_skips": 0
+   },
+   "peak_gib": {
+    "npu:0": 17.95,
+    "npu:1": 20.98,
+    "npu:2": 18.19,
+    "npu:3": 20.91
+   },
+   "allocated_gib": {
+    "npu:0": 17.72,
+    "npu:1": 20.9,
+    "npu:2": 18.14,
+    "npu:3": 20.86
+   },
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2",
+    "npu:3"
+   ],
+   "device": "npu:0",
+   "tier_slots": 2391,
+   "io": {
+    "read_gb": 0.0,
+    "rchar_gb": 479.14
+   },
+   "hbm_free_after": {
+    "npu:0": {
+     "free_gib": 41.68,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 17.72
+    },
+    "npu:1": {
+     "free_gib": 37.28,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 20.9
+    },
+    "npu:2": {
+     "free_gib": 40.06,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 18.14
+    },
+    "npu:3": {
+     "free_gib": 37.28,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 20.86
+    }
+   },
+   "graph_probe": {
+    "graphs_build": false,
+    "model_graphs_at_end": false,
+    "events": [],
+    "domains_created": 0,
+    "domains_closed": 0,
+    "domains_alive_at_end": 0,
+    "alive_domain_conv": null,
+    "alive_domain_id": null,
+    "alive_domain_captured": 0,
+    "alive_domain_bytes": 0,
+    "graphs_disabled": 0,
+    "disable_reasons": [],
+    "decode_steps_total": 32,
+    "decode_steps_with_graphs_on": 0,
+    "decode_steps_on_own_domain": 0,
+    "per_conversation": {
+     "0": {
+      "domains_created": 0,
+      "domains_closed": 0,
+      "graphs_captured_total": 0,
+      "capture_s_total": 0,
+      "decode_steps": 32,
+      "decode_steps_with_graphs_on": 0,
+      "decode_steps_on_own_domain": 0,
+      "decode_step_s_median_own_domain": null,
+      "decode_step_s_median_eager": 1.675
+     }
+    }
+   },
+   "graphs_config": "off",
+   "build_s": 39.9
+  }
+ ]
+}

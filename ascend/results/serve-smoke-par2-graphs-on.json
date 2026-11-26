@@ -1,0 +1,224 @@
+{
+ "summary": {
+  "run_s": 83.0,
+  "cards": [
+   "npu:0",
+   "npu:1",
+   "npu:2",
+   "npu:3"
+  ],
+  "visible": "0,1,2,3",
+  "device": "npu:0",
+  "mode": "concurrent",
+  "parallel": 2,
+  "hbm_share": 0.5,
+  "expert_reserve_gib": 13.0,
+  "max_context": 2048,
+  "prompt_tokens": 64,
+  "gen": 4,
+  "scenarios": 1,
+  "graph": true,
+  "graphs_config": "on",
+  "build_s": 41.4
+ },
+ "records": [
+  {
+   "scenario": "concurrent-2k-n2-graphs-on",
+   "prompt_tokens": 64,
+   "max_context": 2048,
+   "requests": 2,
+   "gen_tokens": 4,
+   "succeeded": 2,
+   "errors": [],
+   "wall_s": 40.28,
+   "ttft_s": 28.61,
+   "ttft_s_list": [
+    28.61,
+    28.61
+   ],
+   "ttft_median_s": 28.61,
+   "ttft_spread_s": 0.0,
+   "ttft_sum_over_wall": 1.42,
+   "ttft_slowest_over_fastest": 1.0,
+   "first_token_spread_s": 0.0,
+   "decode_tok_s": 0.69,
+   "wall_tok_s": 0.2,
+   "decode_steps_total": 8,
+   "decode_tok_s_per_request": [
+    0.35,
+    0.34
+   ],
+   "decode_ms_median_per_request": [
+    1810.8,
+    1564.2
+   ],
+   "tokens_identical": true,
+   "token_streams": [
+    [
+     1281,
+     5395,
+     2272,
+     2758
+    ],
+    [
+     1281,
+     5395,
+     2272,
+     2758
+    ]
+   ],
+   "per_request": [
+    {
+     "ttft_s": 28.613,
+     "first_token": 1281,
+     "decode_steps": 4,
+     "decode_s": 11.504,
+     "decode_tok_s": 0.348,
+     "decode_ms_median": 1810.803,
+     "end_s": 40.117
+    },
+    {
+     "ttft_s": 28.612,
+     "first_token": 1281,
+     "decode_steps": 4,
+     "decode_s": 11.67,
+     "decode_tok_s": 0.343,
+     "decode_ms_median": 1564.193,
+     "end_s": 40.282
+    }
+   ],
+   "tier": {
+    "hits": 2607,
+    "misses": 4673,
+    "hit_rate": 0.3581,
+    "gb_read": 165.37,
+    "gb_read_per_request": 82.69,
+    "slots": 1618,
+    "oom_skips": 0
+   },
+   "peak_gib": {
+    "npu:0": 17.76,
+    "npu:1": 15.96,
+    "npu:2": 20.29,
+    "npu:3": 17.86
+   },
+   "allocated_gib": {
+    "npu:0": 17.13,
+    "npu:1": 15.78,
+    "npu:2": 20.17,
+    "npu:3": 17.74
+   },
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2",
+    "npu:3"
+   ],
+   "device": "npu:0",
+   "tier_slots": 2267,
+   "io": {
+    "read_gb": 0.46,
+    "rchar_gb": 165.59
+   },
+   "hbm_free_after": {
+    "npu:0": {
+     "free_gib": 42.45,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 17.13
+    },
+    "npu:1": {
+     "free_gib": 44.3,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 15.78
+    },
+    "npu:2": {
+     "free_gib": 40.04,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 20.17
+    },
+    "npu:3": {
+     "free_gib": 42.37,
+     "total_gib": 60.96,
+     "allowed_gib": 30.48,
+     "allocated_gib": 17.74
+    }
+   },
+   "graph_probe": {
+    "graph_build": false,
+    "events": [
+     {
+      "ev": "domain_created",
+      "t": 28.812,
+      "conv": 1,
+      "id": 281466987821440,
+      "bytes": 1701517824
+     },
+     {
+      "ev": "domain_created",
+      "t": 28.813,
+      "conv": 0,
+      "id": 281467065277600,
+      "bytes": 1701517824
+     },
+     {
+      "ev": "graphs_disabled",
+      "t": 28.88,
+      "reason": "layer 0: GraphRunnerError: capture 'g_pre.0.0' failed on npu:0: RuntimeError: npuSynchronizeDevice:../torch_npu/csrc/core/npu/NPUStream.cpp:714 NPU function error: AclrtSynchronizeDeviceWithTimeout, error code is 107027\n[ERROR] 2026-11-26-20:05:21 (PID:11636, Device:0, RankID:-1) ERR00100 PTA call acl api failed.\n[PID: 11636] 2026-11-26-20:05:21.239.762 Not_Supported(EE1016): Synchronizing the device failed. Reason: Stream (stream_id=45) on device_id=0 is being captured. End the stream capture b"
+     },
+     {
+      "ev": "domain_closed",
+      "t": 28.881,
+      "conv": 0,
+      "id": 281467065277600,
+      "captured": 0,
+      "capture_s": 0.07,
+      "bytes": null,
+      "error": null
+     }
+    ],
+    "domains_created": 2,
+    "domains_closed": 1,
+    "domains_alive_at_end": 1,
+    "alive_domain_conv": null,
+    "alive_domain_captured": 0,
+    "alive_domain_bytes": 0,
+    "graphs_disabled": 1,
+    "disable_reasons": [
+     "layer 0: GraphRunnerError: capture 'g_pre.0.0' failed on npu:0: RuntimeError: npuSynchronizeDevice:../torch_npu/csrc/core/npu/NPUStream.cpp:714 NPU function error: AclrtSynchronizeDeviceWithTimeout, error code is 107027\n[ERROR] 2026-11-26-20:05:21 (PID:11636, Device:0, RankID:-1) ERR00100 PTA call acl api failed.\n[PID: 11636] 2026-11-26-20:05:21.239.762 Not_Supported(EE1016): Synchronizing the device failed. Reason: Stream (stream_id=45) on device_id=0 is being captured. End the stream capture b"
+    ],
+    "decode_steps_total": 8,
+    "decode_steps_with_graphs_on": 2,
+    "decode_steps_on_own_domain": 0,
+    "per_conversation": {
+     "0": {
+      "domains_created": 1,
+      "domains_closed": 1,
+      "graphs_captured_total": 0,
+      "capture_s_total": 0.07,
+      "decode_steps": 4,
+      "decode_steps_with_graphs_on": 1,
+      "decode_steps_on_own_domain": 0,
+      "decode_step_s_median_own_domain": null,
+      "decode_step_s_median_eager": 1.688
+     },
+     "1": {
+      "domains_created": 1,
+      "domains_closed": 0,
+      "graphs_captured_total": 0,
+      "capture_s_total": 0,
+      "decode_steps": 4,
+      "decode_steps_with_graphs_on": 1,
+      "decode_steps_on_own_domain": 0,
+      "decode_step_s_median_own_domain": null,
+      "decode_step_s_median_eager": 1.426
+     }
+    }
+   },
+   "graphs_config": "on",
+   "build_s": 41.4
+  }
+ ]
+}

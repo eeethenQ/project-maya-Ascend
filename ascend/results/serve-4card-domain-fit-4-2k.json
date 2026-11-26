@@ -1,0 +1,277 @@
+{
+ "summary": {
+  "run_s": 370.5,
+  "cards": [
+   "npu:0",
+   "npu:1",
+   "npu:2",
+   "npu:3"
+  ],
+  "visible": "0,1,2,3",
+  "device": "npu:0",
+  "mode": "domain-fit",
+  "parallel": 4,
+  "hbm_share": 0.5,
+  "expert_reserve_gib": 13.0,
+  "max_context": 2048,
+  "prompt_tokens": 2000,
+  "gen": 1,
+  "scenarios": 1,
+  "graph": true,
+  "build_s": 43.3
+ },
+ "records": [
+  {
+   "scenario": "domain-fit-4",
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2",
+    "npu:3"
+   ],
+   "device": "npu:0",
+   "requests": 4,
+   "fit_domains": 4,
+   "fit_prefill": 2000,
+   "domains_created": 4,
+   "failed_at": null,
+   "rows": [
+    {
+     "domain": 0,
+     "ok": true,
+     "capture_s": 2.89,
+     "captured": 80,
+     "domain_bytes_gib": 1.585,
+     "domain_bytes_per_card": 0.396,
+     "first_token": 64528,
+     "peak_gib": {
+      "npu:0": 17.7,
+      "npu:1": 2.69,
+      "npu:2": 2.68,
+      "npu:3": 2.69
+     },
+     "allocated_gib": {
+      "npu:0": 17.46,
+      "npu:1": 2.49,
+      "npu:2": 2.49,
+      "npu:3": 2.49
+     },
+     "hbm_free": {
+      "npu:0": {
+       "free_gib": 42.29,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 17.46
+      },
+      "npu:1": {
+       "free_gib": 58.0,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 2.49
+      },
+      "npu:2": {
+       "free_gib": 57.98,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 2.49
+      },
+      "npu:3": {
+       "free_gib": 57.91,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 2.49
+      }
+     }
+    },
+    {
+     "domain": 1,
+     "ok": true,
+     "capture_s": 1.74,
+     "captured": 80,
+     "domain_bytes_gib": 1.585,
+     "domain_bytes_per_card": 0.396,
+     "first_token": 64528,
+     "peak_gib": {
+      "npu:0": 18.09,
+      "npu:1": 2.91,
+      "npu:2": 2.9,
+      "npu:3": 2.91
+     },
+     "allocated_gib": {
+      "npu:0": 17.85,
+      "npu:1": 2.89,
+      "npu:2": 2.88,
+      "npu:3": 2.89
+     },
+     "hbm_free": {
+      "npu:0": {
+       "free_gib": 41.83,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 17.85
+      },
+      "npu:1": {
+       "free_gib": 57.6,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 2.89
+      },
+      "npu:2": {
+       "free_gib": 57.59,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 2.88
+      },
+      "npu:3": {
+       "free_gib": 57.51,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 2.89
+      }
+     }
+    },
+    {
+     "domain": 2,
+     "ok": true,
+     "capture_s": 1.88,
+     "captured": 80,
+     "domain_bytes_gib": 1.585,
+     "domain_bytes_per_card": 0.396,
+     "first_token": 64528,
+     "peak_gib": {
+      "npu:0": 18.47,
+      "npu:1": 3.31,
+      "npu:2": 3.3,
+      "npu:3": 3.3
+     },
+     "allocated_gib": {
+      "npu:0": 18.23,
+      "npu:1": 3.29,
+      "npu:2": 3.28,
+      "npu:3": 3.29
+     },
+     "hbm_free": {
+      "npu:0": {
+       "free_gib": 41.42,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 18.23
+      },
+      "npu:1": {
+       "free_gib": 57.17,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 3.29
+      },
+      "npu:2": {
+       "free_gib": 57.17,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 3.28
+      },
+      "npu:3": {
+       "free_gib": 57.11,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 3.29
+      }
+     }
+    },
+    {
+     "domain": 3,
+     "ok": true,
+     "capture_s": 1.77,
+     "captured": 80,
+     "domain_bytes_gib": 1.585,
+     "domain_bytes_per_card": 0.396,
+     "first_token": 64528,
+     "peak_gib": {
+      "npu:0": 18.86,
+      "npu:1": 3.7,
+      "npu:2": 3.69,
+      "npu:3": 3.7
+     },
+     "allocated_gib": {
+      "npu:0": 18.62,
+      "npu:1": 3.69,
+      "npu:2": 3.68,
+      "npu:3": 3.68
+     },
+     "hbm_free": {
+      "npu:0": {
+       "free_gib": 41.18,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 18.62
+      },
+      "npu:1": {
+       "free_gib": 56.73,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 3.69
+      },
+      "npu:2": {
+       "free_gib": 56.74,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 3.68
+      },
+      "npu:3": {
+       "free_gib": 56.72,
+       "total_gib": 60.96,
+       "allowed_gib": 30.48,
+       "allocated_gib": 3.68
+      }
+     }
+    }
+   ],
+   "replay": [
+    {
+     "domain": 0,
+     "ok": true,
+     "step_s": 0.814,
+     "captured": 80
+    },
+    {
+     "domain": 1,
+     "ok": true,
+     "step_s": 0.345,
+     "captured": 80
+    },
+    {
+     "domain": 2,
+     "ok": true,
+     "step_s": 0.346,
+     "captured": 80
+    },
+    {
+     "domain": 3,
+     "ok": true,
+     "step_s": 0.343,
+     "captured": 80
+    }
+   ],
+   "peak_gib": {
+    "npu:0": 18.86,
+    "npu:1": 4.45,
+    "npu:2": 4.44,
+    "npu:3": 4.08
+   },
+   "allocated_gib": {
+    "npu:0": 18.62,
+    "npu:1": 4.39,
+    "npu:2": 4.38,
+    "npu:3": 4.02
+   },
+   "tier": {
+    "hits": 1208,
+    "misses": 42676,
+    "bytes": 1510279741440,
+    "slots": 273,
+    "oom_skips": 0
+   },
+   "build_s": 43.3,
+   "graph_probe": null
+  }
+ ]
+}
