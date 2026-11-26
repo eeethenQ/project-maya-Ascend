@@ -1763,14 +1763,14 @@ def main() -> int:
         if "concurrent" in only:
             def _concurrent() -> None:
                 rc = concurrent_prefill_decode(run, ids, a.gen, a.max_context, devices,
-                                               "concurrent-2k", a.eos)
+                                               "concurrent-2k", a.eos, n=a.parallel)
                 rc.update({"cards": cards, "device": a.device, "tier_slots": run.expert_slots})
                 rec.add(rc)
             guard("concurrent-2k", _concurrent)
         if "control" in only:
             def _control() -> None:
                 rk = concurrent_prefill_decode(run, short, a.gen, a.max_context, devices,
-                                               "control-short", a.eos)
+                                               "control-short", a.eos, n=a.parallel)
                 rk.update({"cards": cards, "device": a.device, "tier_slots": run.expert_slots})
                 rec.add(rk)
             guard("control-short", _control)
