@@ -1,4 +1,7 @@
-# 2 000-token serve measurement - one card (physical 4), four cards still faulted
+# 2 000-token serve measurement - one card (physical 4)
+
+> **Correction 2026-11-26.** The four-card traps described in section 5 were **our Triton kernels, not the
+> hardware**; the section is kept as written and the correction is at its end.
 
 Date 2026-11-25 18:31-20:35 Asia/Shanghai.  Host `blue-910b3`, 8 x 910B3 (64 GB each).
 Container `maya-ascend-dev`, `ASCEND_RT_VISIBLE_DEVICES=4` -> logical `npu:0` is **physical card 4**.
@@ -92,7 +95,7 @@ Measured peak at 8 concurrent 2k is **33.72 GiB on card 4**, so it was run at `-
 the measured peak, not observed.  The same card ran 1 and 4 concurrent at peaks 26.97 and 30.03 GiB.
 No OOM occurred in any arm reported here (`oom_skips = 0`, no ERR lines).
 
-## 5. Four cards (physical 4-7): still unusable
+## 5. Four cards (physical 4-7): the attempts, and the correction
 
 Every four-card attempt on 2026-11-25 faulted or wedged, before and after the claimed reboot:
 
@@ -114,6 +117,34 @@ excluding card 5 (3-card 4,6,7) wedges instead.  `npu-smi set -t reset -i 4..7 -
 ("User aborts reset server by inband").  Note `uptime` shows the host is still on the **11:17 boot** (no
 reboot happened on this host), so the fault has not been cleared.  Logs:
 `ascend/results/diag-20261125/` (`p8.log`, `d3c.log`, `card5.log`, plus the earlier set).
+
+### Correction, 2026-11-26: the fault was ours, not the machine's
+
+The paragraph above is wrong about where the fault lives.  Every attempt in that table ran with the Triton
+kernels enabled; the controls switched off the graph lease and, once, the expert tier - never the kernels.
+The control that settles it is the one that was missing: the same four-card workload with the kernels
+**disabled** runs, and the traps return when they are switched back on.  So the four cards were never
+unusable, and the day spent on resets, reboots and a suspected HCCS link was spent on the wrong layer.
+
+The mechanism is in the launch, not the link.  Triton's Ascend launcher takes the launch card from
+`torch.npu.current_device()`, not from the pointers it is handed
+(`triton/backends/ascend/driver.py`, `get_current_device`).  `runtime.build` claims each expert card's share
+in a loop (`for d in pool: resolve_device(d, ...)`) and each `resolve_device` calls `torch.npu.set_device`,
+so building a four-card tier **leaves the last expert card current** while the layers and their activations
+are on the compute card.  A kernel launched there dereferences card 0's virtual addresses from card 3 (or
+the reverse) - reported as `MTE accesses an invalid GM address or the cross-device memory access times out`,
+asynchronously, at whatever operator is running when the device notices.  In this case the device named our
+own operator: `_quant_row`.
+
+What made the wrong conclusion attractive is worth keeping, because it is the general trap: `npu-smi` health
+was OK on every chip, a copy+peer-event probe between cards passed, single-card work was unaffected, and a
+host reboot changed nothing - four signals each consistent with a bad link, and none of them a test of the
+launch card of a kernel.  The one piece of evidence pointing at the code was in the error text, and it was
+discounted.
+
+The fix, in the Triton wrappers (`ascend/dsv41/triton_device.py`), has every kernel assert that its operands
+share one card and switch to that card for the launch, restoring the caller's card afterwards.  The bar for
+the next "hardware" verdict: a run with the suspect software path disabled, before any reset or reboot.
 
 ## 6. Read-ahead and page-cache regime
 

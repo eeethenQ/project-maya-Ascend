@@ -370,18 +370,21 @@ short-prompt control at the same concurrency gives 1.13 tokens/s, and 2 000-toke
 without changing the rate.  Eight at once also needs **33.7 GiB**, above the 32 GiB the process is normally held
 to (`--hbm-share 0.85` was needed), so one card cannot serve eight 2k conversations within the per-process cap.
 
-**The four-card eight-way number is not measured, and the reason is the machine rather than the engine.**
-This host's last boot was 11:17 today and since then **cross-card access faults**: any second card traps with
-`MTE accesses an invalid GM address or cross-device memory access times out`, at `rtEventRecord` when
-recording an event on a peer card, reproducibly and identically on chips 5 and 7, with graphs on and off,
-with the tier large and disabled, in the serve engine and in a plain eager runtime. Single-card work is
-unaffected (the 181.7 s above and a full 225-test suite ran on one card). Cards 0-3 are usable in principle
-but were held by another tenant's benchmark, and cards 4-7 are the ones in the faulted state. In-band chip
-reset is refused by the platform (`User aborts reset server by inband`), including the `-d` and `-m 1`
-variants, so clearing it needs an out-of-band reset or a host reboot - which on a shared box also kills the
-other tenants' jobs, and was therefore not done unilaterally. The failure logs and card snapshots are in
-[`ascend/results/diag-20261125/`](ascend/results/diag-20261125/) and the write-up in
-[`ascend/results/serve-2k8-REPORT.md`](ascend/results/serve-2k8-REPORT.md).
+**The four-card eight-way number is still not measured - and the reason first written here, a hardware
+fault, was wrong.**  For a day any second card trapped with `MTE accesses an invalid GM address or
+cross-device memory access times out`, and four independent signals - `npu-smi` health OK, a copy plus
+peer-event probe between cards passing, single-card work unaffected, and a reboot that changed nothing -
+all read as a faulted chip.  The control that settled it was the one not yet run: the same four-card
+workload with the Triton kernels **disabled** runs.  The fault was in our own wrappers.  Triton's Ascend
+launcher takes its launch card from `torch.npu.current_device()`, not from the pointers it is handed, and
+`runtime.build`'s expert-device loop leaves the last expert card current - so a kernel whose tensors were
+on the compute card ran on the last expert card and dereferenced another card's virtual addresses.  The
+device named the culprit itself: the trap was at our operator `_quant_row`.  The wrappers now refuse
+mixed-card operands by name and make the operands' card current for the launch
+(`ascend/dsv41/triton_device.py`), which is what the four-card 8 x 2k run was waiting on.  The logs and
+card snapshots from the faulted period are in
+[`ascend/results/diag-20261125/`](ascend/results/diag-20261125/), and
+[`ascend/results/serve-2k8-REPORT.md`](ascend/results/serve-2k8-REPORT.md) carries the correction.
 
 For scale, the two multi-request results that do exist: 4 x 2 000 tokens on four cards ran **1.65x** the
 aggregate of a serial serve path, and 4 x short prompts **2.10x**, with client TTFT for the short case going
