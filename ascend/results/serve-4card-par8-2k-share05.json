@@ -1,0 +1,186 @@
+{
+ "summary": {
+  "run_s": 521.6,
+  "cards": [
+   "npu:0",
+   "npu:1",
+   "npu:2",
+   "npu:3"
+  ],
+  "visible": "0,1,2,3",
+  "device": "npu:0",
+  "mode": "concurrent",
+  "parallel": 8,
+  "hbm_share": 0.5,
+  "expert_reserve_gib": 13.0,
+  "max_context": 2048,
+  "prompt_tokens": 2000,
+  "gen": 32,
+  "scenarios": 1,
+  "graph": false
+ },
+ "records": [
+  {
+   "scenario": "concurrent-2k",
+   "prompt_tokens": 2000,
+   "max_context": 2048,
+   "requests": 8,
+   "gen_tokens": 32,
+   "succeeded": 2,
+   "errors": [
+    "Traceback (most recent call last):\n  File \"/workspace/project-maya-Ascend/ascend/bench_serve.py\", line 346, in worker\n    logits = run.model.forward([tok], state, logits_last_only=True)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.12.16/lib/python3.12/site-packages/torch/utils/_contextlib.py\", line 124, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2175, in forward\n    x = self._eager_layers(h, pre, state, positions, host_positions, engram_rows,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2070, in _eager_layers\n    h, pre = self._layer_eager(li, h, pre, state, positions, host_positions, engram_rows,\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2062, in _layer_eager\n    h = self.hc_post(self.moe(li, x), res, f_post, f_comb)\n                     ^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1920, in moe\n    y = self._routed_sum(li, x.to(dev), idx.to(dev), wts.to(dev)).to(x.device)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1943, in _routed_sum\n    return self._routed_one(li, x, idx, wts)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1999, in _routed_one\n    blocks = self.weights.experts.fetch_int8(li, batch)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 983, in fetch_int8\n    return self._blocks(layer, experts, insert=insert)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 924, in _blocks\n    fresh = self._read_many(layer, [e for _, e in missing])\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 853, in _read_many\n    q = views[:n].to(device, non_blocking=True, copy=True)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntorch.OutOfMemoryError: NPU out of memory. Tried to allocate 68.00 MiB (NPU 1; 60.96 GiB total capacity; 25.90 GiB already allocated; 25.90 GiB current active; 30.04 GiB free; 30.48 GiB allowed; 30.47 GiB reserved in total by PyTorch).If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.\n",
+    "Traceback (most recent call last):\n  File \"/workspace/project-maya-Ascend/ascend/bench_serve.py\", line 346, in worker\n    logits = run.model.forward([tok], state, logits_last_only=True)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.12.16/lib/python3.12/site-packages/torch/utils/_contextlib.py\", line 124, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2175, in forward\n    x = self._eager_layers(h, pre, state, positions, host_positions, engram_rows,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2070, in _eager_layers\n    h, pre = self._layer_eager(li, h, pre, state, positions, host_positions, engram_rows,\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2062, in _layer_eager\n    h = self.hc_post(self.moe(li, x), res, f_post, f_comb)\n                     ^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1920, in moe\n    y = self._routed_sum(li, x.to(dev), idx.to(dev), wts.to(dev)).to(x.device)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1943, in _routed_sum\n    return self._routed_one(li, x, idx, wts)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2003, in _routed_one\n    self.expert_block(xq, xs, b1[0], b1[1], b3[0], b3[1], b2[0], b2[1],\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1837, in expert_block\n    g_raw = self.expert_mm_raw(xq, w1, s1)\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1816, in expert_mm_raw\n    return torch_npu.npu_quant_matmul(xq, q[0].T, scale.view(-1), output_dtype=torch.bfloat16)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.12.16/lib/python3.12/site-packages/torch/_ops.py\", line 1209, in __call__\n    return self._op(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^\ntorch.OutOfMemoryError: NPU out of memory. Tried to allocate 18.00 MiB (NPU 1; 60.96 GiB total capacity; 25.89 GiB already allocated; 25.89 GiB current active; 30.04 GiB free; 30.48 GiB allowed; 30.47 GiB reserved in total by PyTorch).If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.\n",
+    "Traceback (most recent call last):\n  File \"/workspace/project-maya-Ascend/ascend/bench_serve.py\", line 346, in worker\n    logits = run.model.forward([tok], state, logits_last_only=True)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.12.16/lib/python3.12/site-packages/torch/utils/_contextlib.py\", line 124, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2175, in forward\n    x = self._eager_layers(h, pre, state, positions, host_positions, engram_rows,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2070, in _eager_layers\n    h, pre = self._layer_eager(li, h, pre, state, positions, host_positions, engram_rows,\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2062, in _layer_eager\n    h = self.hc_post(self.moe(li, x), res, f_post, f_comb)\n                     ^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1920, in moe\n    y = self._routed_sum(li, x.to(dev), idx.to(dev), wts.to(dev)).to(x.device)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1943, in _routed_sum\n    return self._routed_one(li, x, idx, wts)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2003, in _routed_one\n    self.expert_block(xq, xs, b1[0], b1[1], b3[0], b3[1], b2[0], b2[1],\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1837, in expert_block\n    g_raw = self.expert_mm_raw(xq, w1, s1)\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1816, in expert_mm_raw\n    return torch_npu.npu_quant_matmul(xq, q[0].T, scale.view(-1), output_dtype=torch.bfloat16)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.12.16/lib/python3.12/site-packages/torch/_ops.py\", line 1209, in __call__\n    return self._op(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^\ntorch.OutOfMemoryError: NPU out of memory. Tried to allocate 18.00 MiB (NPU 1; 60.96 GiB total capacity; 25.91 GiB already allocated; 25.91 GiB current active; 30.04 GiB free; 30.48 GiB allowed; 30.47 GiB reserved in total by PyTorch).If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.\n",
+    "Traceback (most recent call last):\n  File \"/workspace/project-maya-Ascend/ascend/bench_serve.py\", line 346, in worker\n    logits = run.model.forward([tok], state, logits_last_only=True)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.12.16/lib/python3.12/site-packages/torch/utils/_contextlib.py\", line 124, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2175, in forward\n    x = self._eager_layers(h, pre, state, positions, host_positions, engram_rows,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2070, in _eager_layers\n    h, pre = self._layer_eager(li, h, pre, state, positions, host_positions, engram_rows,\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2062, in _layer_eager\n    h = self.hc_post(self.moe(li, x), res, f_post, f_comb)\n                     ^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1920, in moe\n    y = self._routed_sum(li, x.to(dev), idx.to(dev), wts.to(dev)).to(x.device)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1943, in _routed_sum\n    return self._routed_one(li, x, idx, wts)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1999, in _routed_one\n    blocks = self.weights.experts.fetch_int8(li, batch)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 983, in fetch_int8\n    return self._blocks(layer, experts, insert=insert)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 924, in _blocks\n    fresh = self._read_many(layer, [e for _, e in missing])\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 853, in _read_many\n    q = views[:n].to(device, non_blocking=True, copy=True)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntorch.OutOfMemoryError: NPU out of memory. Tried to allocate 68.00 MiB (NPU 3; 60.96 GiB total capacity; 25.93 GiB already allocated; 25.93 GiB current active; 30.11 GiB free; 30.48 GiB allowed; 30.46 GiB reserved in total by PyTorch).If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.\n",
+    "Traceback (most recent call last):\n  File \"/workspace/project-maya-Ascend/ascend/bench_serve.py\", line 346, in worker\n    logits = run.model.forward([tok], state, logits_last_only=True)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.12.16/lib/python3.12/site-packages/torch/utils/_contextlib.py\", line 124, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2175, in forward\n    x = self._eager_layers(h, pre, state, positions, host_positions, engram_rows,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2070, in _eager_layers\n    h, pre = self._layer_eager(li, h, pre, state, positions, host_positions, engram_rows,\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2062, in _layer_eager\n    h = self.hc_post(self.moe(li, x), res, f_post, f_comb)\n                     ^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1920, in moe\n    y = self._routed_sum(li, x.to(dev), idx.to(dev), wts.to(dev)).to(x.device)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1943, in _routed_sum\n    return self._routed_one(li, x, idx, wts)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1999, in _routed_one\n    blocks = self.weights.experts.fetch_int8(li, batch)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 983, in fetch_int8\n    return self._blocks(layer, experts, insert=insert)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 924, in _blocks\n    fresh = self._read_many(layer, [e for _, e in missing])\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 853, in _read_many\n    q = views[:n].to(device, non_blocking=True, copy=True)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntorch.OutOfMemoryError: NPU out of memory. Tried to allocate 68.00 MiB (NPU 3; 60.96 GiB total capacity; 25.89 GiB already allocated; 25.89 GiB current active; 30.09 GiB free; 30.48 GiB allowed; 30.44 GiB reserved in total by PyTorch).If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.\n",
+    "Traceback (most recent call last):\n  File \"/workspace/project-maya-Ascend/ascend/bench_serve.py\", line 346, in worker\n    logits = run.model.forward([tok], state, logits_last_only=True)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.12.16/lib/python3.12/site-packages/torch/utils/_contextlib.py\", line 124, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2175, in forward\n    x = self._eager_layers(h, pre, state, positions, host_positions, engram_rows,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2070, in _eager_layers\n    h, pre = self._layer_eager(li, h, pre, state, positions, host_positions, engram_rows,\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 2062, in _layer_eager\n    h = self.hc_post(self.moe(li, x), res, f_post, f_comb)\n                     ^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1920, in moe\n    y = self._routed_sum(li, x.to(dev), idx.to(dev), wts.to(dev)).to(x.device)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1943, in _routed_sum\n    return self._routed_one(li, x, idx, wts)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 1999, in _routed_one\n    blocks = self.weights.experts.fetch_int8(li, batch)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 983, in fetch_int8\n    return self._blocks(layer, experts, insert=insert)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 924, in _blocks\n    fresh = self._read_many(layer, [e for _, e in missing])\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/project-maya-Ascend/ascend/dsv41/model.py\", line 853, in _read_many\n    q = views[:n].to(device, non_blocking=True, copy=True)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\ntorch.OutOfMemoryError: NPU out of memory. Tried to allocate 68.00 MiB (NPU 1; 60.96 GiB total capacity; 25.89 GiB already allocated; 25.89 GiB current active; 30.04 GiB free; 30.48 GiB allowed; 30.47 GiB reserved in total by PyTorch).If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.\n"
+   ],
+   "wall_s": 479.64,
+   "ttft_s": 312.49,
+   "ttft_s_list": [
+    312.49,
+    312.49
+   ],
+   "ttft_median_s": 312.49,
+   "ttft_spread_s": 0.0,
+   "ttft_sum_over_wall": 1.3,
+   "ttft_slowest_over_fastest": 1.0,
+   "first_token_spread_s": 0.0,
+   "decode_tok_s": 0.38,
+   "wall_tok_s": 0.13,
+   "decode_steps_total": 64,
+   "decode_tok_s_per_request": [
+    0.19,
+    0.19
+   ],
+   "decode_ms_median_per_request": [
+    5190.7,
+    5016.6
+   ],
+   "tokens_identical": false,
+   "token_streams": [
+    [
+     64528,
+     7743,
+     5395,
+     2272,
+     74,
+     1269,
+     5426,
+     2699,
+     21592,
+     17,
+     559,
+     306,
+     1709,
+     41178,
+     17,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     22604,
+     30,
+     3713,
+     5451,
+     5635,
+     32,
+     53091,
+     4374
+    ],
+    [
+     64528,
+     7743,
+     5395,
+     2272,
+     74,
+     1269,
+     5426,
+     2699,
+     21592,
+     17,
+     559,
+     306,
+     1709,
+     41178,
+     17,
+     53091,
+     4374,
+     1465,
+     13582,
+     22,
+     16,
+     19,
+     7505,
+     64528,
+     22604,
+     369,
+     2619,
+     53091,
+     4374,
+     1465,
+     13582,
+     22
+    ]
+   ],
+   "per_request": [
+    {
+     "ttft_s": 312.494,
+     "first_token": 64528,
+     "decode_steps": 32,
+     "decode_s": 167.084,
+     "decode_tok_s": 0.192,
+     "decode_ms_median": 5190.726,
+     "end_s": 479.578
+    },
+    {
+     "ttft_s": 312.491,
+     "first_token": 64528,
+     "decode_steps": 32,
+     "decode_s": 166.031,
+     "decode_tok_s": 0.193,
+     "decode_ms_median": 5016.56,
+     "end_s": 478.521
+    }
+   ],
+   "tier": {
+    "hits": 45551,
+    "misses": 98203,
+    "hit_rate": 0.3169,
+    "gb_read": 3475.07,
+    "gb_read_per_request": 434.38,
+    "slots": 2325,
+    "oom_skips": 1
+   },
+   "peak_gib": {
+    "npu:0": 25.06,
+    "npu:1": 25.93,
+    "npu:2": 23.76,
+    "npu:3": 26.01
+   },
+   "allocated_gib": {
+    "npu:0": 18.48,
+    "npu:1": 25.82,
+    "npu:2": 23.71,
+    "npu:3": 25.89
+   },
+   "cards": [
+    "npu:0",
+    "npu:1",
+    "npu:2",
+    "npu:3"
+   ],
+   "device": "npu:0",
+   "tier_slots": 2391,
+   "io": {
+    "read_gb": 10.96,
+    "rchar_gb": 3475.59
+   }
+  }
+ ]
+}

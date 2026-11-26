@@ -31,6 +31,8 @@ import os
 
 import torch
 
+from .triton_device import operand_device, select
+
 _CACHE: "dict[str, object]" = {}
 _ERROR = ""
 _LOADED = False
@@ -199,13 +201,16 @@ def gate_up_swiglu_q8(g_raw: torch.Tensor, u_raw: torch.Tensor, xs: torch.Tensor
     gate_up = kernels[0]
     g_raw = g_raw.contiguous()
     u_raw = u_raw.contiguous()
+    xs = xs.contiguous()
     rows, n = int(g_raw.shape[0]), int(g_raw.shape[1])
     if hq is None:
         hq = torch.empty((rows, n), dtype=torch.int8, device=g_raw.device)
     if hs is None:
         hs = torch.empty((rows, 1), dtype=torch.float32, device=g_raw.device)
-    gate_up[(rows,)](g_raw, u_raw, xs, hq, hs, float(lim), N=n, BLOCK=_block(n, _GATE_UP_CAP),
-                     XS_STRIDE=0 if int(xs.numel()) == 1 else 1)
+    device = operand_device("gate_up_swiglu_q8", g_raw=g_raw, u_raw=u_raw, xs=xs, hq=hq, hs=hs)
+    with select(device):
+        gate_up[(rows,)](g_raw, u_raw, xs, hq, hs, float(lim), N=n, BLOCK=_block(n, _GATE_UP_CAP),
+                         XS_STRIDE=0 if int(xs.numel()) == 1 else 1)
     calls += 1
     return hq, hs
 
@@ -222,7 +227,10 @@ def down_epilogue(d_raw: torch.Tensor, hs: torch.Tensor, w: torch.Tensor, y: tor
         w = w.reshape(1)
         if rows != 1:
             w = w.expand(rows)                 # a scalar route weight, one per row
-    down[(rows,)](d_raw, hs, w.contiguous(), y, N=n, BLOCK=_block(n, _DOWN_CAP))
+    w = w.contiguous()
+    device = operand_device("down_epilogue", d_raw=d_raw, hs=hs, w=w, y=y)
+    with select(device):
+        down[(rows,)](d_raw, hs, w, y, N=n, BLOCK=_block(n, _DOWN_CAP))
     calls += 1
 
 
@@ -239,8 +247,11 @@ def down_sum(diag: torch.Tensor, hs: torch.Tensor, w: torch.Tensor, y: torch.Ten
     if kernels is None:
         raise RuntimeError(f"the expert kernel is unavailable: {_ERROR}")
     down = kernels[2]
-    down[(1,)](diag, hs, w.contiguous(), y, N=int(hidden), ROW_STRIDE=int(row_stride),
-               ROWS=int(rows), BLOCK=_block(hidden, _DOWN_CAP))
+    w = w.contiguous()
+    device = operand_device("down_sum", diag=diag, hs=hs, w=w, y=y)
+    with select(device):
+        down[(1,)](diag, hs, w, y, N=int(hidden), ROW_STRIDE=int(row_stride),
+                   ROWS=int(rows), BLOCK=_block(hidden, _DOWN_CAP))
     calls += 1
 
 

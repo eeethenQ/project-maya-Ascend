@@ -44,6 +44,8 @@ import os
 
 import torch
 
+from .triton_device import operand_device, select
+
 _CACHE: "dict[tuple, str]" = {}
 _ERROR = ""
 _LOADED = False
@@ -147,8 +149,10 @@ def enabled(q: torch.Tensor, keys: torch.Tensor, valid: torch.Tensor, sink: torc
 
 def _run(q, keys, valid, sink, out, scale: float) -> None:
     kernel = _load()
-    kernel[(int(q.shape[0]) // BM,)](q, keys, valid, sink, out, float(scale),
-                                     N=int(keys.shape[0]), D=int(q.shape[1]), BM=BM, BN=BN)
+    device = operand_device("sparse_attn", q=q, keys=keys, valid=valid, sink=sink, out=out)
+    with select(device):
+        kernel[(int(q.shape[0]) // BM,)](q, keys, valid, sink, out, float(scale),
+                                         N=int(keys.shape[0]), D=int(q.shape[1]), BM=BM, BN=BN)
 
 
 def warm(device: torch.device | str, heads: int, dim: int, widths) -> None:

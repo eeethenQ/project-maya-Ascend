@@ -1,0 +1,56 @@
+{
+ "note": "expert bytes and page-cache evidence for the four-card arms; io sampled by the host every 2 s from /proc/<pid>/io",
+ "arms": [
+  {
+   "arm": "par4-share05",
+   "wall_s": 411.9,
+   "ttft_s": 318.37,
+   "requests": 4,
+   "succeeded": 4,
+   "tier_gb_read": 1802.6,
+   "tier_gb_read_per_request": 450.65,
+   "io_rchar_gb": 1793.15,
+   "io_read_gb": 287.47,
+   "page_cache_fraction": 0.8397,
+   "prefill_gb": 1467.45,
+   "decode_gb": 325.7,
+   "decode_gb_per_step": 2.545,
+   "decode_steps": 128,
+   "method": "rchar split at scenario_start+build+TTFT; scenario_start=first /proc/io sample+41s build; tier counter agrees within 0.03%"
+  },
+  {
+   "arm": "par8-share05-failed",
+   "wall_s": 479.64,
+   "ttft_s": 312.49,
+   "requests": 8,
+   "succeeded": 2,
+   "tier_gb_read": 3475.07,
+   "tier_gb_read_per_request": 434.38,
+   "io_rchar_gb": 3468.75,
+   "io_read_gb": 10.93,
+   "page_cache_fraction": 0.9969,
+   "prefill_gb": 2937.7,
+   "decode_gb": 531.05,
+   "decode_gb_per_step": 8.298,
+   "decode_steps": 64,
+   "method": "rchar split at scenario_start+build+TTFT; scenario_start=first /proc/io sample+41s build; tier counter agrees within 0.03%"
+  },
+  {
+   "arm": "par8-share085",
+   "wall_s": 497.98,
+   "ttft_s": 339.61,
+   "requests": 8,
+   "succeeded": 8,
+   "tier_gb_read": 3250.94,
+   "tier_gb_read_per_request": 406.37,
+   "io_rchar_gb": 3249.55,
+   "io_read_gb": 3.03,
+   "page_cache_fraction": 0.9991,
+   "prefill_gb": 2940.99,
+   "decode_gb": 308.56,
+   "decode_gb_per_step": 1.205,
+   "decode_steps": 256,
+   "method": "rchar split at scenario_start+build+TTFT; scenario_start=first /proc/io sample+41s build; tier counter agrees within 0.03%"
+  }
+ ]
+}

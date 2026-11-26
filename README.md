@@ -362,7 +362,8 @@ where the numbers are thinnest, so here is exactly what is and is not measured.
 | **8 requests, 1 card** | **301.4 s** median (267.7-313.2, spread 45.5) | **1.10 tok/s** aggregate, 0.155-0.166 per request | 44.7% hit, 339.9 GB per request, 6.36 GB/step | **33.7 GiB** | one card (physical npu:4), at `--hbm-share 0.85`; the 32 GiB share cannot hold it.  Graph capture failed on this run (`npuSynchronizeDevice` 107027) so it ran eager |
 | 4 requests, 1 card | 113.9 s | 1.30 tok/s aggregate | 43.3% hit | 30.0 GiB | |
 | 1 request, 1 card, warm cache | 77.2 s | 1.12 tok/s | 13.6% hit | 27.0 GiB | the same run cold gives 181.7 s - a 2.35x regime effect, not a concurrency one |
-| **8 requests, 4 cards** | **not measured** | - | - | - | see below |
+| **8 requests, 4 cards** | **339.6 s** (spread **0.05 s**) | **1.62 tok/s** aggregate, 0.20-0.21 each | 36.9% hit, 406.4 GB/request, 1.21 GB/step | **39.6/24.4/21.7/24.1 GiB** | eager, `--hbm-share 0.85`; **does not fit the 32 GiB share** |
+| 4 requests, 4 cards | 318.4 s | 1.37 tok/s aggregate | 29.9% hit, 450.7 GB/request | - | eager |
 
 **On one card, eight concurrent 2 000-token requests saturate at about 1.1-1.3 aggregate tokens/s** - the same
 figure as a single request, because the concurrency cost sits in the decode path and not in the prefill: the
@@ -370,21 +371,18 @@ short-prompt control at the same concurrency gives 1.13 tokens/s, and 2 000-toke
 without changing the rate.  Eight at once also needs **33.7 GiB**, above the 32 GiB the process is normally held
 to (`--hbm-share 0.85` was needed), so one card cannot serve eight 2k conversations within the per-process cap.
 
-**The four-card eight-way number is still not measured - and the reason first written here, a hardware
-fault, was wrong.**  For a day any second card trapped with `MTE accesses an invalid GM address or
-cross-device memory access times out`, and four independent signals - `npu-smi` health OK, a copy plus
-peer-event probe between cards passing, single-card work unaffected, and a reboot that changed nothing -
-all read as a faulted chip.  The control that settled it was the one not yet run: the same four-card
-workload with the Triton kernels **disabled** runs.  The fault was in our own wrappers.  Triton's Ascend
-launcher takes its launch card from `torch.npu.current_device()`, not from the pointers it is handed, and
-`runtime.build`'s expert-device loop leaves the last expert card current - so a kernel whose tensors were
-on the compute card ran on the last expert card and dereferenced another card's virtual addresses.  The
-device named the culprit itself: the trap was at our operator `_quant_row`.  The wrappers now refuse
-mixed-card operands by name and make the operands' card current for the launch
-(`ascend/dsv41/triton_device.py`), which is what the four-card 8 x 2k run was waiting on.  The logs and
-card snapshots from the faulted period are in
-[`ascend/results/diag-20261125/`](ascend/results/diag-20261125/), and
-[`ascend/results/serve-2k8-REPORT.md`](ascend/results/serve-2k8-REPORT.md) carries the correction.
+**Eight concurrent 2 000-token requests do not fit the 32 GiB share.** At `--hbm-share 0.85` the four-card
+run completes - **339.6 s TTFT with a 0.05 s spread across the eight**, 1.62 tok/s aggregate (0.20-0.21 each),
+497.98 s wall, 36.9% tier hit - but it peaks at **39.6 GiB on the compute card**, 1.30x half a card. At the
+`0.5` share these numbers use, **six of the eight decoders die at the 30.48 GiB cap**; all eight prefills fit,
+and the largest concurrency that runs inside the share is **four** (318.4 s, 1.37 tok/s aggregate). So eight 2k
+conversations are possible if one process may take 39.6 GiB of a 61 GiB card, and not possible inside 32 GiB.
+
+Two things about that run: it is **eager**, because the harness builds with graphs off, so 1.62 tok/s is not the
+captured path; and the page cache was 99.9% hot, which is why its TTFT is far below the cold-cache 2 000-token
+figures above. The block I attributed to the machine was ours all along - the Triton wrappers launched on
+`torch.npu.current_device()` while their operands were on another card, fixed in `triton_device.py` with an
+operand-device assertion.
 
 For scale, the two multi-request results that do exist: 4 x 2 000 tokens on four cards ran **1.65x** the
 aggregate of a serial serve path, and 4 x short prompts **2.10x**, with client TTFT for the short case going

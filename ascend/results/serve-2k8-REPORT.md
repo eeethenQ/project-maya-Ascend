@@ -1,180 +1,185 @@
-# 2 000-token serve measurement - one card (physical 4)
+# 2 000-token serve on four 910B3 cards - 8 concurrent, and the Triton cross-card fix
 
-> **Correction 2026-11-26.** The four-card traps described in section 5 were **our Triton kernels, not the
-> hardware**; the section is kept as written and the correction is at its end.
+Date 2026-11-26 23:21 - 2026-11-27 00:2x Asia/Shanghai.  Host `blue-910b3` (rebooted 23:04:57),
+container `maya-ascend-dev`.  **Physical cards 0-3** (`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3`), all four
+health OK and no other process on 0-3 before every run (`npu-smi info` checked; cards 4-7 idle
+throughout).  Benchmark engine: `rt.build(..., graphs=False)`, resident **15.09 GiB** on npu:0, tier
+**2 391 slots** at `hbm_share 0.5` / reserve 13 GiB (**4 979 slots** at 0.85), build ~40 s.  These
+numbers are **eager**: `bench_serve` builds its 2 000-token engine with `graphs=False`, so no graph was
+captured in these arms.  The spread-tier capture path is proven separately by the parity suite (section 4).
 
-Date 2026-11-25 18:31-20:35 Asia/Shanghai.  Host `blue-910b3`, 8 x 910B3 (64 GB each).
-Container `maya-ascend-dev`, `ASCEND_RT_VISIBLE_DEVICES=4` -> logical `npu:0` is **physical card 4**.
-**Every number below is one card.**  Four-card numbers do not exist (section 5).
+## 0. The result in one line
 
-Engine for every run: `serve_engine.Engine`, `--graphs --hbm-share 0.85 --reserve 26
---max-context 2048 --prefill-chunk 2048`; build 37-38 s, resident 15.09 GiB, tier **294 slots /
-9.69 GiB**, KV 0.0146 GiB per conversation.  2 000-token prompts are 2 000-token slices of README.md
-(distinct per request), 32 greedy tokens.  `--parallel N` gives N conversation slots; all requests are
-submitted at once, so none queued in any arm (`queued_requests = 0`).
+**8 x 2 000 tokens does not fit the 30.5 GiB half-card share: all eight prefills complete, then six of
+the eight decoders OOM.  At `hbm_share 0.85` (51.8 GiB) all eight run: TTFT 339.61 s (spread 0.05 s),
+aggregate decode 1.62 tok/s, wall 497.98 s, peak 39.61 / 24.41 / 21.70 / 24.09 GiB on npu:0..3.**
+The largest concurrency that ran inside the half-card share on four cards is **4** (section 3).
 
-## 1. 8 concurrent x 2 000 tokens (single run, one card)
+## 1. 8 x 2 000 tokens, four cards - the headline run (share 0.85, eager)
 
-| quantity | value |
-|---|---|
-| **TTFT per request (s)** | rid1 **313.21**, rid2 302.62, rid3 302.08, rid4 301.44, rid5 301.39, rid6 301.30, rid7 267.68, rid8 267.79 |
-| TTFT median / spread | **301.42 s** / **45.54 s** (min 267.68, max 313.21) |
-| **aggregate decode** | **1.10 tok/s** (248 steps total, 31 per request) |
-| **per-request decode** | 0.166, 0.161, 0.162, 0.161, 0.162, 0.162, 0.155, 0.156 tok/s (median step **6.36 s**) |
-| **wall clock** | **501.27 s** (prefill phase 313.23 s) |
-| **peak HBM** | **33.72 GiB** (card 4) |
-| **tier hit rate** | **44.7%** overall (prefill 61.0%, decode 20.7%); 294 slots, 0 OOM skips |
-| **GB read / request** | **339.93 GB** (142.89 GB in the prefill, 197.04 GB in decode) |
-| **GB read / decode step** | **6.36 GB** |
-| page-cache regime | **warm**: rchar 2 719.67 GB vs read_bytes 121.59 GB -> **95.5% from page cache** |
-| graph lease | capture **failed**: `GraphRunnerError: capture 'g_post.0' failed ... npuSynchronizeDevice ... error code 107027`; engine logged "graphs: disabled after a capture/replay failure" and ran all 8 conversations **eager** |
-
-Command and duration (11:52:17Z -> 12:01:27Z, 9 m 10 s incl. build):
-
-    ASCEND_RT_VISIBLE_DEVICES=4 python3 -m ascend.bench_par \
-      --model /mnt/weights/Eco-Tech-DeepSeek-V4.1-Flash-1017-w8a8 \
-      --tokenizer /mnt/weights/DeepSeek-V4-Flash-0731-w8a8/tokenizer.json \
-      --cards npu:0 --parallel 8 --prompt-tokens 2000 --gen 32 \
-      --reserve 26 --hbm-share 0.85 --arm 2k \
-      --json ascend/results/serve-1card-par8-2k.json
-
-Result: `ascend/results/serve-1card-par8-2k.json`.  Single run - no median of runs.
-
-## 2. Scaling: concurrency 1, 4, 8 (one card, 2 000 tokens, 32 generated)
-
-All four arms below use the same engine build shape (tier 294 slots) and the same prompts; only
-`--parallel` changes.  N=1 was run twice: **cold** (first 2k after the box's earlier cold period) and
-**warm**; the warm one is the one to compare.
-
-| N | TTFT mean (s) | TTFT list (s) | spread | aggregate decode | per-request decode | wall (s) | peak HBM | hit rate | GB/request | GB/step |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 1 cold | **181.66** | [181.66] | - | 0.87 tok/s | 0.87 | 218.6 | 26.97 GiB | 13.6% | 555.65 | 5.95 |
-| 1 warm | **77.24** | [77.24] | - | 1.12 tok/s | 1.12 | 105.9 | 26.97 GiB | 13.6% | 555.65 | 5.95 |
-| 4 warm | **113.93** | [113.98, 113.95, 113.94, 113.86] | 0.12 s | 1.30 tok/s | 0.33, 0.33, 0.32, 0.33 | 212.5 | 30.03 GiB | 43.3% (prefill 64.9%) | 361.50 | 7.52 |
-| 8 warm | **294.69** | [313.21, 302.62, 302.08, 301.44, 301.39, 301.30, 267.68, 267.79] | 45.54 s | 1.10 tok/s | 0.15-0.17 | 501.3 | 33.72 GiB | 44.7% (prefill 61.0%) | 339.93 | 6.36 |
-
-Reading the curve:
-* **Aggregate decode saturates at ~1.1-1.3 tok/s on one card** (1.12 -> 1.30 -> 1.10).  It does not scale
-  with concurrency: the expert fetch is serialised by the engine's one-at-a-time fetch lock, and graphs
-  are unavailable once a second conversation is live (capture times out, see section 1).  Per-request
-  decode falls 1.12 -> 0.33 -> 0.16 tok/s.
-* **TTFT is not monotone in N** because the 2k prefill is dominated by expert reads and the arms were run
-  in a warming page cache: N=1 cold 181.66 s vs N=1 warm 77.24 s.  Against the warm N=1, 4 concurrent
-  prefills cost 1.5x (113.9 s) and 8 cost 3.8x (294.7 s) - the eight prefills do not overlap their expert
-  fetches, so the cost is close to the sum of eight single prefills divided by the shared tier's hits
-  (8 x 77 s = 616 s of fetch work against 313 s wall, made up by the 61% prefill hit rate).
-* N=2 was skipped for time (the two ends and N=4 bound the shape); no value is extrapolated.
-
-## 3. Short-prompt control at 8 concurrent (one card)
-
-8 x 8-token prompts, 32 generated tokens, same engine shape:
+`ascend/results/serve-4card-par8-2k.json`; cards 0-3; one 2 000-token README prompt shared by all eight
+conversations (so the token streams are an isolation check); 32 greedy tokens each.  Started 23:57:46;
+wall 497.98 s, process 539.7 s including the 40 s build.
 
 | quantity | value |
 |---|---|
-| TTFT list (s) | 27.46, 27.53, 28.51, 28.73, 28.29, 29.26, 28.18, 27.84; median **28.24**, spread **1.79** |
-| aggregate decode | **1.13 tok/s** |
-| per-request decode | 0.18, 0.18, 0.18, 0.18, 0.18, 0.15, 0.15, 0.18 tok/s |
-| wall | 202.76 s (prefill phase 29.26 s) |
-| peak HBM | 27.63 GiB |
-| hit rate | 24.8% (prefill 56.4%, decode 19.2%) |
-| GB/request, GB/step | 183.33 GB, 7.04 GB/step |
-| page cache | 98.8% (rchar 1 466.86 GB, read 17.17 GB) |
+| **TTFT per request (s)** | 339.63, 339.63, 339.59, 339.63, 339.59, 339.59, 339.63, 339.58 |
+| TTFT median / spread | **339.61 s** / **0.05 s** (min 339.58, max 339.63) |
+| **aggregate decode** | **1.62 tok/s** (256 steps total, 32 per request) |
+| **per-request decode** | 0.21, 0.21, 0.21, 0.21, 0.20, 0.20, 0.21, 0.21 tok/s (median step **4.65-5.13 s**) |
+| **wall clock** | **497.98 s** (prefill/TTFT phase 339.61 s) |
+| **peak HBM per card** | **39.61 / 24.41 / 21.70 / 24.09 GiB** (npu:0..3, torch `max_memory_allocated`) |
+| **tier hit rate** | **36.85%** (53 594 hits / 91 862 misses; 2 788 live slots of 4 979; 0 OOM skips) |
+| **GB read per request** | **406.37 GB** (3 250.94 GB total / 8) |
+| **GB read per decode step** | **1.21 GB** (io split: ~2 941 GB in the 339.6 s prefill, ~309 GB in the 158 s decode / 256 steps) |
+| page-cache regime | **hot: 99.91% from page cache** (`rchar` 3 251.18 GB vs `read_bytes` 3.03 GB) |
+| succeeded | **8 / 8**, no errors; graphs **off / eager** |
 
-The control separates the two costs: at 8 concurrent the **2k prefill adds 294.7 - 28.2 = 266.5 s of
-TTFT** and ~2.7 TB of expert reads, while the **decode rate is the same 1.1 tok/s** with or without the
-long prefill.  The concurrency cost is therefore in the decode path (serialised expert fetch + no
-graphs), not in the prefill alone.
+This run **exceeds the shipped 0.5 share**: its compute-card peak was 39.61 GiB against a 30.48 GiB cap,
+so it is reported as the 0.85 configuration, not as an operation inside the 32 GiB premise.
 
-Result: `ascend/results/serve-1card-par8-short.json`.
+Request isolation: 6 of the 8 token streams are identical; 2 diverge at token 10.  That is the
+direct-drive harness, not the Triton kernels: `bench_serve.concurrent_prefill_decode` calls
+`model.forward` from 8 threads against one shared `ExpertStreamer`, whose pinned staging ring is not
+reentrant (the `serve_engine` path serialises the fetch with a lock; this harness does not).  The
+four-card single-conversation engine output (section 4) is coherent.
 
-## 4. Memory: does 8 x 2k fit the 32 GiB share?
+## 2. 8 x 2 000 tokens at the 0.5 share - precisely what fails
 
-Measured peak at 8 concurrent 2k is **33.72 GiB on card 4**, so it was run at `--hbm-share 0.85`
-(54.4 GiB cap).  At the engine's default 0.5 share the cap is 32 GiB, **below the measured peak**, so
-8 x 2k would not fit there; the 0.5 run was not executed (time), so the 32-GiB failure is inferred from
-the measured peak, not observed.  The same card ran 1 and 4 concurrent at peaks 26.97 and 30.03 GiB.
-No OOM occurred in any arm reported here (`oom_skips = 0`, no ERR lines).
+`ascend/results/serve-4card-par8-2k-share05.json`.  Same eight conversations and tier shape as section 1,
+`hbm_share 0.5` (30.48 GiB cap):
 
-## 5. Four cards (physical 4-7): the attempts, and the correction
+* **all eight prefills completed** (first token at ~312.5 s) - the 2 000-token prefill itself fits;
+* **six of the eight decoders then died** with `torch.OutOfMemoryError` on the expert cards, e.g.
+  `Tried to allocate 68.00 MiB (NPU 1; 25.90 GiB allocated; 30.04 GiB free; 30.48 GiB allowed;
+  30.47 GiB reserved)` in `ExpertStreamer._read_many`, and an 18.00 MiB allocation in `expert_mm_raw`;
+  NPU 3 failed the same way;
+* `succeeded: 2`, wall 479.6 s, peak 25.06 / 25.93 / 23.76 / 26.01 GiB, tier hit 31.7%, 3 475.1 GB read,
+  page cache 99.69%.
 
-Every four-card attempt on 2026-11-25 faulted or wedged, before and after the claimed reboot:
+So 8 x 2 000 does **not** fit the half-card share: resident 15.09 GiB plus the 8 decode working sets
+exhaust the 30.48 GiB cap during decode (the allocator had reserved 30.47 of 30.48 GiB).  The 0.85 peak
+of 39.61 GiB is 1.30x the half-card share, i.e. this is a memory-cap failure, not a tier-size or a
+Triton-path failure (all these arms are eager).
 
-| run | outcome |
+## 3. Concurrency 4 at the 0.5 share (largest N that ran inside the share)
+
+`ascend/results/serve-4card-par4-2k.json` - four conversations, the same 2k prompt, 32 tokens, share
+0.5, reserve 13 GiB (measured through the same function with `n=4`; see the harness note in section 7).
+
+| quantity | value |
 |---|---|
-| 2k, 4 cards, reserve 13/hbm 0.5 | prefill read 100.3 GB then wedged (`dms_event_wait_interrupt`, AICore 0%, no I/O >10 min); killed |
-| 256 tok, 4 cards, 13/0.5 | `ACL stream synchronize failed 507035`; **chipId 5**, `aivec error`, "timeout or trap error" in an expert `weight_scale` `.to(device)` |
-| 256 tok, 4 cards, 22/0.85 | vector-core exception **chipId 5** at `0x12c1d5000000`/+0x574, `aclnnNonzero` |
-| 8 tok, 4 cards, 13/0.5 | vector-core exception **chipId 7** at `0x124e00000000`/+0x4ac, `rtEventRecord` |
-| 8 tok, 2 cards (4,5) | same trap **chipId 5**, `rtEventRecord` |
-| 8 tok, 2 cards, tier disabled | same trap **chipId 5** |
-| **8 x 2k, 4 cards, 26/0.85** (after the lead's "fixed" check) | wall 119.5 s then `aclnnNonzero` **chipId 5**, PCs +0x478/+0x574; peak 23.9/0.6/0.0/0.0 GiB; process killed |
-| **8 tok, 3 cards (4,6,7)** | first forward read 24.8 GB then **wedged** (CPU frozen, AICore 0%) |
-| 1 card (4) or 1 card (5), same engine | **works** (all numbers above; card 5: TTFT 8.0 s, 0.83 tok/s, 101.67 GB, peak 20.3 GiB) |
+| TTFT per request / median / spread | 318.38, 318.37, 318.37, 318.37 s / **318.37 s** / **0.00 s** |
+| aggregate decode | **1.37 tok/s** |
+| per-request decode | 0.34, 0.34, 0.34, 0.34 tok/s (median step 2.97-2.99 s) |
+| wall | **411.9 s** |
+| peak HBM per card | **21.65 / 20.71 / 17.97 / 20.57 GiB** |
+| tier hit rate | **29.92%** (21 748 hits / 50 936 misses; 1 818 live slots) |
+| GB read | **1 802.6 GB total = 450.65 GB/request**; **2.55 GB/decode step** |
+| page cache | **83.97%** cached (`rchar` 1 803.69 GB vs `read_bytes` 287.65 GB) |
+| succeeded / tokens identical | **4 / 4**, all four streams identical |
 
-A small copy+peer-event probe between cards passes, and chips report health OK with 0 ECC errors, but the
-engine's multi-card expert path does not: it faults on whichever non-compute card is reached second, and
-excluding card 5 (3-card 4,6,7) wedges instead.  `npu-smi set -t reset -i 4..7 -c 0 -m 1` is refused
-("User aborts reset server by inband").  Note `uptime` shows the host is still on the **11:17 boot** (no
-reboot happened on this host), so the fault has not been cleared.  Logs:
-`ascend/results/diag-20261125/` (`p8.log`, `d3c.log`, `card5.log`, plus the earlier set).
+N=1 was started at 0.5 but had not finished its 2 000-token prefill within the report window; it was
+stopped to free the cards, so no N=1 number is reported and none is extrapolated.  The short-prompt
+8-way control was not run (time).
 
-### Correction, 2026-11-26: the fault was ours, not the machine's
+## 4. Why the four Triton kernels broke on more than one card, and the fix
 
-The paragraph above is wrong about where the fault lives.  Every attempt in that table ran with the Triton
-kernels enabled; the controls switched off the graph lease and, once, the expert tier - never the kernels.
-The control that settles it is the one that was missing: the same four-card workload with the kernels
-**disabled** runs, and the traps return when they are switched back on.  So the four cards were never
-unusable, and the day spent on resets, reboots and a suspected HCCS link was spent on the wrong layer.
+**Finding.**  `run_dsv41 --expert-devices npu:0..3` with all kernels on died at `chipId:3`, operator
+`_quant_row`, `MTE accesses an invalid GM address or the cross-device memory access times out`.  With
+`ASCEND_LAUNCH_BLOCKING=1` the first fault surfaced in `_sinkhorn_kernel` instead, and the trace printed
+`mixes=npu:0 scale=npu:0 base=npu:0 cur=3` at the warm call; a quant-only bisect reproduced
+`x/q/s=npu:0, cur=3, _quant_row, chipId:3`.  The model's operands agree with each other - the fault is
+the **launch card**.  `runtime.build` calls `resolve_device(d)` for every expert-device entry
+(`ascend/dsv41/runtime.py:114-115`), and that calls `torch.npu.set_device(index)` (`runtime.py:64`),
+leaving card 3 current.  Triton's Ascend launcher takes the launch card from
+`torch.npu.current_device()` (`triton/backends/ascend/driver.py:get_current_device`), not from the
+pointers.  A wrapper that launched without selecting the operands' card ran card 3's kernel against
+card 0's pointers - an async MTE trap that names whichever operator is in flight (`_quant_row` in the
+normal run, `_sinkhorn_kernel` under launch blocking).  On one card current == operand device, which
+is why every single-card run and the whole single-card suite were clean.
 
-The mechanism is in the launch, not the link.  Triton's Ascend launcher takes the launch card from
-`torch.npu.current_device()`, not from the pointers it is handed
-(`triton/backends/ascend/driver.py`, `get_current_device`).  `runtime.build` claims each expert card's share
-in a loop (`for d in pool: resolve_device(d, ...)`) and each `resolve_device` calls `torch.npu.set_device`,
-so building a four-card tier **leaves the last expert card current** while the layers and their activations
-are on the compute card.  A kernel launched there dereferences card 0's virtual addresses from card 3 (or
-the reverse) - reported as `MTE accesses an invalid GM address or the cross-device memory access times out`,
-asynchronously, at whatever operator is running when the device notices.  In this case the device named our
-own operator: `_quant_row`.
+**Fix (launch on the operand's device and assert it).**  New `ascend/dsv41/triton_device.py`:
 
-What made the wrong conclusion attractive is worth keeping, because it is the general trap: `npu-smi` health
-was OK on every chip, a copy+peer-event probe between cards passed, single-card work was unaffected, and a
-host reboot changed nothing - four signals each consistent with a bad link, and none of them a test of the
-launch card of a kernel.  The one piece of evidence pointing at the code was in the error text, and it was
-discounted.
+* `operand_device(op, **tensors)` returns the one device all operands are on, or raises
+  `AssertionError: <op>: operands on different cards: x=npu:0, scale=npu:3.  A Triton kernel
+  dereferences raw pointers and cannot span cards; place the operands on one card before the call`;
+* `select(device)` makes that card current for the launch and restores the caller's card afterwards
+  (a no-op when they already agree).
 
-The fix, in the Triton wrappers (`ascend/dsv41/triton_device.py`), has every kernel assert that its operands
-share one card and switch to that card for the launch, restoring the caller's card afterwards.  The bar for
-the next "hardware" verdict: a run with the suspect software path disabled, before any reset or reboot.
+All four wrappers now allocate their outputs on the operands' device, check every operand they will
+pass, and launch inside `select`: `quant_triton.py:167-173`, `sinkhorn_triton.py:152-157`,
+`expert_triton.py:207-212` (`gate_up`), `expert_triton.py:231-233` (`down_epilogue`),
+`expert_triton.py:251-253` (`down_sum`), `attn_triton.py:152-155`.  The level is the wrapper, not the
+caller, so every caller (model, capture path, tests, probes) is device-correct; a caller that passes
+co-located operands is unchanged (the device selection is a no-op and the outputs were already
+allocated on the input device), and a caller that passes mixed operands gets the named assertion
+instead of an MTE trap.
 
-## 6. Read-ahead and page-cache regime
+**Four-card run with the fix.**  `run_dsv41 --expert-devices npu:0,npu:1,npu:2,npu:3 --chat "The capital
+of France is" --gen 8`, all kernels on, tier **2 603 slots over 4 cards**, hbm-share 0.5:
 
-* `/mnt/weights` on `/dev/mapper/openeuler-root`; `read_ahead_kb = 128` on dm-0 via the lead's
-  `/etc/udev/rules.d/60-maya-readahead.rules`.  128 does not survive a reboot; the udev rule does.
-* Raw device: `dd bs=8M count=256 iflag=direct` = **2.4 GB/s**; buffered = 680 MB/s.
-* The one-card arms read 5.5-2.7 TB of expert bytes at 5-6 GB/s once the page cache was warm.  Regime by
-  arm: **N=1 cold 62% cached** (rchar 555.87 GB / read 209.42 GB), N=1 warm 99.6%, N=4 99.9%, N=8 95.5%,
-  short-8 98.8%.  The first 2k after the cold period therefore cost 181.7 s of TTFT against 77.2 s warm -
-  a 2.35x regime effect that must not be read as a concurrency effect.
-* A 2 000-token prefill moves ~185-555 GB of expert bytes depending on the tier's hit rate (13.6% at
-  N=1, ~44% at N=4/8), not a fixed amount: the tier (294 slots of 15 360 experts) is what decides it.
+```
+prefill: 9 tokens in 20.18s
+gen: 1: 'The'  2803 ms ... gen: 8: '**.'  3087 ms
+--- text ---
+The capital of France is **Paris**.
+experts: 1371 hits, 1725 misses, 61.0 GB read, 1480 resident
+EXIT=0
+```
 
-## 7. Tests
+No trap, 8/8 tokens, 1.8-3.1 s/token eager (log `ascend/results/serve-4card-triton-fixed.log`).
 
-`ASCEND_RT_VISIBLE_DEVICES=4 python3 -m unittest discover -s ascend -p "test_*.py" -t .`
--> **Ran 225 tests in 64.98 s, OK (skipped=10)**.  No `aclrtMallocHost` failure (host RAM free).
+**Numerics are unchanged** (four visible cards, npu:0):
 
-## 8. Files
+* `probe_quant`: **exact on 19/19 cases** - 0 int8 differences and 0 fp32 scale-bit differences,
+  including 1 315 840 values at `[257, 5120]`, the all-zero row, and 40 958 exact-`.5` ties;
+* `probe_expert`: rows=1 and rows=5, all four magnitude cases: `hq` differs **0**, `hs` differs **0**,
+  down-epilogue `y` differs **0** - the expert block is **bit-identical** to the torch composition;
+* `probe_attn_ab`: **80 real attention calls**, per-call `|kernel-torch|/max|torch|` **max 2.422e-6**,
+  median 1.177e-6 - unchanged.
+
+**Tests.**  `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python3 -m unittest discover -s ascend -p "test_*.py" -t .`
+-> **Ran 225 tests in 65.84 s, OK (skipped=8)**.  (One card was 225 / 10 skipped; the two extra tests
+here are the real two-card ones, including `test_the_captured_decode_runs_on_a_spread_expert_tier`,
+which now captures `g_post` on card 1 and passes.)
+
+## 5. Page-cache regime and method
+
+The arms ran back to back, so the cache warmed across them - this is a **warm-cache** study, not a
+cold-boot one:
+
+| arm | `rchar` | `read_bytes` | cached |
+|---|---|---|---|
+| 4 x 2k, share 0.5 | 1 803.69 GB | 287.65 GB | 83.97% |
+| 8 x 2k, share 0.5 (OOM) | 3 475.59 GB | 10.96 GB | 99.69% |
+| **8 x 2k, share 0.85** | **3 251.18 GB** | **3.03 GB** | **99.91% (hot)** |
+
+`read_bytes`/`rchar` come from `/proc/<pid>/io` sampled every 2 s for the benchmark process (host side;
+the process is inside `maya-ascend-dev`).  GB read per request and per step come from the engine's own
+expert-byte counter (`tier.gb_read`), split at the measured TTFT instant using the same io series; the
+io and tier counters agree to 0.03% on the headline run (3 251.18 vs 3 250.94 GB).  The full split is in
+`ascend/results/serve-4card-io.json`.  The headline 8 x 2k is therefore a **hot-page-cache** number; a
+cold run would move far more from disk and is not reported here.
+
+## 6. Files
 
 | file | content |
 |---|---|
-| `serve-1card-par1-2k.json` | 1 x 2k, cold page cache |
-| `serve-1card-par1-2k-warm.json` | 1 x 2k, warm page cache |
-| `serve-1card-par4-2k.json` | 4 x 2k |
-| `serve-1card-par8-2k.json` | **8 x 2k (headline)** |
-| `serve-1card-par8-short.json` | 8 x 8-token control |
-| `serve-diag-1card.json`, `serve-diag-card5.json` | single-card validation on cards 4 and 5 |
-| `diag-20261125/` | four-card failure logs and card snapshots |
+| `serve-4card-par8-2k.json` / `.jsonl` | **8 x 2k, share 0.85 (headline)** |
+| `serve-4card-par8-2k-share05.json` / `.jsonl` | 8 x 2k at 0.5: all prefills, 6/8 decoders OOM (the exact failure) |
+| `serve-4card-par4-2k.json` / `.jsonl` | 4 x 2k at 0.5: 4/4, 318.37 s TTFT, 1.37 tok/s |
+| `serve-4card-io.json` | expert bytes and page-cache fractions, phase split per arm |
+| `serve-4card-triton-fixed.log` | the four-card `run_dsv41` all-kernels-on run with the fix (`**Paris**`) |
+| `serve-2k8-REPORT.md` | this report |
+| `serve-2k8-REPORT-1card.md` | the previous one-card report, kept for history |
 
-`ascend/bench_par.py` (new, benchmark-only; no engine change) drives `serve_engine.Engine` and reads the
-protocol's own `T <rid>` lines for each request's first token; it splits the expert-tier bytes into the
-prefill part and the decode part so "GB per request" and "GB per decode step" are separate measurements.
+## 7. Harness note (why `bench_4card_par.py` exists)
+
+`bench_serve.py`'s default `concurrent`/`control` scenarios call `concurrent_prefill_decode(...)`
+without `n`, so the function's default `n=4` is used and `--parallel` only affects the serve-engine
+arms: `--only concurrent --parallel 8` really ran four conversations (the JSON said `"requests": 4`).
+`ascend/bench_4card_par.py` (benchmark-only, new) builds the same eager engine and calls the **same**
+`bench_serve.concurrent_prefill_decode` with `n` set, adding only the io counters; no measurement
+code is changed.  The one-line fix in `bench_serve.py` would be to pass `n=a.parallel` at those two
+call sites.

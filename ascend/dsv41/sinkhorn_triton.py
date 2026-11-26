@@ -32,6 +32,8 @@ import os
 
 import torch
 
+from .triton_device import operand_device, select
+
 _CACHE: "dict[tuple, object]" = {}
 _ERROR = ""
 _LOADED = False
@@ -144,12 +146,15 @@ def sinkhorn(mixes: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, iters
     if kernel is None:
         raise RuntimeError(f"the Sinkhorn kernel is unavailable: {_ERROR}")
     mixes = mixes.contiguous()
+    scale = scale.contiguous()
+    base = base.contiguous()
     rows = int(mixes.shape[0])
     pre = torch.empty((rows, 4), dtype=torch.float32, device=mixes.device)
     post = torch.empty((rows, 4), dtype=torch.float32, device=mixes.device)
     comb = torch.empty((rows, 16), dtype=torch.float32, device=mixes.device)
-    kernel[(rows,)](mixes, scale.contiguous(), base.contiguous(), pre, post, comb,
-                    ITERS=int(iters), EPS=float(eps))
+    device = operand_device("sinkhorn", mixes=mixes, scale=scale, base=base, pre=pre, post=post, comb=comb)
+    with select(device):
+        kernel[(rows,)](mixes, scale, base, pre, post, comb, ITERS=int(iters), EPS=float(eps))
     return pre, post, comb.view(rows, 4, 4)
 
 

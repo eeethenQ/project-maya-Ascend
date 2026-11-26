@@ -38,6 +38,8 @@ import os
 
 import torch
 
+from .triton_device import operand_device, select
+
 _CACHE: "dict[str, object]" = {}
 _ERROR = ""
 _LOADED = False
@@ -164,9 +166,11 @@ def per_token_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     rows, n = int(x.shape[0]), int(x.shape[1])
     q = torch.empty((rows, n), dtype=torch.int8, device=x.device)
     s = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
+    device = operand_device("per_token_int8", x=x, q=q, s=s)
     block = _block(n)
     kernel = row_kernel if n <= block else loop_kernel
-    kernel[(rows,)](x, q, s, N=n, BLOCK=block)
+    with select(device):
+        kernel[(rows,)](x, q, s, N=n, BLOCK=block)
     calls += 1
     return q, s
 
