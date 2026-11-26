@@ -359,10 +359,19 @@ where the numbers are thinnest, so here is exactly what is and is not measured.
 | **1 request, 1 card** | **181.7 s** | **0.87 tok/s** | 13.6% hit (32.2% while decoding), 555.7 GB read, 5.95 GB/step | 27.0 GiB | measured on the current engine, one card (physical npu:4) |
 | 4 requests, 4 cards | 191.2 s each | 1.08 tok/s aggregate, 0.27 per request | 28.8% hit, 459 GB per request | 20.4/11.2/10.6/10.0 GiB | measured **before** the operator work; today's engine would be faster |
 | 1 request, 4 cards | 393.5 s cold / 343.6 s warm | - | 0% hit on a prefill | - | pre-operator-work |
-| **8 requests** | **not measured** | - | - | - | see below |
+| **8 requests, 1 card** | **301.4 s** median (267.7-313.2, spread 45.5) | **1.10 tok/s** aggregate, 0.155-0.166 per request | 44.7% hit, 339.9 GB per request, 6.36 GB/step | **33.7 GiB** | one card (physical npu:4), at `--hbm-share 0.85`; the 32 GiB share cannot hold it.  Graph capture failed on this run (`npuSynchronizeDevice` 107027) so it ran eager |
+| 4 requests, 1 card | 113.9 s | 1.30 tok/s aggregate | 43.3% hit | 30.0 GiB | |
+| 1 request, 1 card, warm cache | 77.2 s | 1.12 tok/s | 13.6% hit | 27.0 GiB | the same run cold gives 181.7 s - a 2.35x regime effect, not a concurrency one |
+| **8 requests, 4 cards** | **not measured** | - | - | - | see below |
 
-**8 concurrent 2 000-token requests is not measured, and the reason is the machine rather than the engine.**
-This host rebooted at 11:17 today and afterwards **cross-card access faults**: any second card traps with
+**On one card, eight concurrent 2 000-token requests saturate at about 1.1-1.3 aggregate tokens/s** - the same
+figure as a single request, because the concurrency cost sits in the decode path and not in the prefill: the
+short-prompt control at the same concurrency gives 1.13 tokens/s, and 2 000-token prompts add 266 s of TTFT
+without changing the rate.  Eight at once also needs **33.7 GiB**, above the 32 GiB the process is normally held
+to (`--hbm-share 0.85` was needed), so one card cannot serve eight 2k conversations within the per-process cap.
+
+**The four-card eight-way number is not measured, and the reason is the machine rather than the engine.**
+This host's last boot was 11:17 today and since then **cross-card access faults**: any second card traps with
 `MTE accesses an invalid GM address or cross-device memory access times out`, at `rtEventRecord` when
 recording an event on a peer card, reproducibly and identically on chips 5 and 7, with graphs on and off,
 with the tier large and disabled, in the serve engine and in a plain eager runtime. Single-card work is
