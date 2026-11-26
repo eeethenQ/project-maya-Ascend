@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -657,6 +658,24 @@ class NullExpertSource(ExpertSource):
         return []
 
 
+def _serialised(method):
+    """Hold the streamer's staging-ring lock for the whole call.
+
+    The ring is shared mutable state - ``self._slot`` plus the pinned buffers in ``self._staging`` - and so is
+    the *current device*, which the fetch sets before recording its event.  Two threads interleave both, and the
+    symptom is not a crash: a slot is overwritten while another thread is still reading it, so a few of N
+    concurrent conversations quietly decode different tokens.  That is what the direct-drive harness showed -
+    2 of 8 streams diverging at the tenth token - while the serve path was fine because it holds an external
+    lock.  A fetch costs milliseconds, so an uncontended lock is free beside it.
+    """
+    def wrapper(self, *args, **kwargs):
+        with self._fetch_lock:
+            return method(self, *args, **kwargs)
+    wrapper.__name__ = method.__name__
+    wrapper.__doc__ = method.__doc__
+    return wrapper
+
+
 class ExpertStreamer(ExpertSource):
     """Routed experts read from the checkpoint straight into a pinned staging buffer, then to the card.
 
@@ -721,6 +740,7 @@ class ExpertStreamer(ExpertSource):
         # card current (a spread tier), so they are made on demand for the destination
         self._events: dict[str, list] = {}
         self._slot = 0
+        self._fetch_lock = threading.RLock()
         self._cap = 0
         self._fds: dict[str, int] = {}
         self._pool = ThreadPoolExecutor(max_workers=max(1, io_threads))
@@ -979,9 +999,11 @@ class ExpertStreamer(ExpertSource):
                   else sum(1 for d in devices if str(d) == str(device)))
         return int(self._slots.get(str(device), 0) // max(1, layers))
 
+    @_serialised
     def fetch_int8(self, layer: int, experts: list[int], insert: bool = True) -> list[dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
         return self._blocks(layer, experts, insert=insert)
 
+    @_serialised
     def fetch_int8_into(self, layer: int, experts: list[int], slab: torch.Tensor,
                         scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
                         scale_flat: "torch.Tensor | None" = None,
