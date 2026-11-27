@@ -385,9 +385,10 @@ admission, and it now gives each conversation its own domain up to the same boun
 **3.96 tok/s against 1.46 eager, paired wall 0.772, decode 2.71x**, four of four captured and 32 of 32 forwards
 on their own domain - within the direct-drive run's own spread, so the server adds no measurable overhead to the
 captured path. Past the bound a conversation runs eagerly with one log naming the bound, the 1.585 GiB
-(405.7 MiB a card) and 1.8-1.9 s per domain cost, and no live domain is evicted; **degradation at five and
-eight conversations is exercised only by the CPU test** - a co-tenant took all eight cards before the NPU arm
-could run, so that is the one number still missing.
+(405.7 MiB a card) and 1.8-1.9 s per domain cost, and no live domain is evicted. Measured on the NPU with eight
+concurrent conversations against a bound of four: **four capture, four run eagerly, each of the four is logged,
+and nothing OOMs** - 2.51 tok/s aggregate, 24.63 s TTFT, 50.16 s wall on short prompts
+(`ascend/results/serve-domains-bound8-short.json`).
 
 **Eight concurrent 2 000-token requests do not fit the 32 GiB share.** At `--hbm-share 0.85` the four-card
 run completes - **339.6 s TTFT with a 0.05 s spread across the eight**, 1.62 tok/s aggregate (0.20-0.21 each),
