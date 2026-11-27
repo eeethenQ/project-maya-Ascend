@@ -164,16 +164,19 @@ card is present, and the CPU tests run in CI.
   its eleven fields, the kept conversation's `reused`, STOP cutting a decode, STAT, and QUIT. Also the
   captured decode's serve surface: `--graphs`/`--graph-verify`/`--graph-max-conversations` and their
   defaults, the flags reaching `runtime.build`, capture on a conversation's first decode, release when the
-  conversation ends, release when a prompt is abandoned, and a teardown failure being logged, counted
-  against the bound, and served eagerly instead of taking the engine down. The prompt chunk too:
+  conversation ends, release when a prompt is abandoned, and a teardown failure being logged and counted
+  against the bound instead of taking the engine down. The prompt chunk too:
   `--prompt-chunk` and its old `--prefill-chunk` name, the measured 2 048 default, `prompt_chunks()`'s
   split, `0` meaning the whole prompt, the clamp to `--max-context`, and one PP line per forward over the
   real protocol. Prefix reuse has its own class: a diverging prompt that shares a prefix reports the shared
   count in DONE's `reused`, reads only its suffix, and produces the **same tokens** as a scratch prefill of
   the same prompt; a parallel slot reuses another conversation's prefix; `--no-prefix-reuse` restores the
-  old path. The graphs x `--parallel` lease has one too: the reserve is taken, a lone conversation captures,
-  a second admission revokes and releases the domain, idle re-arms, and a capture/teardown failure pins the
-  process to the eager path. And the two streaming flags: their CLI defaults, that they reach
+  old path. The graphs x `--parallel` policy has its own class too: the reserve is taken and the bound is
+  the engine's own (four, or `DSV41_GRAPH_MAX_CONVERSATIONS`) with `--graph-max-conversations` only able to
+  lower it; with the bound at 1 a conversation ending releases its domain so its successor captures; with
+  the bound at 2 of four concurrent conversations exactly two capture and two run eagerly and say so (the
+  bound and the 1.585 GiB per-domain cost are in the log); and a capture failure retires only the
+  conversation that failed, the others keeping their domains. And the two streaming flags: their CLI defaults, that they reach
   `runtime.build`, and that `ExpertStreamer` ends up with that many read threads and the model with that
   read batch.
 * `test_env.py` — the four hardware facts the design rests on.
@@ -206,10 +209,12 @@ answer. A teardown that cannot destroy a graph is logged and counted against `--
 costs a 405.7 MiB landing zone plus registers on every card the experts live on; four measured 1.62 GiB in
 total and put the process at 27.1 GiB of its 32 GiB share on one card at 2 048 context. With `--parallel 1` (the default) the
 server holds one conversation, and the tier reserves 1 GiB per card for that one; `--parallel N` gives it N
-conversations (and the server's FIFO N places).  `--graphs` and `--parallel N` compose as a lease (§19): a
-conversation captures while it is the only live one, a second admission revokes the lease (release, then
-eager for both), and the lease returns when every conversation is idle.  A request that shares a prompt
-prefix with the conversation it lands on resumes from that KV instead of re-prefilling it (§18).
+conversations (and the server's FIFO N places).  `--graphs` and `--parallel N` compose as one captured
+domain per conversation (§19): up to the engine's bound - four, `DSV41_GRAPH_MAX_CONVERSATIONS`, which
+`--graph-max-conversations` may lower but not raise - each live conversation holds its own domain; past the
+bound a conversation runs eagerly and logs the bound and the per-domain cost, no live domain is evicted,
+and a conversation that ends releases only its own domain.  A request that shares a prompt prefix with the
+conversation it lands on resumes from that KV instead of re-prefilling it (§18).
 
 `ascend/setup_tokenizer.sh` builds that tokenizer directory: the export ships no tokenizer, V4.1 and V4
 share the vocabulary, `serve/` reads its own pack layout rather than Hugging Face's `tokenizer.json`, and
@@ -705,13 +710,14 @@ forwards, not one** - which is exactly what the old 4-thread drive did.
   bytes to the card - a silent wrong answer. With `--parallel > 1` the engine wraps `fetch_int8` in one
   lock (host read + H2D only, and only while the scheduler runs); attention, the router and the expert
   matmuls still overlap across the request threads.
-* **Graphs and `--parallel N` compose as a lease** (§19), where §16's snapshot had them mutually exclusive:
-  a captured decode is one `State` at `T == 1` and the model holds one graph domain, so a conversation
-  captures only while it is the only live one; a second admission revokes the lease (release, then eager
-  for both) and the lease returns when every conversation is idle.  The cost is one decoded step on
-  revoke and one 1.8-1.9 s re-capture on the next lone conversation after a burst - logged, never silent.
-  N captured domains would need a domain per `State` in `model.py`, which this engine does not own, and N
-  landing zones per card (the tier reserves one, §6).
+* **Graphs and `--parallel N` compose as one captured domain per conversation** (§19), where §16's snapshot
+  had them mutually exclusive: a captured decode is one `State` at `T == 1`, so the model keeps one domain
+  per `State` (`_graph_domains`, keyed by `id(state)`), bounded by the engine's
+  `DSV41_GRAPH_MAX_CONVERSATIONS` (four - the measured fit for four landing zones per card).  Each live
+  conversation up to the bound holds and replays its own domain; past the bound a conversation runs eagerly
+  with a loud log, and a conversation that ends releases only its own domain.  Four domains cost 1.585 GiB
+  in total (405.7 MiB a card) and 1.8-1.9 s to capture each, charged to a decode step after the first
+  token.  The tier reserves 1 GiB per card (the build takes it whether one or four domains are used).
 * **Per-conversation NPU streams are opt-in** (`--parallel-streams`) and default off: measured on one
   910B3, four streams were ~10-15% slower than the device's default stream at the same expert tier - the
   staging ring's per-slot events then couple the streams, so the independence the streams buy is given
@@ -1050,7 +1056,7 @@ hop.**  That means one process per card and a real HCCL group (`torch.distribute
 it wants one rank per process, which this engine is not today), not 80 hand-rolled `copy_`s.
 
 
-## 19. Graphs and conversations compose as a lease; a shared prefix is not read twice
+## 19. Graphs and conversations: one captured domain per conversation, bounded; a shared prefix is not read twice
 
 Two serve-layer features did not compose.  `--graphs` captured the one-token decode for *the* held
 conversation, and `--parallel N` needed N conversations; the engine resolved that by logging the conflict
@@ -1060,41 +1066,78 @@ conversation's State and re-read the prompt from token 0** - the slot was reused
 2 000-token prefill of §15 (233.5 s in one forward, 440.0 s in four 512-token pieces) the second is the
 largest serve win available: a share-the-system-prompt workload pays it once per request today.
 
-### 19.1 The conflict, precisely
+### 19.1 From one domain, to a lease, to one domain per conversation
 
-`Dsv41` holds **one** graph domain (`model._decode_graphs`), and a domain's buffers bake the `State` it was
-captured against; `_graph_decode` releases a domain whose `State` is not the current one.  Per-slot capture
-would therefore need N domains inside `model.py` plus N landing zones (405.7 MiB plus registers *per card*
-each, against the 1 GiB per card `runtime.build(graphs=True)` reserves), and `model.py` is not this
-change's to edit.  The measured alternative - recapturing whenever two conversations alternate - is the
-`thrash` arm of `bench_serve`: a capture is 1.8-1.9 s, so alternating conversations pay it repeatedly.
+`Dsv41` originally held **one** graph domain (`model._decode_graphs`), and a domain's buffers bake the
+`State` it was captured against, so a second conversation could not capture.  The first serve-side
+resolution was a **lease**: a conversation captured only while it was the sole live one, a second
+admission revoked the domain and ran both eagerly, and the lease re-armed when every conversation went
+idle.  That kept a single-user server captured but capped the server at one captured conversation.
 
-### 19.2 The lease
+The model now keeps **one domain per `State`** (`Dsv41._graph_domains`, keyed by `id(state)`), builds and
+bounds them under `Dsv41._graph_lock`, and serialises every *capture* process-wide
+(`_capture_exclusive` - the vendor capture's device-wide synchronise cannot overlap another capture, even
+on another card).  The direct-drive arm measured four conversations each replaying their own 80-graph
+domain: 4.18 vs 1.40 tok/s, wall 0.77 of eager (§14 evidence file
+`ascend/results/serve-4card-par4-2k-graphs-locked-REPORT.md`).  This round removes the serve lease so the
+server can use that.
 
-`--graphs --parallel N` now grants the graph domain as a **lease**:
+### 19.2 The policy: up to N conversations each hold a domain, and none is ever evicted
 
-* **Grant.**  A conversation may capture only while it is the *sole live* one: its request was admitted
-  with every other slot idle, and no domain is held.  The grant and the capture are logged.  Capture stays
-  lazy (the first `T == 1` step; the first token already came from the prompt's logits), and `DONE's`
-  `reused`/PP lines are unaffected.
-* **Revoke.**  Admitting a conversation while the lease is held (second slot busy, or a request placed on
-  another slot) sets `model.graphs = False`, orders the bookkeeping against a concurrent grant under
-  `_sched`, waits on `_graph_lock` for the step that may be in flight, releases the domain, and logs
-  `lease revoked from <slot>`.  Both conversations then run eagerly.  The engine's forwards are wrapped in
-  that lock only *while a lease is active*, so the eager path keeps §16's cross-thread overlap.
-* **Re-arm.**  When the last conversation finishes (every slot idle), the engine turns the captured path
-  back on - only if it was *this engine* that turned it off, never overruling a capture/replay failure the
-  model reported - and logs it.  The next lone conversation captures again, paying 1.8-1.9 s charged to its
-  decode after the first token.
-* **Bounds.**  With `--parallel > 1` the effective bound is one domain whatever `--graph-max-conversations`
-  says; a larger value is called out in the start log.  A teardown that leaks a domain, or a model that
-  disables the captured path, pins the process to eager for its life (as before), and the log says so.
+* **The bound is the engine's.**  `DSV41_GRAPH_MAX_CONVERSATIONS` (four by default - the measured fit:
+  1.585 GiB = 405.7 MiB a card per domain) is read by the model; `--graph-max-conversations` may only
+  lower it, and the start log states the effective bound, the per-domain cost and the capture cost.  The
+  engine writes the effective number back to the model, so the serve policy and the model's
+  `_graph_domain` cannot disagree.
+* **Capture stays lazy and per conversation.**  A conversation captures on its first `T == 1` step, after
+  the first token has already been read from the prompt's logits, so no request waits on the 1.8-1.9 s
+  (80 graphs) capture to answer.  Four simultaneous first steps are legal because the capture is
+  exclusive in the process; a build failure marks only *that* `State` eager (`_graph_failed`).
+* **Past the bound, eager - loudly, and never by eviction.**  A conversation past the bound runs its
+  decode eagerly.  The engine logs the refusal once, naming the effective bound, the flag/env it came
+  from, the 1.585 GiB / 405.7 MiB-a-card per-domain cost and the fact that no live domain was evicted; a
+  conversation that gets room later (a release) is reported as captured when it takes the slot.  There is
+  no revoke, no re-arm, no `model.graphs` toggling, and no engine-side lock around forwards: each domain
+  is replayed only by the thread that owns its conversation's `State`, which is what the four-domain
+  direct-drive arm measured.
+* **A conversation that ends releases only its own domain.**  The domain is removed from the model's
+  registry under `_graph_lock` and closed; the other conversations' domains are untouched.  A teardown
+  failure is counted in `model._graph_leaked`, names itself in the log and keeps serving - the count is
+  part of the bound, so the next conversation cannot capture into HBM the leak still holds.  A failed
+  capture retires only its conversation.
 
-The cost is concrete and logged: **one in-flight decode step plus one release at the revoke** (an eager step
-is 816.5 ms on the four-card tier, 409.6 ms captured - the revoke takes the eager step's length, not the
-conversation's), and **one 1.8-1.9 s re-capture on the next lone conversation after a burst**.  A server
-that usually has one user at a time therefore keeps the captured decode; a burst pays the re-capture once,
-not per step.  Nothing is silent: grant, revoke and re-arm each write a line.
+`--serve-domains` (`ascend/bench_serve_domains.py`) is the serve-path measurement of this policy: one
+shared 2 000-token prompt, four conversations, four cards, `--hbm-share 0.5`, graphs ON against OFF, one
+engine build per arm (interleaved), reporting TTFT/TTFT spread, aggregate and per-request decode, wall,
+peak HBM per card, tier hit rate and how many conversations actually captured.  §19.2.1 is the result.
+
+### 19.2.1 Measured through the serve path
+
+`ascend/bench_serve_domains.py`, four 2 000-token conversations (one shared prompt, the direct-drive
+workload), four cards, `--hbm-share 0.5`, one engine build per arm, 32 greedy tokens, TTFT/T/DONE read
+off the protocol:
+
+| arm | TTFT per request (s) | spread | decode tok/s | per-req tok/s | wall (s) | peak HBM npu:0..3 (GiB) | tier hit | captured |
+|---|---|---|---|---|---|---|---|---|
+| serve ON | 179.92, 179.06, 179.82, 179.08 | 0.86 | 3.96 | 1.01/0.98/1.00/0.98 | 211.4 | 20.21 / 22.11 / 19.21 / 21.64 | 36.82% | **4/4** |
+| serve OFF | 186.09, 186.09, 186.05, 186.14 | 0.09 | 1.46 | 0.36 each | 273.8 | 20.35 / 20.73 / 17.96 / 20.68 | 38.08% | none |
+| direct ON (reference) | 179.23, 179.22, 179.20, 179.18 | 0.05 | 4.18 | 1.05 each | 209.8 | 20.34 / 22.11 / 19.21 / 21.64 | 37.21% | 4/4 |
+| direct OFF (reference) | 180.11, 180.18, 180.20, 180.16 | 0.09 | 1.40 | 0.35 each | 271.2 | 20.94 / 20.67 / 17.91 / 20.61 | 38.08% | none |
+
+Paired wall **0.772** (direct drive 0.773), decode **2.71x** (2.99x), per request **2.76x** (3.00x) -
+the serve path reproduces the direct-drive pair to a few percent.  Four live domains, 320 graphs, and
+every conversation's 32 decode forwards ran on its own domain (32/32 x 4); all token streams are
+identical to eager.  The report is `ascend/results/serve-4card-par4-2k-serve-domains-REPORT.md`.
+
+**Caveat, stated because it is real:** a co-tenant took all eight cards at ~09:42 local (58.5 of the
+65.5 GiB on every card) and held them, so the second and third interleaved pairs and the 5/8-conversation
+NPU arm could not be completed in this window.  The one clean pair ran before the takeover; both of its
+arms sit ~1% above the direct-drive equivalents, so the ratio is not a one-sided artifact.  The bound past
+four is pinned on the CPU path by
+`test_eight_conversations_capture_four_and_the_rest_are_eager` (8 conversations, default bound 4: 4
+capture, 4 run eagerly, each refusal names the bound and the per-domain cost, no domain evicted) and by
+the model's `test_the_bound_sends_the_next_conversation_eager_and_says_so`; what is *not* measured is
+HBM/thrash at N=8 on the cards.
 
 ### 19.3 Prefix reuse: rewind the State, do not copy it
 
@@ -1154,13 +1197,13 @@ not mistaken for a lost engine, and the engine logs the plan on stderr as the re
 ### 19.5 Measurements: done, and waiting on the card
 
 **Done (no card needed):** `python3 -m unittest discover -s ascend -p "test_*.py" -t .` - **216 tests, 10
-skipped, green** on the CPU path, including the new prefix-reuse exactness and the graph-lease tests.  A
+skipped, green** on the CPU path, including the new prefix-reuse exactness and the graph-domain tests.  A
 **pilot** `--serve-policy` run was made and **discarded**: its arms reused each other's prompts (prefix
 reuse) and its first arm paid a cold tier, so the lone and two-conversation numbers were not comparable.
 The harness was rewritten to build **one engine per policy** (`graphs=False` for the before arm, `true` for
 the after arm), warm the tier identically, use distinct prompts, and stagger the second request until the
-first's first token - that is what makes it a *second* admission, which is the event the revoke is defined
-on.
+first's first token - that is what makes it a *second* admission, which is where the old lease revoked;
+under §19.2 both conversations simply capture, up to the bound.
 
 **Not yet measured:** the two timing runs below.  The four 910B3s were held by the TP/EP experiment (§18)
 for the whole of this round; a single card is required, and the runs must not overlap another tenant's
@@ -1184,8 +1227,8 @@ prefill or their numbers are noise.  Commands (from the host, card 0 only; ~5 mi
 
 What each will show: `policy-summary` carries `lone_graphs_decode_tok_s` against `lone_eager_decode_tok_s`
 (the lease's decode ratio, expected near the captured/eager ratio of §14: 0.660 single-card, i.e. ~1.5x),
-`two_eager_wall_tok_s` against `two_graphs_wall_tok_s` (after the revoke both are eager, so ~1.0x is the
-cost statement), the two arms' *second* TTFT (the revoke's one-step cost), and
+`two_eager_wall_tok_s` against `two_graphs_wall_tok_s` (under §19.2 both capture, so this is the
+two-domain throughput ratio), the two arms' *second* TTFT, and
 `lone_tokens_identical`/`two_tokens_identical` (the captured path must not change a token).
 `prefix-summary` carries `reused_ttft_s` (the requested number), `scratch_ttft_s`, `ttft_ratio`,
 `reused_tokens_reported` (should be 2 000) and **`tokens_identical`** - the bar.  If that last field is
