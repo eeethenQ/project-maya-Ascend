@@ -363,8 +363,9 @@ where the numbers are thinnest, so here is exactly what is and is not measured.
 | 4 requests, 1 card | 113.9 s | 1.30 tok/s aggregate | 43.3% hit | 30.0 GiB | |
 | 1 request, 1 card, warm cache | 77.2 s | 1.12 tok/s | 13.6% hit | 27.0 GiB | the same run cold gives 181.7 s - a 2.35x regime effect, not a concurrency one |
 | **8 requests, 4 cards** | **339.6 s** (spread **0.05 s**) | **1.62 tok/s** aggregate, 0.20-0.21 each | 36.9% hit, 406.4 GB/request, 1.21 GB/step | **39.6/24.4/21.7/24.1 GiB** | eager, `--hbm-share 0.85`; **does not fit the 32 GiB share** |
-| **4 requests, 4 cards, captured** | **179.2 s** (spread 2.9) | **4.18 tok/s** aggregate, 1.05 each | 37.2% hit | 20.3/22.1/19.2/21.6 GiB | all four conversations captured, 320 graphs |
-| 4 requests, 4 cards, eager | 180.2 s | 1.40 tok/s aggregate, 0.35 each | 38.1% hit | 20.9/20.7/17.9/20.6 GiB | paired wall ratio **0.773** = **2.99x** decode |
+| **4 requests, 4 cards, captured, through the server** | **179.9 s** (spread 0.9) | **3.96 tok/s** aggregate, ~1.0 each | 36.8% hit | 20.2/22.1/19.2/21.6 GiB | every conversation captured its own decode; paired wall **0.772**, decode **2.71x** |
+| 4 requests, 4 cards, eager | 186.1 s | 1.46 tok/s aggregate, 0.36 each | 38.1% hit | 20.4/20.7/18.0/20.7 GiB | the other half of that pair |
+| 4 requests, 4 cards, captured, direct drive | 179.2 s | 4.18 tok/s aggregate | 37.2% hit | 20.3/22.1/19.2/21.6 GiB | paired wall **0.773**, decode **2.99x** |
 
 **On one card, eight concurrent 2 000-token requests saturate at about 1.1-1.3 aggregate tokens/s** - the same
 figure as a single request, because the concurrency cost sits in the decode path and not in the prefill: the
@@ -379,8 +380,14 @@ arms give wall ratios of **0.773 / 0.782 / 0.779** and decode ratios of **2.99 /
 reporting four live domains, 320 graphs, 128 of 128 steps on their own domain, and all 32 x 4 token streams
 identical to eager. Peak **22.12 GiB** against the 30.48 GiB share, so the memory fits; the bound is a policy
 of four conversations (`DSV41_GRAPH_MAX_CONVERSATIONS`), and past it a conversation runs eagerly with a log
-rather than evicting a live domain. The serve path still leases one captured conversation at a time - relaxing
-that is the next step.
+rather than evicting a live domain. The serve path reaches the same place: it used to lease one captured conversation and revoke on a second
+admission, and it now gives each conversation its own domain up to the same bound of four, measured at
+**3.96 tok/s against 1.46 eager, paired wall 0.772, decode 2.71x**, four of four captured and 32 of 32 forwards
+on their own domain - within the direct-drive run's own spread, so the server adds no measurable overhead to the
+captured path. Past the bound a conversation runs eagerly with one log naming the bound, the 1.585 GiB
+(405.7 MiB a card) and 1.8-1.9 s per domain cost, and no live domain is evicted; **degradation at five and
+eight conversations is exercised only by the CPU test** - a co-tenant took all eight cards before the NPU arm
+could run, so that is the one number still missing.
 
 **Eight concurrent 2 000-token requests do not fit the 32 GiB share.** At `--hbm-share 0.85` the four-card
 run completes - **339.6 s TTFT with a 0.05 s spread across the eight**, 1.62 tok/s aggregate (0.20-0.21 each),

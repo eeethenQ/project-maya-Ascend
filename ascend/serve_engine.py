@@ -31,12 +31,15 @@ Lines it reads: `GEN <max_new> [k=v ...] <ids>`, `STOP`, `PAUSE [keep]`, `WRAP`,
 With `--graphs` the one-token decode runs as captured NPU graphs, exactly as `run_dsv41 --graphs` does:
 a `g_pre`/`g_post` pair per layer, one `g_pre` per indexer selection bucket, and prompt chunks (`T > 1`)
 stay eager.  A graph bakes the buffers of the `State` it was captured against, so the graphs belong to a
-conversation: this engine captures them for the conversation that holds the *lease*, releases them when
-that conversation ends (a diverging prompt) or is abandoned (a request cut during its prompt), and reports
-what the capture cost (1.8-1.9 s for 80 graphs, charged to the decode after the first token - the first
-token is read from the prompt's own logits, so a request never waits on it to answer).  At most
-`--graph-max-conversations` captured conversations may be alive at once (default 1, which is what
-`runtime.build` reserves HBM for); past it a conversation runs eagerly and says so.
+conversation: each conversation captures its **own domain** (the model's `_graph_domains`, one per State,
+keyed by `id(state)`) on its first one-token step, and releases only that domain when the conversation
+ends (a diverging prompt) or is abandoned (a request cut during its prompt).  Up to **N** conversations
+may each hold a captured domain at once, where N is the engine's bound (`DSV41_GRAPH_MAX_CONVERSATIONS`,
+**four** by default, the measured fit); `--graph-max-conversations` can only lower it.  Past the bound a conversation runs eagerly and says so - the bound, the 1.585 GiB
+(405.7 MiB a card) per-domain cost and the fact that no live domain was evicted are in the log - and a
+domain that is released frees the slot for the next conversation.  The capture costs 1.8-1.9 s for 80
+graphs, charged to the decode after the first token: the first token is read from the prompt's own logits,
+so a request never waits on the capture to answer.
 
 Several conversations at once (`--parallel N`)
 ------------------------------------------------
@@ -87,13 +90,14 @@ Two consequences of sharing one model, both handled here:
   once could hand each other's expert bytes to the card.  With `--parallel > 1` the engine wraps
   `fetch_int8` in one lock (host read + H2D only), so the shared ring is used one fetch at a time.  The
   rest of a forward - attention, the expert matmuls - still overlaps across the request threads.
-* **Graphs are one conversation's buffers.**  The model holds one graph domain, so `--parallel N --graphs`
-  is a **lease**: a conversation captures only while it is the sole live one; admitting a second
-  conversation revokes the lease (the domain is released, both conversations run eagerly), and the lease
-  becomes available again once every conversation is idle, so the next lone conversation re-captures.
-  The cost is one decode step of the owning conversation on revoke and a 1.8-1.9 s capture on the next
-  lone conversation after a burst; every grant, revoke and re-arm is logged, never silent.  A capture the
-  model disables (a replay failure) or a teardown that leaks pins the process to the eager path.
+* **Graphs are one conversation's buffers.**  Each conversation captures its own domain (one per `State`,
+  keyed by `id(state)`) and holds it until that conversation ends; up to the engine's bound - four by
+  default, `DSV41_GRAPH_MAX_CONVERSATIONS`, which `--graph-max-conversations` may lower but not raise -
+  may live at once.  There is no lease and no revocation: admitting another conversation never takes a
+  live domain away.  A conversation past the bound runs eagerly and the engine logs the bound and the
+  per-domain cost once for it; a released domain frees the slot for the next conversation.  A capture the
+  model refuses retires only that conversation; a teardown that leaks is counted against the bound and
+  named in the log, never raised.
 """
 from __future__ import annotations
 
@@ -149,6 +153,11 @@ class Conversation:
         self.clean = 0
         self.busy = False
         self.rid: int | None = None
+        # The captured decode is per conversation: `graph_notes` is what has already been logged about
+        # this one's domain ("captured", "refused" at the bound, "failed", "disabled"), and
+        # `graph_steps` counts its one-token steps taken while its own domain was alive.
+        self.graph_notes: set[str] = set()
+        self.graph_steps = 0
         # The queue item this slot is serving.  `generate` releases the slot *before* it writes DONE (the
         # client may answer DONE with the conversation's next turn immediately), and the worker's
         # `finally` must not then release a slot a newer request may already own: both passes carry the
@@ -217,14 +226,13 @@ class Engine:
     def __init__(self, args):
         self.args = args
         self.parallel = max(1, int(getattr(args, "parallel", 1) or 1))
-        # --graphs and --parallel compose as a *lease* (see the module docstring and docs/ASCEND-DSV41.md
-        # §19).  The model holds one graph domain, so at most one conversation can own captured graphs; with
-        # N > 1 the engine grants the lease to a conversation only while it is the sole live one, and revokes
-        # it (release + eager) the moment a second conversation is admitted.  The lease is available again
-        # once every conversation is idle, so a server that usually has one user keeps its graphs and a
-        # burst pays one released domain plus one eager step - stated in the log, never silent.
+        # --graphs is one captured decode *per conversation* (see the module docstring and
+        # docs/ASCEND-DSV41.md §19).  The model keeps one domain per State (`_graph_domains`, keyed by
+        # id(state)) and bounds how many may live at once; the engine does not lease, revoke or rebuild a
+        # domain: a conversation captures on its first one-token step and releases only its own domain when
+        # it ends.  The bound is the model's (`DSV41_GRAPH_MAX_CONVERSATIONS`, four by default) and
+        # `--graph-max-conversations` may lower it, never raise it.
         self._graphs_wanted = bool(getattr(args, "graphs", False))
-        self._graphs_conflict = False            # kept as an attribute for older tests: no static conflict now
         # `--prefix-reuse` is a plain boolean for old callers (`False` means off), but it also accepts the
         # names always/safe/off.  `safe` is the shape-exact mode described in the module docstring.
         raw = getattr(args, "prefix_reuse", True)
@@ -248,6 +256,20 @@ class Engine:
                            verbose=args.verbose)
         self.cfg = self.rt.cfg
         self.load_s = time.time() - t0
+        # The bound both sides enforce.  The engine's bound is the model's (`graph_max_conversations`,
+        # read from DSV41_GRAPH_MAX_CONVERSATIONS at build time, four by default); the serve flag may only
+        # cap it lower.  Writing the effective value back to the model means the serve policy and the
+        # model's own `_graph_domain` can never disagree about how many conversations captured.
+        engine_bound = max(1, int(getattr(getattr(self.rt, "model", None),
+                                          "graph_max_conversations", 4) or 4))
+        asked = getattr(args, "graph_max_conversations", None)
+        self._graph_max_asked = None if asked is None else max(1, int(asked))
+        self._graph_engine_bound = engine_bound
+        self._graph_max = (engine_bound if self._graph_max_asked is None
+                           else min(self._graph_max_asked, engine_bound))
+        model = getattr(self.rt, "model", None)
+        if model is not None and hasattr(model, "graph_max_conversations"):
+            model.graph_max_conversations = self._graph_max
         self.state = None
         self.held: list[int] = []                 # the tokens the state covers
         self.clean = 0                            # `held` prefix written by full, aligned prompt chunks
@@ -278,26 +300,12 @@ class Engine:
         self._expert_lock = threading.Lock()
         self._install_expert_lock()
         self._closed = False
-        # -- the captured decode, leased to one conversation ------------------------------------
-        # The graphs bake the held State's buffers, so there is nothing to reuse once the conversation
-        # is over.  `_graphs_owner` is the conversation the live domain belongs to (None when none is
-        # held); `_graphs_leaked` counts domains a failed teardown left alive (their HBM never comes back
-        # in this process), and the two together are what the bound counts.  A leaked domain must never
-        # turn into a second landing zone on every expert card by accident, which is what the bound is for.
-        self._graph_max = max(1, int(getattr(args, "graph_max_conversations", 1) or 1))
-        self._graphs_held = 0
-        self._graphs_leaked = 0
-        self._graphs_blocked = False             # this engine forced eager at the bound
-        self._graphs_active = False              # a lease is granted (a domain is planned/held)
-        self._graphs_owner: Conversation | None = None
-        self._graphs_retired = False             # capture failed or leaked: eager for the process's life
-        self._graphs_revoked = False             # this engine turned model.graphs off for a revoke
-        # Serialises every forward while a lease is active with the lease's release: a graph replay and a
-        # release of that graph on two threads is a use-after-free, and an eager forward from a second
-        # conversation must not interleave into a running graph's register handshake.
-        self._graph_lock = threading.Lock()
-        self._graphs_captured_seen = 0
-        self._graphs_capture_s_seen = 0.0
+        # -- the captured decode: one domain per conversation, bounded --------------------------
+        # A domain bakes one State's KV addresses, so it belongs to that conversation's State and is
+        # released only by the thread that owns it.  `graph_notes` / `graph_steps` are per conversation
+        # (see `Conversation`); `self` carries the same pair for the single-conversation path.
+        self.graph_notes: set[str] = set()
+        self.graph_steps = 0
         # The engine only needs the end-of-sequence id; serve/ does every tokenization.  `--tokenizer` is
         # therefore optional, and a path to something other than a Hugging Face tokenizer.json (the pack
         # layout, say) is a note in the log rather than a failed start.
@@ -324,22 +332,22 @@ class Engine:
              f"{self.kv_gib(ctx):.2f}, activations 0.50, other (context, scratch, prompt path) 0.50")
         _log(f"maya generate: session is up (ascend dsv41, {self.rt.device}, weights in {self.load_s:.1f}s, "
              f"graphs {'on' if self._graphs_wanted else 'off'}, conversations {self.parallel})")
-        if self._graphs_wanted and self.parallel > 1:
-            _log(f"dsv41 graphs: --graphs with --parallel {self.parallel} is a *lease*: the model holds one "
-                 f"graph domain, so only one conversation can capture at a time (effective bound 1, "
-                 f"whatever --graph-max-conversations says).  A conversation captures while it "
-                 f"is the only live one; admitting a second releases the domain and both run eagerly; the "
-                 f"lease comes back when every conversation is idle.  Nothing is silent: every grant, "
-                 f"revoke and re-arm is logged")
-        elif self._graphs_wanted:
-            _log(f"dsv41 graphs: capturing the one-token decode per conversation (g_pre/g_post per layer, "
-                 f"one g_pre per indexer bucket; measured 1.8-1.9 s for 80 graphs).  At most "
-                 f"{self._graph_max} captured conversation(s) alive at once; past that bound a "
-                 f"conversation runs eagerly and says so.  Prompt chunks stay eager.")
-        if self._graphs_wanted and self._graph_max > 1 and self.parallel > 1:
-            _log(f"dsv41 graphs: --graph-max-conversations {self._graph_max} cannot be honoured with "
-                 f"--parallel {self.parallel} - a captured decode is one State and the model holds one "
-                 f"graph domain; the effective bound is 1")
+        if self._graphs_wanted:
+            _log(f"dsv41 graphs: one captured decode per conversation (g_pre/g_post per layer, one g_pre "
+                 f"per indexer bucket; prompt chunks stay eager).  Up to {self._graph_max} conversation(s) may each "
+                 f"hold their own domain at once (the engine's bound: DSV41_GRAPH_MAX_CONVERSATIONS="
+                 f"{self._graph_engine_bound}, default 4; --graph-max-conversations "
+                 f"{self._graph_max_asked if self._graph_max_asked is not None else 'unset'}).  One domain "
+                 f"is 1.585 GiB = 405.7 MiB a card and 1.8-1.9 s for 80 graphs, charged to the decode after "
+                 f"the first token.  A conversation past the bound runs eagerly and says so; no live domain "
+                 f"is ever evicted, and a released domain frees the slot for the next conversation")
+            if self._graph_max_asked is not None and self._graph_max_asked > self._graph_engine_bound:
+                _log(f"dsv41 graphs: --graph-max-conversations {self._graph_max_asked} cannot raise the "
+                     f"engine's bound of {self._graph_engine_bound} "
+                     f"(DSV41_GRAPH_MAX_CONVERSATIONS); the effective bound is {self._graph_max}")
+            elif self._graph_max_asked is not None and self._graph_max_asked < self._graph_engine_bound:
+                _log(f"dsv41 graphs: --graph-max-conversations {self._graph_max_asked} caps the "
+                     f"engine's bound of {self._graph_engine_bound} (DSV41_GRAPH_MAX_CONVERSATIONS)")
         if self.parallel > 1:
             _log(f"dsv41 parallel: {self.parallel} conversations at once, one State each"
                  f"{' and one NPU stream each' if self._parallel_streams else ''}; "
@@ -377,198 +385,189 @@ class Engine:
         index_k = ctx * cfg.index_head_dim * 2 / (1 << 30) * len(cfg.kv_source_layer_ids)
         return swa + long_kv + index_k
 
-    # -- the captured decode, leased to one conversation ----------------------------------------
+    # -- the captured decode: one domain per conversation, bounded -------------------------------
+    @staticmethod
+    def _conv_name(conv) -> str:
+        return getattr(conv, "name", "") or "the conversation"
+
+    def _conv_domain(self, conv):
+        """The live captured domain owned by `conv`'s State, or None.
+
+        The model's registry is the truth (`_graph_domains`, keyed by `id(state)`); the engine keeps no
+        second count that could drift from it.  A domain whose State was replaced, or that was already
+        closed, is not this conversation's.
+        """
+        state = getattr(conv, "state", None)
+        if state is None:
+            return None
+        domains = getattr(self.rt.model, "_graph_domains", None) or {}
+        domain = domains.get(id(state))
+        if domain is None or getattr(domain, "state", None) is not state \
+                or getattr(domain, "closed", False):
+            return None
+        return domain
+
     def graphs_live(self) -> int:
-        """Captured conversations whose graphs are still alive: the leased one plus any leaked domains."""
-        return self._graphs_held + self._graphs_leaked
+        """Captured conversations whose graphs are still alive: held domains plus leaked ones.
+
+        Leaked domains (`model._graph_leaked`, a failed teardown) still occupy HBM, so the model counts
+        them against the same bound; so does this reader.
+        """
+        model = self.rt.model
+        domains = getattr(model, "_graph_domains", None)
+        if domains is None:                              # a test double with no graph registry
+            return 0
+        return len(domains) + int(getattr(model, "_graph_leaked", 0) or 0)
 
     def _plan_graphs(self, conv) -> None:
-        """Take the graph lease for `conv` and report its layout and the capture cost.
+        """Say what this request's decode will try: capture on its first one-token step, or eager.
 
-        The model holds one graph domain, so the lease is one conversation: with `--parallel > 1` it is
-        granted only while `conv` is the sole live conversation (a second one revokes it, see
-        :meth:`_revoke_graphs`), and with `--parallel 1` the pre-existing bound applies.  Bookkeeping is
-        under `_sched` so a revoke racing this call cannot leave the lease set with no domain behind it.
+        The decision belongs to the model's `_graph_domain`, which enforces the bound at that step; this
+        line is the prediction and :meth:`_note_graph_state` confirms it after the first step.  Nothing
+        here changes model state: no live domain is released to make room for `conv`.
         """
         model = self.rt.model
-        log: list[str] = []
-        with self._sched:
-            if self._graphs_active or not self._graphs_wanted or self._graphs_retired:
-                return
-            if not bool(getattr(model, "graphs", False)):
-                return
-            if self.parallel > 1:
-                if any(s.busy for s in self.slots if s is not conv):
-                    return
-            elif self.graphs_live() >= self._graph_max:
-                if not self._graphs_blocked:
-                    self._graphs_blocked = True
-                    model.graphs = False
-                    log.append(
-                        f"dsv41 graphs: {self.graphs_live()} captured conversation(s) already hold their "
-                        f"graphs (--graph-max-conversations {self._graph_max}); this conversation runs "
-                        f"eagerly - the tier reserves one landing zone per card, not another")
-                for line in log:
-                    _log(line)
-                return
-            self._graphs_active = True
-            self._graphs_owner = conv
-            self._graphs_held = 1
-        _log("dsv41 graphs: this conversation captures its decode on the first one-token step "
-             "(measured 1.8-1.9 s for 80 graphs); the first token is read from the prompt's own logits "
-             "before that, so the request never waits on the capture to answer")
-        if self.parallel > 1:
-            _log(f"dsv41 graphs: lease granted to {getattr(conv, 'name', 'this conversation')} - it is the only "
-                 f"live conversation, so its "
-                 f"captured decode is used; a second conversation revokes the lease (one release, then "
-                 f"eager for both) and the lease returns only when every conversation is idle")
-        try:
-            _log(model.graph_summary(conv.state))
-        except Exception as e:                           # noqa: BLE001 - a log line is not worth a request
-            _log(f"dsv41 graphs: (could not describe the capture table: {type(e).__name__}: {e})")
-
-    def _report_graph_capture(self) -> None:
-        """Say what the capture cost, in the engine log the server keeps (the protocol has no field for it)."""
-        g = getattr(self.rt.model, "_decode_graphs", None)
-        if g is None:
+        if not self._graphs_wanted or not bool(getattr(model, "graphs", False)):
             return
-        captured, seconds = int(getattr(g, "captured", 0)), float(getattr(g, "capture_s", 0.0))
-        graphs = captured - self._graphs_captured_seen
-        spent = seconds - self._graphs_capture_s_seen
-        self._graphs_captured_seen, self._graphs_capture_s_seen = captured, seconds
-        if graphs > 0:
-            _log(f"dsv41 stat: graphs captured {graphs} in {spent * 1e3:.0f} ms "
-                 f"({seconds * 1e3:.0f} ms, {captured} graphs for this conversation); it is charged to the "
+        if self._conv_domain(conv) is not None:
+            return                                       # an earlier turn already captured it
+        name = self._conv_name(conv)
+        live = self.graphs_live()
+        if live >= self._graph_max:
+            _log(f"dsv41 graphs: the bound is full ({live}/{self._graph_max} captured conversation(s); "
+                 f"--parallel {self.parallel}, --graph-max-conversations "
+                 f"{self._graph_max_asked if self._graph_max_asked is not None else 'unset'}, "
+                 f"DSV41_GRAPH_MAX_CONVERSATIONS={self._graph_engine_bound}); {name} runs eagerly unless a "
+                 f"domain frees.  One domain is 1.585 GiB = 405.7 MiB a card; no live domain is evicted")
+        else:
+            _log(f"dsv41 graphs: {name} will capture its decode on the first one-token step "
+                 f"({live + 1}/{self._graph_max} domain(s); 1.585 GiB = 405.7 MiB a card, 1.8-1.9 s for 80 "
+                 f"graphs, charged to the decode after the first token)")
+
+    def _note_graph_state(self, conv) -> None:
+        """After a one-token step: log what happened to this conversation's domain, once per outcome.
+
+        Three outcomes are possible and all are stated in the log:
+        the conversation captured (the model built its domain on this step), the model refused it at the
+        bound (it runs eagerly; no live domain was touched), or its capture/replay failed (it is retired
+        to eager and only it - the other conversations keep their domains).  Called after every decode
+        step, so a conversation refused at the bound but given room later by a release is reported as
+        captured when it takes that slot.
+        """
+        if not self._graphs_wanted:
+            return
+        conv = self if conv is None else conv
+        model = self.rt.model
+        name = self._conv_name(conv)
+        notes = conv.graph_notes
+        domain = self._conv_domain(conv)
+        if domain is not None:
+            conv.graph_steps += 1
+            if "captured" in notes:
+                return
+            notes.add("captured")
+            _log(f"dsv41 stat: graphs captured {int(getattr(domain, 'captured', 0))} in "
+                 f"{float(getattr(domain, 'capture_s', 0.0)) * 1e3:.0f} ms for {name} "
+                 f"({self.graphs_live()}/{self._graph_max} captured conversation(s)); it is charged to the "
                  f"decode step, after the token that preceded it was already written")
+            try:
+                _log(model.graph_summary(conv.state))
+            except Exception as e:                       # noqa: BLE001 - a log line is not worth a request
+                _log(f"dsv41 graphs: (could not describe the capture table: {type(e).__name__}: {e})")
+            return
+        if not bool(getattr(model, "graphs", False)):
+            if "disabled" not in notes:
+                notes.add("disabled")
+                _log("dsv41 graphs: the model disabled the captured path after a capture/replay failure; "
+                     "every conversation runs eagerly from here")
+            return
+        state = getattr(conv, "state", None)
+        failed = state is not None and state in getattr(model, "_graph_failed", ())
+        if failed:
+            if "failed" in notes:
+                return
+            notes.add("failed")
+            failures = getattr(model, "_graph_failures", []) or []
+            detail = failures[-1] if failures else "capture/replay failed"
+            _log(f"dsv41 graphs: {name}'s capture/replay failed ({detail}); it runs eagerly for the rest of "
+                 f"its life, and the failure retired only this conversation: {self.graphs_live()}/"
+                 f"{self._graph_max} domain(s) live, and the other conversations keep theirs")
+            return
+        if "refused" in notes:
+            return
+        notes.add("refused")
+        _log(f"dsv41 graphs: {self.graphs_live()} captured conversation(s) already hold their domain "
+             f"(bound {self._graph_max}: --graph-max-conversations "
+             f"{self._graph_max_asked if self._graph_max_asked is not None else 'unset'}, "
+             f"DSV41_GRAPH_MAX_CONVERSATIONS={self._graph_engine_bound}); {name} runs eagerly.  One domain "
+             f"is 1.585 GiB = 405.7 MiB a card and 1.8-1.9 s to capture; no live domain is evicted - a slot "
+             f"frees when a captured conversation ends")
 
     def _forward(self, ids, state, **kw):
-        """`model.forward`, serialised with a lease release while one is active.
-
-        A graph replay and the release of that graph on two threads is a use-after-free; an eager forward
-        from a second conversation also must not interleave into a running graph's register handshake.
-        The lock is taken only while a lease is active (`--parallel > 1`); the eager path keeps the
-        cross-thread overlap that makes `--parallel` worth 2.1x.
+        """`model.forward`.  No engine-side serialisation: a domain is replayed, and released, only by
+        the thread that owns its conversation's State, and the capture/teardown exclusion is the model's
+        process-wide `_capture_exclusive`.  The eager path keeps the cross-thread overlap that makes
+        `--parallel` worth 2.1x, and concurrent replays of different domains are what the four-domain
+        direct-drive arm measured.
         """
-        if self.parallel > 1 and self._graphs_active:
-            with self._graph_lock:
-                return self.rt.model.forward(ids, state, **kw)
         return self.rt.model.forward(ids, state, **kw)
 
-    def _release_graphs(self, reason: str) -> None:
-        """Release the graphs of the conversation being dropped; a failed teardown is logged, not raised.
+    def _release_graphs(self, conv, reason: str) -> None:
+        """Release the one domain `conv` owns; a failed teardown is logged and counted, never raised.
 
-        ``Dsv41.release_graphs`` raises :class:`GraphTeardownError` after dropping the domain when a
-        graph could not be destroyed - its HBM is not returned in this process.  A leaked model must not
-        take the server down with it: the failure is named in the log, counted against
-        ``--graph-max-conversations`` (so the bound then sends the next conversation to the eager path
-        instead of capturing into HBM that is not there), and serving continues.
+        `Dsv41.release_graphs` drops *every* domain and is the shutdown path; a running server must drop
+        one conversation without touching the others' domains, so the domain is removed from the model's
+        registry under the model's lock (`_graph_lock` also serialises it against a capture) and closed
+        here.  A close that fails leaves its HBM allocated for the life of the process: it is counted in
+        `model._graph_leaked`, which :meth:`graphs_live` and the model's bound both include, so the next
+        conversation cannot capture into HBM that is still held.  Serving continues either way.
         """
         model = self.rt.model
-        domain = getattr(model, "_decode_graphs", None)
-        had = domain is not None
-        self._graphs_active = False
-        self._graphs_owner = None
-        if self.parallel > 1 and bool(getattr(model, "graphs", False)):
-            # the lease is the only thing that may leave the model graph-capable: a released conversation
-            # that kept model.graphs=True could start a replay while a second conversation's eager forward
-            # is running (the register/landing-zone mix the lease exists to prevent).  `_maybe_rearm_graphs`
-            # turns it back on once every conversation is idle.
-            model.graphs = False
-            self._graphs_revoked = True
+        domain = self._conv_domain(conv)
+        if domain is None:
+            return
+        key = id(conv.state)
+        lock = getattr(model, "_graph_lock", None) or threading.Lock()
+        with lock:
+            domains = getattr(model, "_graph_domains", None)
+            if domains is not None:
+                domains.pop(key, None)
+            if getattr(model, "_decode_graphs", None) is domain:
+                model._decode_graphs = None
         try:
-            model.release_graphs()
+            domain.close()
         except GraphTeardownError as exc:
-            if had:
-                self._graphs_leaked += 1
-            self._graphs_held = 0
-            self._graphs_retired = True
-            model.graphs = False
-            _log(f"dsv41 graphs: could not release the graphs of the conversation that ended "
-                 f"({reason}) - {exc}.  The engine keeps serving; the leaked graph models stay alive "
-                 f"until this process exits, and every conversation runs eagerly from here")
+            with lock:
+                model._graph_leaked = int(getattr(model, "_graph_leaked", 0) or 0) + 1
+            _log(f"dsv41 graphs: could not release the graphs of the conversation that ended ({reason}) - "
+                 f"{exc}.  The engine keeps serving; the leaked graph model stays alive until this process "
+                 f"exits and counts against the bound ({self.graphs_live()}/{self._graph_max}), so no new "
+                 f"conversation captures into the HBM it still holds")
             return
-        finally:
-            self._graphs_captured_seen = 0
-            self._graphs_capture_s_seen = 0.0
-        if had:
-            _log(f"dsv41 graphs: released {int(getattr(domain, 'captured', 0))} graphs of the "
-                 f"conversation that ended ({reason})")
-        # nothing is held for the dropped conversation: whether it captured or fell back to eager, the
-        # domain is gone now (a capture that never happened leaves nothing behind either)
-        self._graphs_held = 0
-        if self._graphs_blocked and self.parallel <= 1 and self.graphs_live() < self._graph_max:
-            # only a block this engine set is undone here; a model that disabled graphs itself (a
-            # capture/replay failure) must stay on the eager path
-            self._graphs_blocked = False
-            model.graphs = True
-            _log(f"dsv41 graphs: the bound has room again ({self.graphs_live()}/"
-                 f"{self._graph_max}); new conversations capture")
-
-    def _revoke_graphs(self, reason: str) -> None:
-        """Take the lease back from its conversation: release the domain and run eagerly (parallel mode).
-
-        Called on the thread that admits a second conversation.  `model.graphs = False` goes first so no
-        new step can start a replay; `_sched` orders the bookkeeping against `_plan_graphs`; `_graph_lock`
-        then waits out the step that may be in flight before the domain is destroyed.  The cost is one
-        decode step of the owning conversation plus the release - after that both conversations are eager
-        until every conversation is idle again (:meth:`_maybe_rearm_graphs`).
-        """
-        model = self.rt.model
-        owner = None
-        with self._sched:
-            leased = (self._graphs_active or self._graphs_owner is not None
-                      or getattr(model, "_decode_graphs", None) is not None)
-            if leased:
-                owner = self._graphs_owner
-                self._graphs_active = False
-                self._graphs_owner = None
-            if bool(getattr(model, "graphs", False)):
-                model.graphs = False
-                self._graphs_revoked = True
-        if not leased:
+        except Exception as exc:                         # noqa: BLE001 - a teardown must not kill the engine
+            with lock:
+                model._graph_leaked = int(getattr(model, "_graph_leaked", 0) or 0) + 1
+            _log(f"dsv41 graphs: the teardown of the conversation that ended ({reason}) failed with "
+                 f"{type(exc).__name__}: {exc}.  It is counted as a leak against the bound "
+                 f"({self.graphs_live()}/{self._graph_max}); serving continues")
             return
-        with self._graph_lock:
-            self._release_graphs(reason)
-        name = getattr(owner, "name", "this conversation") if owner is not None \
-            else "the conversation that held it"
-        _log(f"dsv41 graphs: lease revoked from {name} ({reason}); that conversation and this one run "
-             f"eagerly.  The lease returns when every conversation is idle, and the next lone conversation "
-             f"re-captures (measured 1.8-1.9 s, charged to its decode after the first token)")
-
-    def _maybe_rearm_graphs(self) -> None:
-        """Make the lease available again once every conversation is idle (caller holds `_sched`).
-
-        No forward can be in flight here: a slot sets `busy = False` only after its request returned.
-        Re-arming is what keeps a server that usually has one user on the captured path after a burst;
-        the cost is one capture (1.8-1.9 s) on the next lone conversation, never on a reply.
-        """
-        if self.parallel <= 1 or not self._graphs_wanted or self._graphs_retired:
-            return
-        if self._graphs_active or bool(getattr(self.rt.model, "graphs", False)):
-            return
-        if not self._graphs_revoked:
-            # the model disabled the captured path itself (a capture/replay failure); never overrule it
-            return
-        self._graphs_blocked = False
-        self._graphs_revoked = False
-        self.rt.model.graphs = True
-        _log("dsv41 graphs: every conversation is idle again, so the graph lease is available; the next "
-             "lone conversation captures its decode (1.8-1.9 s, charged to its decode) and concurrent "
-             "ones run eagerly")
+        others = len(getattr(model, "_graph_domains", None) or {})
+        _log(f"dsv41 graphs: released {int(getattr(domain, 'captured', 0))} graphs of the conversation "
+             f"that ended ({reason}); {others} other captured conversation(s) keep their domains")
 
     def _drop_conversation(self, reason: str, conv=None) -> None:
-        """Forget a conversation, releasing its graphs (its State is garbage after this).
+        """Forget a conversation: release its own domain and drop its State.
 
-        With `--parallel` the model's one graph domain may belong to a slot; only that slot's thread
-        releases it, and the release is serialised with any in-flight graph step by `_graph_lock`.
+        This runs on the thread that serves the conversation, so the release cannot race its own replay;
+        the other conversations' domains, and `model.graphs`, are not touched.
         """
         conv = self if conv is None else conv
-        if self.parallel > 1:
-            with self._graph_lock:
-                if conv is self._graphs_owner:
-                    self._release_graphs(reason)
-        elif conv is self:
-            self._release_graphs(reason)
+        self._release_graphs(conv, reason)
+        notes = getattr(conv, "graph_notes", None)
+        if notes is not None:
+            notes.clear()
+        if hasattr(conv, "graph_steps"):
+            conv.graph_steps = 0
         conv.state = None
         conv.held = []
         conv.clean = 0
@@ -836,7 +835,6 @@ class Engine:
     def _admit(self, line: str, rid: int) -> None:
         """Place a request on the idle conversation sharing the longest prefix, else queue it."""
         ids = [int(x) for x in line.split()[-1].split(",") if x]
-        revoke = False
         with self._sched:
             if rid in self._rid_cut:
                 # stopped while it was on its way in: answer its DONE so the server's drain completes
@@ -854,13 +852,9 @@ class Engine:
                         slot, best = s, n
                 if slot is not None:
                     self._assign(slot, line, rid, self._cut, self._wrap)
-                    # a second conversation is now live: the graph lease cannot be shared
-                    revoke = self._graphs_active and self._graphs_owner is not slot
                 else:
                     self._waiting.append((line, rid))
                     self._queued_seen += 1
-        if revoke:
-            self._revoke_graphs("a second conversation was admitted")
         if cancelled:
             self._emit(f"DONE 0 {len(ids)} 0.0 0.0 cancel 0 0 0 0 0", rid)
         elif slot is None:
@@ -920,7 +914,6 @@ class Engine:
         newer request that has since been assigned to it.
         """
         cancelled: list[tuple[int, int]] = []
-        revoke = False
         with self._sched:
             if request is not None and slot.request is not request:
                 return                                    # already released; a newer request owns it
@@ -936,12 +929,7 @@ class Engine:
                     cancelled.append((rid, self._prompt_len(line)))
                     continue
                 self._assign(slot, line, rid, self._cut, self._wrap)
-                revoke = self._graphs_active and self._graphs_owner is not slot
                 break
-            if not any(s.busy for s in self.slots):
-                self._maybe_rearm_graphs()
-        if revoke:
-            self._revoke_graphs("a queued conversation was admitted")
         for rid, n in cancelled:
             self._emit(f"DONE 0 {n} 0.0 0.0 cancel 0 0 0 0 0", rid)
 
@@ -1069,7 +1057,8 @@ class Engine:
                     # conversation cannot be continued: it is abandoned, and its graphs (if it had
                     # any from an earlier turn) go with it.
                     _log("dsv41: the request was abandoned during its prompt - dropping the "
-                         "conversation's state" + (" and its graphs" if self._graphs_held else ""))
+                         "conversation's state"
+                         + (" and its graphs" if self._conv_domain(conv) is not None else ""))
                     self._drop_conversation("the request was abandoned during its prompt", conv)
                     return
         prompt_ms = (time.perf_counter() - t_prompt) * 1e3
@@ -1077,8 +1066,8 @@ class Engine:
         if self._prefix_mode == "safe":
             conv.clean = self._advance_clean(conv.clean, reused, plan)
         if max_new > 0:
-            # Count the conversation that holds captured graphs.  The capture itself is lazy (the first
-            # one-token step below); this is the lease's accounting and the report of what it will cost.
+            # The capture itself is lazy (the first one-token step below); this says whether it will be
+            # attempted and, if the bound is full, names the bound and the per-domain cost up front.
             self._plan_graphs(conv)
 
         # --- decode
@@ -1115,12 +1104,13 @@ class Engine:
                 conv.held.pop()
                 break
             logits = self._forward([tok], conv.state, logits_last_only=True)
+            # The capture happened inside that forward, on this conversation's first step: report it (or
+            # the bound's refusal, or a failure that retired only this conversation) in the engine log.
+            self._note_graph_state(conv)
             n = len(produced)
             if n % 8 == 0:
                 self.emit(self.stat_line(t0, n))
         decode_ms = (time.perf_counter() - t0) * 1e3
-        if conv is self or conv is self._graphs_owner:
-            self._report_graph_capture()
         with self._sched:
             self.stats["tokens"] += len(produced)
             self.stats["steps"] += 1
@@ -1298,9 +1288,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "with rid=<id>; each conversation gets its own State (and, with --parallel-streams, "
                          "its own NPU stream).  This is NOT batching: forward takes one State (KvPlanes "
                          "refuses batch > 1), so the gain is host dispatch overlap across the request "
-                         "threads.  Composes with --graphs as a lease (see that flag); size "
-                         "--expert-reserve-gib for N concurrent activations; a request past N waits in the "
-                         "engine's queue")
+                         "threads.  Composes with --graphs: up to the graph bound of conversations can each "
+                         "hold their own captured decode (see --graphs); size --expert-reserve-gib for N "
+                         "concurrent activations; a request past N waits in the engine's queue")
     ap.add_argument("--prompt-chunk", "--prefill-chunk", dest="prefill_chunk", type=int, default=2048,
                     metavar="N",
                     help="the most tokens one prompt forward reads (default 2048; 0 = the whole prompt).  "
@@ -1341,21 +1331,20 @@ def build_parser() -> argparse.ArgumentParser:
                          "ascend/run_dsv41.py: a g_pre/g_post pair per layer, one g_pre per indexer "
                          "selection bucket, the expert fetch between them on the host.  Off by default; "
                          "prompt chunks (T > 1) stay eager.  The graphs bake the conversation State's "
-                         "buffers, so they are captured per conversation (1.8-1.9 s for 80 graphs) and "
-                         "released when it ends.  With --parallel N > 1 this is a lease: one conversation "
-                         "captures while it is the only live one, a second conversation revokes it, and it "
-                         "returns when every conversation is idle")
+                         "buffers, so every conversation captures its own domain (1.8-1.9 s for 80 "
+                         "graphs, 1.585 GiB) and releases only that domain when it ends.  With --parallel "
+                         "N > 1 up to --graph-max-conversations conversations hold one at once; the rest "
+                         "run eagerly and say so, and no live domain is evicted")
     ap.add_argument("--graph-verify", action="store_true",
                     help="run the did-it-capture guard on every graph (slow: 4 eager runs per graph at "
                          "start-up, then bit-equality at two input values); only meaningful with "
                          "--graphs")
-    ap.add_argument("--graph-max-conversations", type=int, default=1,
-                    help="the most conversations whose captured graphs may be alive at once.  Each "
-                         "conversation costs a 425 MB landing zone on every card that holds experts plus "
-                         "that card's graph pool and registers, and --graphs reserves 1 GiB per card for "
-                         "one; past this bound a conversation runs eagerly and says so in the log.  The "
-                         "model holds one graph domain, so with --parallel > 1 the effective bound is 1 "
-                         "however this is set (logged at start)")
+    ap.add_argument("--graph-max-conversations", type=int, default=None, metavar="N",
+                    help="cap the engine's captured-conversation bound (default: the engine's own bound, "
+                         "DSV41_GRAPH_MAX_CONVERSATIONS, four - the measured fit; a value here can only "
+                         "lower it).  Each captured conversation costs 1.585 GiB = 405.7 MiB a card, and "
+                         "--graphs reserves 1 GiB per card; past the bound a conversation runs eagerly and "
+                         "says so in the log, and no live domain is evicted")
     ap.add_argument("--verbose", action="store_true")
     return ap
 

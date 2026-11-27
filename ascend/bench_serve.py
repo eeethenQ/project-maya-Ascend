@@ -41,12 +41,12 @@ build, the same prompts, all on the cards given):
 * ``isolation``        - the same prompts alone against together, token for token.
 
 ``--serve-policy`` measures the ``--graphs`` x ``--parallel`` composition on one engine build and tier:
-``policy-eager-*`` is the pre-change path (graphs forced off), ``policy-graphs-lone`` the graph lease on a
-single live conversation, ``policy-graphs-two`` the revoke when a second conversation arrives, and
-``policy-graphs-lone-again`` the re-capture after the burst.  ``--serve-lease`` measures the same lease on
-*one* graphs engine: lone, then a burst of ``--parallel`` conversations (the second admission revokes the
-lease), then lone again (the re-arm and its re-capture), with an eager engine for the throughput and token
-controls.  ``--serve-prefix`` measures prefix reuse: a
+``policy-eager-*`` is the graphs-off path, ``policy-graphs-lone`` a lone conversation's captured domain,
+``policy-graphs-two`` two live conversations (each captures its own domain up to the engine's bound), and
+``policy-graphs-lone-again`` the lone conversation after the burst.  ``--serve-lease`` keeps its old name
+but now measures the post-lease policy on *one* graphs engine: lone, a burst of ``--parallel``
+conversations, then lone again, with an eager engine for the throughput and token controls.  The
+serve-path measurement of the bounded per-conversation policy is ``bench_serve_domains.py``.  ``--serve-prefix`` measures prefix reuse: a
 long shared prefix is seeded by one request, resumed by a second with a different suffix (its TTFT), and
 the same prompt with reuse off gives both the re-prefill baseline and the token stream the reused arm must
 match exactly.
@@ -643,9 +643,9 @@ def serve_parallel(engine, prompts: list[list[int]], gen: int, label: str, devic
 
     ``stagger`` submits the second request only after the first's first token: that is what makes it a
     *second* live conversation (a second admission) rather than two requests racing the scheduler's
-    admission loop, and it is the shape the graph-lease revoke is specified for.  ``burst`` is the same
-    wait but then submits *every* remaining prompt back to back: the first conversation holds the lease,
-    the next admission revokes it, and the rest of the burst runs eagerly.
+    admission loop.  ``burst`` is the same wait but then submits *every* remaining prompt back to back:
+    each conversation captures its own domain until the engine's bound, and the rest of the burst runs
+    eagerly with the bound logged.
     """
     collector = ServeCollector()
     engine.emit = collector
@@ -656,8 +656,7 @@ def serve_parallel(engine, prompts: list[list[int]], gen: int, label: str, devic
     for rid, ids in enumerate(prompts, 1):
         if (stagger and rid == 2) or (burst and rid == 2):
             # A second conversation is admitted once the first has answered AND, when graphs are in use,
-            # has actually captured its decoded step - otherwise the revoke would have no domain to
-            # release and the arm would not measure the policy's cost.
+            # has actually captured its decoded step - the burst then arrives with a live domain.
             end = time.perf_counter() + 30
             while time.perf_counter() < end:
                 answered = any(l.startswith("T 1 ") for _, l in collector.snapshot())
@@ -668,7 +667,7 @@ def serve_parallel(engine, prompts: list[list[int]], gen: int, label: str, devic
                 time.sleep(0.01)
             else:
                 print(f"{label}: the first request answered but no graph domain appeared within 30 s; "
-                      f"admitting the rest anyway (the lease is not held)", flush=True)
+                      f"admitting the rest anyway (no captured domain appeared)", flush=True)
         submits[rid] = time.perf_counter()
         engine.submit(f"GEN {gen} rid={rid} " + ",".join(str(int(t)) for t in ids))
     try:
@@ -730,7 +729,7 @@ def serve_compare_phase(a, tokenizer, rec: Recorder, devices, cards, prompts: li
         expert_batch=a.expert_batch, expert_reserve_gib=reserve,
         expert_devices=",".join(cards), engram_tokenizer="", verbose=False,
         max_context=a.max_context, prefill_chunk=0,     # one forward for a 2 000-token prompt
-        serve=True, graphs=False, graph_verify=False, graph_max_conversations=1, parallel=n,
+        serve=True, graphs=False, graph_verify=False, graph_max_conversations=None, parallel=n,
         parallel_streams=getattr(a, "parallel_streams", False))
     print(f"\nbuilding the serve engine ({n} conversations, reserve {reserve:.1f} GiB, {label})",
           flush=True)
@@ -835,7 +834,7 @@ def _policy_engine(a, cards, n: int, graphs: bool):
         expert_batch=a.expert_batch, expert_reserve_gib=a.expert_reserve_gib,
         expert_devices=",".join(cards), engram_tokenizer="", verbose=False,
         max_context=a.max_context, prefill_chunk=getattr(a, "serve_prefill_chunk", 0),
-        serve=True, graphs=graphs, graph_verify=False, graph_max_conversations=1, parallel=n,
+        serve=True, graphs=graphs, graph_verify=False, graph_max_conversations=None, parallel=n,
         parallel_streams=getattr(a, "parallel_streams", False), prefix_reuse=mode,
         prefix_reuse_mode=mode)
     engine = serve_engine.Engine(ns)
@@ -853,12 +852,13 @@ def serve_policy(a, tokenizer, rec: Recorder, devices, cards) -> dict:
     reserve would take left in the expert tier); the after engine with ``graphs=True``.  Both are driven
     the same way and with distinct prompts, so no arm inherits a prefix (which would hide the prefill):
 
-    * ``policy-eager-lone``   - one live conversation, eager (the pre-change ``--parallel N --graphs`` path).
-    * ``policy-graphs-lone``  - the lease: one live conversation captures and replays its decode.
+    * ``policy-eager-lone``   - one live conversation, eager (graphs off).
+    * ``policy-graphs-lone``  - one live conversation captures and replays its decode.
     * ``policy-eager-two``    - two conversations: the first decodes, the second is submitted after its
       first token (staggered, not at once).
-    * ``policy-graphs-two``   - the same stagger: the second admission revokes the lease, both go eager.
-    * ``policy-graphs-lone-again`` - after the burst the lease re-arms and the lone conversation captures.
+    * ``policy-graphs-two``   - the same stagger: each conversation captures its own domain (the engine's
+      bound is four by default, so both fit).
+    * ``policy-graphs-lone-again`` - after the burst the lone conversation uses its captured domain.
 
     The lone arms' token streams must match (the captured decode changes no token).
     """
@@ -875,9 +875,9 @@ def serve_policy(a, tokenizer, rec: Recorder, devices, cards) -> dict:
         engine = _policy_engine(a, cards, n, graphs=graphs)
         try:
             engine.start_workers()
-            # The warm-up request must not take the graph lease: it leaves a conversation on slot 0, and the
-            # measured prompt then diverges from it - a lease would be released and the measured arm would
-            # run eagerly.  Warm the tier with the captured path disabled, then enable it for the arm.
+            # The warm-up request must not capture: it leaves a conversation on slot 0, and the measured
+            # prompt then diverges from it, so a warm domain would be captured and released before the arm.
+            # Warm the tier with the captured path disabled, then enable it for the arm.
             if graphs:
                 engine._graphs_wanted = False
                 engine.rt.model.graphs = False
@@ -891,8 +891,8 @@ def serve_policy(a, tokenizer, rec: Recorder, devices, cards) -> dict:
             r["staggered"] = stagger
             r["note"] = ("one live conversation, captured decode" if graphs
                          else "one live conversation, eager (the pre-change path)") if len(prompts) == 1 else \
-                        ("two conversations, second admitted after the first's first token; the lease is "
-                         "revoked" if graphs else
+                        ("two conversations, second admitted after the first's first token; both capture "
+                         "their own domain" if graphs else
                          "two conversations, second admitted after the first's first token; eager throughout")
             rec.add(r | {"cards": cards, "device": a.device})
             return r
@@ -938,13 +938,13 @@ def serve_policy(a, tokenizer, rec: Recorder, devices, cards) -> dict:
     return summary
 
 
-# --------------------------------------------------------------------------- 8b: the graph lease, one card set
+# --------------------------------------------------------------------------- 8b: graph domains, one card set
 class _DomainWatch:
-    """Poll the model's one graph domain while an arm runs: grant, capture, revoke and what each cost.
+    """Poll the model's graph-domain registry while an arm runs: creation, capture cost and release.
 
-    The lease is engine state, and the protocol deliberately does not carry it, so the benchmark reads the
-    same attribute the engine's lease reads (``model._decode_graphs``) and records every change with a
-    timestamp and the capture cost the domain reports.
+    The domains are engine state, and the protocol deliberately does not carry them, so the benchmark reads
+    the same registry the engine reads (``model._decode_graphs``, the most recent alias) and records every
+    change with a timestamp and the capture cost the domain reports.
     """
 
     def __init__(self, engine, every: float = 0.05):
@@ -1007,21 +1007,20 @@ def _step_inflation(per_request: dict) -> dict:
 
 
 def serve_lease(a, tokenizer, rec: Recorder, devices, cards) -> dict:
-    """``--parallel N --graphs`` as a lease, on the cards given: lone, revoke by a burst, lone again.
+    """``--parallel N --graphs`` on the cards given: lone, a burst, then lone again.
 
     The eager control engine is built and driven **first**, then shut down; the graphs engine is built
     afterwards.  That order matters because a failed graph capture can leak its landing zones for the
     life of the process (the engine then pins itself to eager, which is correct, but a *second* model in
     the same process no longer fits npu:0 - observed), and the control must not be lost to it.
 
-    * ``lease-lone``       - one live conversation: the lease is granted, the capture is charged to its
-      first decode step, and the capture cost is read while the domain is alive.
+    * ``lease-lone``       - one live conversation captures its decode; the capture cost is read while
+      the domain is alive.
     * ``lease-burst``      - the same lone conversation sends its next turn and, while it is decoding,
-      ``N-1`` new conversations arrive.  Their first admission revokes the lease (one release, then
-      every conversation eager); the head request's per-token series shows the captured->eager step.
-    * ``lease-lone-again`` - after the burst every conversation is idle, the engine re-arms the lease and
-      this lone conversation captures again.  Same process, same tier: this is the re-capture cost, not
-      a fresh engine's start-up capture.
+      ``N-1`` new conversations arrive.  Under the per-conversation policy each of them captures up to
+      the engine's bound (four by default); past it they run eagerly with the bound logged.  The name is
+      kept so old result files stay comparable; it is no longer a revoke measurement.
+    * ``lease-lone-again`` - the lone conversation after the burst, on the same engine and tier.
 
     The eager engine runs ``eager-lone`` and ``eager-burst`` with the same prompts and the same
     submission shape (head request first, the others after its first token), so both the lone ratio and
@@ -1095,9 +1094,9 @@ def serve_lease(a, tokenizer, rec: Recorder, devices, cards) -> dict:
                               "one live conversation: the lease is granted and the decode captured; the "
                               "capture's 1.8-2.0 s lands in its first decode step")
         results["burst"] = arm(graphs_engine, "lease-burst", burst, True,
-                               f"{n} conversations: the head continues the lone one (lease held), then "
-                               f"{n - 1} new ones arrive while it decodes; the first admission revokes the "
-                               f"lease and every conversation runs eagerly")
+                               f"{n} conversations: the head continues the lone one, then {n - 1} new ones "
+                               f"arrive while it decodes; each captures its own domain up to the engine's "
+                               f"bound, and the rest run eagerly with the bound logged")
         results["again"] = arm(graphs_engine, "lease-lone-again", [again_prompt], False,
                                "after the burst every conversation is idle, the lease re-arms and this lone "
                                "conversation captures again - the re-capture cost")
@@ -1569,15 +1568,15 @@ def main() -> int:
                          "drive against --parallel conversations, at 4 x 2 000 tokens and 4 x short prompts, "
                          "plus the isolation check.  Builds a serve_engine.Engine instead of a bare runtime.")
     ap.add_argument("--serve-policy", action="store_true",
-                    help="run ONLY the graphs x parallel composition measurement: the pre-change eager path, "
-                         "the lone-conversation graph lease, the two-conversation revoke, and the re-arm, all "
-                         "on one engine build and tier")
+                    help="run ONLY the graphs x parallel composition measurement: the graphs-off path, a "
+                         "lone conversation's captured domain, two live conversations each capturing their "
+                         "own, and the lone conversation after the burst, all on one engine build and tier")
     ap.add_argument("--serve-lease", action="store_true",
-                    help="run ONLY the graph lease on the cards given, in one graphs engine: a lone "
-                         "conversation (captured), a burst of --parallel conversations (the next admission "
-                         "revokes the lease, the burst runs eagerly), then a lone conversation again (the "
-                         "engine re-arms and it re-captures).  An eager engine gives the same three shapes "
-                         "as the throughput and token controls")
+                    help="run ONLY this policy on the cards given, in one graphs engine: a lone conversation "
+                         "(captured), a burst of --parallel conversations (each captures its own domain up "
+                         "to the engine's bound; the rest run eagerly and say so), then a lone conversation "
+                         "again.  An eager engine gives the same three shapes as the throughput and token "
+                         "controls; bench_serve_domains.py is the four-conversation 2 000-token arm")
     ap.add_argument("--reuse-mode", choices=["always", "safe", "off"], default="always",
                     help="prefix reuse for the engines this run builds: always (the default, every matching "
                          "token), safe (only the matching prefix written by full offset-aligned prompt "

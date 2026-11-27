@@ -43,7 +43,7 @@ def engine_args(model_dir: Path, **overrides) -> argparse.Namespace:
         model=str(model_dir), tokenizer="", device="cpu", dtype="float32", hbm_share=0.5,
         expert_slots=None, io_threads=1, expert_batch=8, expert_reserve_gib=6.0, expert_devices="",
         engram_tokenizer="", verbose=False, max_context=64, prefill_chunk=512, serve=True,
-        graphs=True, graph_verify=False, graph_max_conversations=1, parallel=1)
+        graphs=True, graph_verify=False, graph_max_conversations=None, parallel=1)
     for key, value in overrides.items():
         setattr(args, key, value)
     return args
@@ -243,11 +243,12 @@ class TheGraphsArguments(unittest.TestCase):
         from ascend import serve_engine
         return serve_engine.build_parser()
 
-    def test_graphs_are_off_by_default(self):
+    def test_graphs_are_off_by_default_and_the_bound_is_the_engine_s(self):
         args = self.parser().parse_args(["--serve", "--model", "/tmp/model"])
         self.assertFalse(args.graphs, "the captured decode is opt-in, as in run_dsv41")
         self.assertFalse(args.graph_verify)
-        self.assertEqual(args.graph_max_conversations, 1)
+        self.assertIsNone(args.graph_max_conversations,
+                          "unset means the engine's own bound (DSV41_GRAPH_MAX_CONVERSATIONS, 4)")
 
     def test_the_graph_flags_parse(self):
         args = self.parser().parse_args(
@@ -260,7 +261,7 @@ class TheGraphsArguments(unittest.TestCase):
 
 @NEEDS_TORCH
 class TheGraphsPlumbing(unittest.TestCase):
-    def test_the_flags_reach_runtime_build(self):
+    def test_the_flags_reach_runtime_build_and_the_bound_is_capped_not_raised(self):
         from types import SimpleNamespace
         from ascend import serve_engine
 
@@ -269,7 +270,9 @@ class TheGraphsPlumbing(unittest.TestCase):
 
         def fake(**kwargs):
             seen.update(kwargs)
-            return SimpleNamespace(cfg=SimpleNamespace(num_hidden_layers=4))
+            model = SimpleNamespace(cfg=SimpleNamespace(num_hidden_layers=4),
+                                    graph_max_conversations=4)
+            return SimpleNamespace(cfg=model.cfg, model=model)
 
         try:
             serve_engine.rt.build = fake
@@ -280,6 +283,16 @@ class TheGraphsPlumbing(unittest.TestCase):
         self.assertIs(seen["graphs"], True)
         self.assertIs(seen["graph_verify"], True)
         self.assertEqual(engine._graph_max, 2)
+        self.assertEqual(engine.rt.model.graph_max_conversations, 2,
+                         "the model and the serve policy enforce the same number")
+        try:
+            serve_engine.rt.build = fake
+            high = serve_engine.Engine(engine_args(Path("/tmp/not-loaded"), graphs=True,
+                                                   graph_max_conversations=8))
+        finally:
+            serve_engine.rt.build = real
+        self.assertEqual(high._graph_max, 4, "--graph-max-conversations can only lower the engine's bound")
+        self.assertEqual(high.rt.model.graph_max_conversations, 4)
 
 
 @NEEDS_TORCH
@@ -332,7 +345,7 @@ class TheConversationGraphLifecycle(unittest.TestCase):
             self.assertIsNotNone(graphs)
             self.assertEqual(graphs.captured, 2 * engine.cfg.num_hidden_layers,
                              "one g_pre and one g_post per layer")
-            self.assertIn("captures its decode", err)
+            self.assertIn("capture its decode", err)
             self.assertIn("graphs captured", err, "the capture cost is reported in the log")
             self.assertEqual(engine.graphs_live(), 1)
             # the next turn of the same conversation reuses the captured domain (that is the point)
@@ -392,40 +405,38 @@ class TheConversationGraphLifecycle(unittest.TestCase):
         finally:
             engine.shutdown()
 
-    def test_a_teardown_failure_is_logged_and_the_bound_falls_back_to_eager(self):
+    def test_a_teardown_failure_is_counted_and_logged_without_retiring_the_others(self):
         from ascend.dsv41.graph_runner import GraphTeardownError
 
-        engine = self.engine()
+        engine = self.engine(graph_max_conversations=2)
         try:
             quiet_generate(engine, "GEN 2 3,5,7")
             model = engine.rt.model
-            real = model.release_graphs
-            calls = {"n": 0}
+            leaked = model._decode_graphs
+            self.assertIsNotNone(leaked)
 
             def failing():
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    # what `Dsv41.release_graphs` does when a destroy failed: drop the reference, name
-                    # the leak.  The HBM is not returned, and the domain can never be freed again.
-                    domain, model._decode_graphs = model._decode_graphs, None
-                    if domain is not None:
-                        domain.close()
-                    raise GraphTeardownError(
-                        "npu:0", [("g_pre.0.0", "rtModelDestroy failed: model not in current ctx")])
-                return real()
+                # what a destroy failure is: the domain is already out of the registry, its HBM is not
+                # returned, and it can never be freed again
+                raise GraphTeardownError("npu:0", [("g_pre.0.0", "rtModelDestroy failed")])
 
-            model.release_graphs = failing
+            leaked.close = failing
             out, err = quiet_generate(engine, "GEN 1 11,13")
             self.assertIn("DONE 1 2", out, "one conversation's teardown failure must not kill the engine")
             self.assertIn("could not release", err)
-            self.assertEqual(engine.graphs_live(), 1, "the leaked domain is counted against the bound")
-            self.assertFalse(model.graphs, "the bound sends the next conversation to the eager path")
-            self.assertIsNone(model._decode_graphs, "nothing captures into HBM the leak already holds")
-            self.assertIn("eagerly", err)
-            out, _ = quiet_generate(engine, "GEN 1 19,23")
-            self.assertIn("DONE 1 2", out)
-            self.assertIsNone(model._decode_graphs)
+            self.assertNotIn("Traceback", err)
+            self.assertEqual(int(model._graph_leaked), 1,
+                             "the leaked domain is counted against the bound")
+            self.assertEqual(engine.graphs_live(), 2, "one live domain plus the leak")
+            self.assertTrue(model.graphs,
+                            "a leak must not disable the captured path for every other conversation")
+            # one slot of the bound is spent on the leak; the next conversation still captures in the other
+            fresh = model._decode_graphs
+            self.assertIsNotNone(fresh, "the other bound slot still captures")
+            self.assertIsNot(fresh, leaked)
+            self.assertFalse(leaked.closed, "the leaked domain could not be closed")
         finally:
+            # the leaked domain is already out of the registry (and counted); shutdown must not raise
             engine.shutdown()
 
     def test_shutdown_names_a_failed_teardown_instead_of_raising(self):
@@ -577,7 +588,7 @@ class TheParallelArguments(unittest.TestCase):
         self.assertEqual(ready, ["READY 64 stop pause"], "a single-conversation engine must not say multi=")
         self.assertNotIn("multi=", err.getvalue())
 
-    def test_multi_is_the_number_the_scheduler_holds_and_the_lease_is_logged(self):
+    def test_multi_is_the_number_the_scheduler_holds_and_the_graph_policy_is_logged(self):
         from ascend import serve_engine
         from types import SimpleNamespace
 
@@ -586,7 +597,9 @@ class TheParallelArguments(unittest.TestCase):
 
         def fake(**kwargs):
             seen.update(kwargs)
-            return SimpleNamespace(cfg=SimpleNamespace(num_hidden_layers=4))
+            model = SimpleNamespace(cfg=SimpleNamespace(num_hidden_layers=4),
+                                    graph_max_conversations=4)
+            return SimpleNamespace(cfg=model.cfg, model=model)
 
         try:
             serve_engine.rt.build = fake
@@ -595,9 +608,9 @@ class TheParallelArguments(unittest.TestCase):
             serve_engine.rt.build = real
         try:
             self.assertIs(seen["graphs"], True,
-                          "graphs now compose with --parallel under a lease, so the reserve is taken")
+                          "graphs compose with --parallel as one domain per conversation, so the reserve is taken")
             self.assertTrue(engine._graphs_wanted)
-            self.assertFalse(engine._graphs_conflict, "there is no static conflict to report any more")
+            self.assertEqual(engine._graph_max, 4, "with no flag the bound is the engine's own (4)")
         finally:
             engine.shutdown()
 
@@ -610,8 +623,9 @@ class TheParallelArguments(unittest.TestCase):
             finally:
                 engine.shutdown()
         self.assertIn("READY 64 stop pause multi=4", out.getvalue())
-        self.assertIn("is a *lease*", err.getvalue(), "the composition is stated, not silently resolved")
-        self.assertIn("4 conversations at once", err.getvalue())
+        self.assertIn("one captured decode per conversation", err.getvalue(),
+                      "the composition is stated, not silently resolved")
+        self.assertIn("Up to 4 conversation(s)", err.getvalue())
 
     def test_parallel_parses(self):
         args = self.parser().parse_args(["--serve", "--model", "/tmp/model", "--parallel", "8"])
@@ -1058,8 +1072,15 @@ class ThePrefixReuse(unittest.TestCase):
 
 
 @NEEDS_TORCH
-class TheGraphsParallelLease(unittest.TestCase):
-    """`--graphs --parallel N`: one conversation holds the graph lease, a second revokes it, idle re-arms."""
+class TheGraphsParallelDomains(unittest.TestCase):
+    """`--graphs --parallel N`: up to the engine's bound conversations each hold a captured domain.
+
+    The bound is the model's (`DSV41_GRAPH_MAX_CONVERSATIONS`, four by default) and
+    `--graph-max-conversations` can only lower it.  A conversation past the bound runs eagerly and says so
+    (naming the bound and the 1.585 GiB per-domain cost); no live domain is evicted; a conversation that
+    ends releases *its* domain so the next one can take the slot; and a capture failure retires only the
+    conversation that failed.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -1082,7 +1103,7 @@ class TheGraphsParallelLease(unittest.TestCase):
         return lines
 
     @staticmethod
-    def wait_done(lines, n: int, timeout: float = 60.0) -> list[str]:
+    def wait_done(lines, n: int, timeout: float = 120.0) -> list[str]:
         end = time.time() + timeout
         while time.time() < end:
             dones = [l for l in lines if l.startswith("DONE ")]
@@ -1091,137 +1112,260 @@ class TheGraphsParallelLease(unittest.TestCase):
             time.sleep(0.01)
         raise AssertionError(f"{n} DONE line(s) did not arrive; saw {lines[-12:]}")
 
-    def test_the_flags_compose_and_the_engine_reserves_the_graph_landing_zone(self):
-        """The old path forced graphs off; now the lease means graphs can be built and used."""
+    def test_the_start_log_states_the_bound_and_the_flag_can_only_lower_it(self):
         from ascend import serve_engine
-        from types import SimpleNamespace
-
-        seen: dict = {}
-        real = serve_engine.rt.build
-
-        def fake(**kwargs):
-            seen.update(kwargs)
-            return SimpleNamespace(cfg=SimpleNamespace(num_hidden_layers=4))
-
-        try:
-            serve_engine.rt.build = fake
-            engine = serve_engine.Engine(engine_args(Path("/tmp/not-loaded"), parallel=4, graphs=True))
-        finally:
-            serve_engine.rt.build = real
-        try:
-            self.assertIs(seen["graphs"], True,
-                          "the multi path now uses the captured decode under a lease, so it reserves it")
-            self.assertTrue(engine._graphs_wanted)
-            self.assertFalse(engine._graphs_conflict, "there is no static conflict to report any more")
-        finally:
-            engine.shutdown()
 
         with TinyModel() as model:
             engine = serve_engine.Engine(engine_args(model.root, parallel=4, graphs=True,
-                                                     graph_max_conversations=3))
+                                                     graph_max_conversations=2))
             out, err = io.StringIO(), io.StringIO()
             try:
                 with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     engine.say_ready()
             finally:
                 engine.shutdown()
+        log = err.getvalue()
         self.assertIn("READY 64 stop pause multi=4", out.getvalue())
-        self.assertIn("is a *lease*", err.getvalue(), "the composition policy is stated at start")
-        self.assertIn("effective bound 1", err.getvalue())
-        self.assertIn("--graph-max-conversations 3 cannot be honoured", err.getvalue(),
-                      "a bound that cannot be honoured is called out")
+        self.assertIn("one captured decode per conversation", log)
+        self.assertIn("Up to 2 conversation(s)", log)
+        self.assertIn("caps the engine's bound of 4", log)
+        self.assertIn("1.585 GiB = 405.7 MiB a card", log,
+                      "the per-domain cost is stated, not implied")
+        self.assertIn("no live domain is ever evicted", log)
 
-    def test_one_conversation_leases_a_second_revokes_and_idle_rearms(self):
-        """One conversation captures; admitting a second revokes, both run eagerly, idle re-arms.
+        with TinyModel() as model:
+            engine = serve_engine.Engine(engine_args(model.root, parallel=4, graphs=True,
+                                                     graph_max_conversations=8))
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    engine.say_ready()
+            finally:
+                engine.shutdown()
+        self.assertEqual(engine._graph_max, 4, "the flag cannot raise the engine's bound")
+        self.assertIn("cannot raise the engine's bound of 4", err.getvalue())
 
-        The second request is admitted while the first is *held between two tokens*: `sample` waits on
-        an event, not for a sleep the scheduler could outrun.  The capture is lazy (it belongs to the
-        first one-token forward, after that `T` line is written), so the hold is taken at the second
-        sample call - by then the first step, and with it the capture, has completed.
+    def test_the_bound_is_respected_the_rest_run_eagerly_and_are_logged(self):
+        """With the bound at 2 and four conversations, exactly two capture and two are eager (and say so).
+
+        All four are held at their second token: the first decode step - the lazy capture - has completed
+        for every one of them by then, so the domain count is final.
         """
-        engine = self.engine()
-        real_sample = engine.sample
-        second_token = threading.Event()
-        release = threading.Event()
-        calls = {"n": 0}
+        engine = self.engine(parallel=4, graph_max_conversations=2)
+        engine.eos_id = lambda: -1                # 20 tokens of every stream: the step counts are exact
+        real_sample, local = engine.sample, threading.local()
+        first = threading.Barrier(4, timeout=120)
+        second = threading.Semaphore(0)
+        gate = threading.Event()
 
         def held_sample(*a, **kw):
-            calls["n"] += 1
-            if calls["n"] == 2:                    # the step after the captured one
-                second_token.set()
-                if not release.wait(30):
-                    raise AssertionError("the test did not release the first conversation's decode")
+            n = getattr(local, "n", 0) + 1
+            local.n = n
+            if n == 1:
+                first.wait()                  # all four are admitted and about to reach their first step
+            elif n == 2:
+                second.release()              # its first decode step (and any capture) is done
+                if not gate.wait(120):
+                    raise AssertionError("the test did not release the decodes")
             return real_sample(*a, **kw)
 
         engine.sample = held_sample
-        err = io.StringIO()
+        err, lines = io.StringIO(), self.collector(engine)
         try:
-            with contextlib.redirect_stderr(err):
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
                 engine.say_ready()
-                lines = self.collector(engine)
                 engine.start_workers()
-                engine.submit("GEN 12 rid=1 3,5,7")
-                self.assertTrue(second_token.wait(30),
-                                f"the first conversation never reached its second token; saw {lines[-12:]}")
-                self.assertIsNotNone(engine.rt.model._decode_graphs,
-                                     "the lone conversation captured its decode (the lease was granted)")
-                self.assertEqual(engine.graphs_live(), 1)
-                engine.submit("GEN 12 rid=2 11,13,17")      # request 1 is held mid-decode: a second slot
-                release.set()                               # let both run to their DONEs
-                self.wait_done(lines, 2)
-                self.assertTrue(engine.wait_idle(timeout=30))
-                first = [l for l in lines if l.startswith("DONE 1 ")][0].split()
+                for rid, ids in enumerate(((3, 5, 7), (11, 13, 17), (19, 23, 29), (2, 4, 31)), 1):
+                    engine.submit(f"GEN 20 rid={rid} " + ",".join(map(str, ids)))
+                for _ in range(4):
+                    self.assertTrue(second.acquire(timeout=120),
+                                    f"not every conversation reached its second token; saw {lines[-8:]}")
+                gate.set()
+                self.assertTrue(engine.wait_idle(timeout=120))
+            model = engine.rt.model
+            domains = dict(model._graph_domains)
+            captured = [s for s in engine.slots if s.state is not None and id(s.state) in domains]
+            eager = [s for s in engine.slots if s.state is not None and id(s.state) not in domains]
+            self.assertEqual(len(captured), 2, "exactly the bound captures")
+            self.assertEqual(len(eager), 2, "the rest still serve, on their own States, eagerly")
+            for slot in captured:
+                self.assertEqual(slot.graph_steps, 20,
+                                 "every decode step after the capture ran on the conversation's own domain")
+            for slot in eager:
+                self.assertEqual(slot.graph_steps, 0, "a conversation past the bound never got a domain")
+            self.assertEqual(engine.graphs_live(), 2)
+            self.assertTrue(model.graphs, "the bound must not disable the captured path")
+            self.assertNotIn("revoked", err.getvalue())
+            self.assertEqual(err.getvalue().count("already hold their domain (bound 2"), 2,
+                             "every conversation past the bound says so, naming the bound")
+            self.assertIn("1.585 GiB = 405.7 MiB a card", err.getvalue())
+            self.assertIn("no live domain is evicted", err.getvalue())
+            self.assertEqual(err.getvalue().count("graphs captured"), 2,
+                             "only the two captured conversations report a capture")
         finally:
-            release.set()                           # never leave a worker parked on the event
+            gate.set()
             engine.stop_workers()
-        log, graphs = err.getvalue(), engine.rt.model.graphs
-        held = engine.rt.model._decode_graphs
-        engine.shutdown()
-        self.assertGreaterEqual(int(first[1]), 1)
-        self.assertIn("lease granted", log)
-        self.assertIn("lease revoked", log, "the second conversation took the graph domain back")
-        self.assertIn("every conversation is idle again", log, "the lease is available again afterwards")
-        self.assertIsNone(held, "the revoked domain was released")
-        self.assertTrue(graphs, "the engine re-armed the captured path when idle")
+            engine.shutdown()
 
-    def test_a_lone_conversation_after_a_burst_captures_again(self):
-        engine = self.engine()
+    def test_eight_conversations_capture_four_and_the_rest_are_eager(self):
+        """Eight concurrent conversations at the engine's default bound of four: 4 capture, 4 are refused.
+
+        This is the "past the bound" shape the task asks for, at the policy level: the four extra
+        conversations still serve, eagerly, and every one of them logs the bound and the per-domain cost;
+        no live domain is touched.  (The NPU 8-conversation arm also checks HBM and thrash; this test
+        pins the policy and the log without a card.)
+        """
+        engine = self.engine(parallel=8, graph_max_conversations=None)
+        self.assertEqual(engine._graph_max, 4, "unset means the engine's own bound (4)")
+        engine.eos_id = lambda: -1
+        real_sample, local = engine.sample, threading.local()
+        first = threading.Barrier(8, timeout=180)
+        second = threading.Semaphore(0)
+        gate = threading.Event()
+
+        def held_sample(*a, **kw):
+            n = getattr(local, "n", 0) + 1
+            local.n = n
+            if n == 1:
+                first.wait()
+            elif n == 2:
+                second.release()
+                if not gate.wait(180):
+                    raise AssertionError("the test did not release the decodes")
+            return real_sample(*a, **kw)
+
+        engine.sample = held_sample
+        prompts = ((3, 5, 7), (11, 13, 17), (19, 23, 29), (2, 4, 31),
+                   (6, 8, 10), (12, 14, 16), (18, 20, 22), (24, 26, 28))
+        err, lines = io.StringIO(), self.collector(engine)
         try:
-            engine.say_ready()
-            lines = self.collector(engine)
-            engine.start_workers()
-            engine.submit("GEN 2 rid=1 3,5,7")
-            self.wait_done(lines, 1)
-            self.assertTrue(engine.wait_idle(timeout=10))
-            self.assertIsNotNone(engine.rt.model._decode_graphs)
-            engine.submit("GEN 2 rid=2 11,13,17")
-            self.wait_done(lines, 2)
-            self.assertTrue(engine.wait_idle(timeout=10))
-            # the second request may have landed on the same slot (a different conversation there
-            # re-captures) or another one (a revoke); either way the next lone conversation captures.
-            engine.submit("GEN 2 rid=3 19,23,29")
-            self.wait_done(lines, 3)
-            self.assertTrue(engine.wait_idle(timeout=10))
-            self.assertIsNotNone(engine.rt.model._decode_graphs,
-                                 "the lease is usable again after every conversation went idle")
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                engine.say_ready()
+                engine.start_workers()
+                for rid, ids in enumerate(prompts, 1):
+                    engine.submit(f"GEN 6 rid={rid} " + ",".join(map(str, ids)))
+                for _ in range(8):
+                    self.assertTrue(second.acquire(timeout=180),
+                                    f"not every conversation reached its second token; saw {lines[-8:]}")
+                gate.set()
+                self.assertTrue(engine.wait_idle(timeout=180))
+            model = engine.rt.model
+            domains = dict(model._graph_domains)
+            captured = [s for s in engine.slots if s.state is not None and id(s.state) in domains]
+            eager = [s for s in engine.slots if s.state is not None and id(s.state) not in domains]
+            self.assertEqual(len(captured), 4, "the engine's default bound captures four")
+            self.assertEqual(len(eager), 4, "the other four conversations run eagerly")
+            for slot in captured:
+                self.assertEqual(slot.graph_steps, 6, "6 decode forwards on its own domain")
+            for slot in eager:
+                self.assertEqual(slot.graph_steps, 0)
+            self.assertEqual(engine.graphs_live(), 4)
+            self.assertTrue(model.graphs)
+            log = err.getvalue()
+            self.assertEqual(log.count("already hold their domain (bound 4"), 4,
+                             "each refused conversation names the bound, and none is silent")
+            self.assertIn("1.585 GiB = 405.7 MiB a card", log)
+            self.assertIn("no live domain is evicted", log)
+            self.assertEqual(log.count("graphs captured"), 4)
+        finally:
+            gate.set()
+            engine.stop_workers()
+            engine.shutdown()
+
+    def test_a_captured_conversation_that_ends_frees_its_slot_for_the_next(self):
+        """With the bound at 1, the conversation that ends releases its domain and its successor captures.
+
+        The second request's first token differs from the held conversation's, so the engine drops that
+        conversation (and only its graphs) before building the new State.  The bound is 1, so the new
+        conversation can capture only if the old domain really was released - the freed slot is reused,
+        not a second domain added.
+        """
+        engine = self.engine(parallel=2, graph_max_conversations=1)
+        err, lines = io.StringIO(), self.collector(engine)
+        try:
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                engine.say_ready()
+                engine.start_workers()
+                engine.submit("GEN 3 rid=1 3,5,7")
+                self.wait_done(lines, 1)
+                self.assertTrue(engine.wait_idle(timeout=120))
+                first = engine.rt.model._decode_graphs
+                self.assertIsNotNone(first, "the lone conversation captured")
+                self.assertEqual(engine.graphs_live(), 1)
+                # the first token differs: the held conversation is dropped before the prompt is read
+                engine.submit("GEN 3 rid=2 11,13,17")
+                self.wait_done(lines, 2)
+                self.assertTrue(engine.wait_idle(timeout=120))
+            log = err.getvalue()
+            self.assertTrue(first.closed, "the ended conversation's graphs were torn down")
+            self.assertEqual(engine.graphs_live(), 1,
+                             "the released domain freed the slot the next conversation took")
+            fresh = engine.rt.model._decode_graphs
+            self.assertIsNotNone(fresh, "the conversation started in its place captured")
+            self.assertIsNot(fresh, first)
+            self.assertGreater(int(getattr(fresh, "captured", 0)), 0)
+            self.assertIn("released", log)
+            self.assertIn("graphs captured", log)
         finally:
             engine.stop_workers()
             engine.shutdown()
 
+    def test_a_capture_failure_retires_only_that_conversation(self):
+        from ascend.dsv41 import model as model_mod
 
+        engine = self.engine(parallel=2, graph_max_conversations=2)
+        real_init = model_mod._DecodeGraphs.__init__
+        calls, lock = {"n": 0}, threading.Lock()
 
-    """The real executable: READY multi=N, a rid-tagged GEN, tagged T/DONE, and a clean QUIT."""
+        def failing_init(self, *a, **kw):
+            with lock:
+                calls["n"] += 1
+                fail = calls["n"] == 1
+            if fail:
+                raise RuntimeError("injected domain build failure")
+            return real_init(self, *a, **kw)
+
+        err, lines = io.StringIO(), self.collector(engine)
+        model_mod._DecodeGraphs.__init__ = failing_init
+        try:
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                engine.say_ready()
+                engine.start_workers()
+                engine.submit("GEN 6 rid=1 3,5,7")
+                engine.submit("GEN 6 rid=2 11,13,17")
+                self.wait_done(lines, 2)
+                self.assertTrue(engine.wait_idle(timeout=120))
+        finally:
+            model_mod._DecodeGraphs.__init__ = real_init
+            engine.stop_workers()
+        try:
+            model = engine.rt.model
+            self.assertTrue(model.graphs,
+                            "a failed capture must not take the captured path away from the others")
+            self.assertEqual(len(model._graph_domains), 1, "the healthy conversation keeps its domain")
+            self.assertEqual(len(model._graph_failures), 1)
+            self.assertEqual(engine.graphs_live(), 1)
+            domains = dict(model._graph_domains)
+            captured = [s for s in engine.slots if s.state is not None and id(s.state) in domains]
+            eager = [s for s in engine.slots if s.state is not None and id(s.state) not in domains]
+            self.assertEqual((len(captured), len(eager)), (1, 1))
+            self.assertEqual(eager[0].graph_steps, 0)
+            self.assertIn("capture/replay failed", err.getvalue())
+            self.assertIn("retired only this conversation", err.getvalue())
+        finally:
+            engine.shutdown()
 
     def test_a_parallel_engine_tags_its_lines_and_quits(self):
+        """The real executable: READY multi=N, a rid-tagged GEN, tagged T/DONE, and a clean QUIT."""
         with TinyModel() as model:
             engine = Engine(model.root, "--parallel", "2", "--graphs")
             ready = engine.read_until("READY")[-1]
             self.assertIn("multi=2", ready.split())
             end = time.time() + 20
-            while not any("is a *lease*" in l for l in engine.log) and time.time() < end:
+            while not any("one captured decode per conversation" in l for l in engine.log) and time.time() < end:
                 time.sleep(0.02)
-            self.assertIn("is a *lease*", "\n".join(engine.log),
-                          "the graphs/parallel composition policy is stated at start")
+            self.assertIn("one captured decode per conversation", "\n".join(engine.log),
+                          "the graphs/parallel policy is stated at start")
             engine.send("GEN 2 rid=7 3,5,7")
             lines = engine.read_until("DONE ")
             self.assertTrue([l for l in lines if l.startswith("T 7 ")], lines)

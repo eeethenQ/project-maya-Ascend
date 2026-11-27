@@ -43,7 +43,7 @@ def _engine(a, cards: list[str], reserve: float, graphs: bool) -> tuple[object, 
         expert_batch=a.expert_batch, expert_reserve_gib=reserve,
         expert_devices=",".join(cards), engram_tokenizer="", verbose=False,
         max_context=a.max_context, prefill_chunk=a.prefill_chunk, serve=True, graphs=graphs,
-        graph_verify=False, graph_max_conversations=1, parallel=a.parallel,
+        graph_verify=False, graph_max_conversations=None, parallel=a.parallel,
         parallel_streams=a.parallel_streams, prefix_reuse="always", prefix_reuse_mode="always")
     t0 = time.perf_counter()
     engine = serve_engine.Engine(ns)
